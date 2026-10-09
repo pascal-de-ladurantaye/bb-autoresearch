@@ -4,7 +4,7 @@ import type { Engine } from "./engine.ts";
 import type { CandidateRow, StudyRow } from "./db/store.ts";
 import { BENCH_BOUND_STAGES } from "./pipeline.ts";
 import { clip, safeJson } from "./prompts.ts";
-import type { StudySpec } from "./spec.ts";
+import { oracleHash, type StudySpec } from "./spec.ts";
 
 export interface StudySummary {
   slug: string;
@@ -223,6 +223,8 @@ export function overview(engine: Engine, s: StudyRow) {
     bestSha: s.best_sha,
     bestCi: bestCi(engine, s),
     utilization: utilization(engine, s),
+    benchHosts: benchHostsView(engine, s),
+    segment: segmentView(engine, s),
     tEval: engine.pipeline.recentEvalSeconds(s),
     tThink: engine.thinkSeconds(s),
     trajectory: trajectory(engine, s),
@@ -230,6 +232,73 @@ export function overview(engine: Engine, s: StudyRow) {
     queue,
     notices: store.notices(s.id, { limit: 10 }).map((n) => ({ id: n.id, at: n.at, kind: n.kind, text: clip(n.text, 1000), delivered: n.delivered_round !== null })),
     events: store.events(s.id, { limit: 25 }).map((e) => ({ id: e.id, at: e.at, kind: e.kind, actor: clip(e.actor, 40), data: clip(e.data_json, 300) })),
+  };
+}
+
+/**
+ * Bench hosts for the study page and CLI: status, health, what it's
+ * measuring, drift, cache, last bundle. No holdout data (agents can call RPC).
+ */
+export function benchHostsView(engine: Engine, s: StudyRow) {
+  const { store } = engine.ctx;
+  const spec = specOf(engine, s);
+  const rows = store.benchHosts(s.id);
+  const transfers = store.transfers(s.id, 200);
+  const measuring = store.candidates(s.id, { stages: ["measuring", "confirming"] });
+  const progress = engine.pipeline.progress(s.id);
+  return rows.map((h) => {
+    const health = safeJson<{ summary?: string; problems?: string[] }>(h.health_json);
+    const t = transfers.find((x) => x.host_id === h.host_id && x.ok);
+    const sent = transfers.filter((x) => x.host_id === h.host_id && x.ok);
+    return {
+      hostId: h.host_id,
+      name: h.name,
+      mode: h.mode,
+      status: h.status,
+      healthOk: h.health_ok === null ? null : h.health_ok === 1,
+      healthAt: h.health_at,
+      healthSummary: health?.summary ?? null,
+      problems: health?.problems ?? [],
+      deferredUntil: h.deferred_until !== null && h.deferred_until > engine.ctx.now() ? h.deferred_until : null,
+      offlineSince: h.offline_since,
+      measuring: measuring.find((c) => c.bench_host_id === h.host_id)?.n ?? null,
+      progress: progress.find((p) => p.hostId === h.host_id)?.text ?? null,
+      driftStatus: h.drift_status,
+      driftAt: h.drift_at,
+      evalsSinceDrift: h.evals_since_drift,
+      driftEvery: spec?.oracle.drift.every ?? 0,
+      bestBuildSha: h.best_build_sha,
+      noiseFloor: h.noise_floor,
+      mde: h.mde,
+      repoPath: h.mode === "clone" ? h.repo_path : null,
+      lastTransfer: t ? `${t.bytes} B (${t.purpose}, ${t.chunks} chunk${t.chunks === 1 ? "" : "s"})` : null,
+      bundles: sent.length,
+      bundleBytes: sent.reduce((a, x) => a + x.bytes, 0),
+    };
+  });
+}
+
+/** The active oracle segment and whether a pending spec changes it. */
+export function segmentView(engine: Engine, s: StudyRow) {
+  const { store } = engine.ctx;
+  const seg = store.segment(s.id, s.segment);
+  let pendingChangesOracle: boolean | null = null;
+  if (s.pending_spec_version !== null) {
+    try {
+      pendingChangesOracle = oracleHash(store.specOfVersion(s.id, s.pending_spec_version)) !== oracleHash(store.spec(s));
+    } catch {
+      pendingChangesOracle = null;
+    }
+  }
+  return {
+    k: s.segment,
+    count: store.segments(s.id).length,
+    oracleHash: seg?.oracle_hash ?? null,
+    specVersion: seg?.spec_version ?? null,
+    baselineSha: seg?.baseline_sha ?? null,
+    ref: s.segment > 0 ? `refs/studies/${s.slug}/segment/${s.segment}` : null,
+    pendingSpecVersion: s.pending_spec_version,
+    pendingChangesOracle,
   };
 }
 
@@ -282,6 +351,9 @@ export function candidateRow(engine: Engine, c: CandidateRow, ideaTitle: string 
     linesDeleted: c.lines_deleted,
     rebases: c.rebases,
     benchSeconds: c.bench_seconds,
+    benchHostId: c.bench_host_id,
+    /** pass/fail only: holdout numbers never leave the plugin database. */
+    holdout: c.holdout,
     summary: clip(c.summary.split("\n")[0] ?? "", 200),
     submittedAt: c.submitted_at,
     decidedAt: c.decided_at,

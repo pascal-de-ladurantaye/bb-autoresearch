@@ -29,7 +29,9 @@ Pick the noise class:
 
 - `deterministic`: the number is identical run to run (bundle size, instruction or allocation counts, output size). One run per side; a candidate wins when it is better beyond `tolerance`.
 - `noisy`: wall-clock time, latency, throughput. Paired, interleaved runs with a bootstrap CI of the median and a sequential test. Calibration measures the noise first.
-- `expensive`: one run takes many minutes. One run per candidate, confirmed with extra runs.
+- `expensive`: one run takes many minutes. One screening run per candidate against the calibrated per-run noise; a promising run is confirmed with `confirm_runs` (default 3) fresh runs.
+
+Pick the bench hosts (`oracle.bench_hosts`): `["local"]` (default) measures in plugin checkouts on this machine. Any other entry is a BB machine name or host id (see `bb host list`); that machine keeps its own clone and receives commits as git bundles. A dedicated, quiet machine of the production architecture is best. Ask whether there is a **holdout** workload that lives only on the bench host (a different input set): it is run on every win before promotion, and agents only learn pass/fail.
 
 Run `measure` once yourself to check the METRIC lines parse. If the harness lives in the repo, list its paths under `protected` (its content hash becomes part of the oracle).
 
@@ -62,7 +64,26 @@ build = "make release"           # optional
 gate = ["make test-parser"]
 measure = "bench/parse.sh"
 noise = "noisy"                  # deterministic | noisy | expensive
-timeout_minutes = 20             # per command, max 29
+bench_hosts = ["local"]          # or BB machine names/ids: own clone, git bundles
+timeout_minutes = 20             # per command (runs as a host job; up to 1440)
+max_bundle_mib = 256             # optional: largest git bundle sent to a bench host
+offline_grace_minutes = 10       # optional: notify when a bench host stays offline
+
+[oracle.holdout]                 # optional: hidden workload on the bench host
+measure = "/srv/holdout/parse.sh"   # prints METRIC lines like measure
+runs = 3                         # paired best/candidate runs
+max_regression = "1%"            # fail when the candidate is worse than this
+
+[oracle.health]                  # optional: checked before every measurement
+max_load = 0.8                   # 1-minute load per CPU
+max_process_cpu = 60             # % of one core for the busiest other process
+require_ac_power = true          # where detectable (laptops)
+retry_seconds = 60               # a deferred host waits this long
+
+[oracle.drift]                   # optional: A/A on best while running
+every = 10                       # evaluations per bench host (0 = off)
+pairs = 6
+max_ratio = 2                    # pause when noise > 2x calibrated
 
 [oracle.protocol]                # all optional
 n_min = 6                        # noisy: pairs before an early stop
@@ -71,6 +92,8 @@ min_effect = "1%"                # floor for the win threshold
 max_mde = "20%"                  # calibration fails above this
 tolerance = "0%"                 # deterministic: required improvement
 confirm = true                   # noisy: re-measure wins before promotion
+confirm_runs = 3                 # expensive: k confirmation runs
+calibration_runs = 5             # expensive: baseline runs at calibration
 
 [budget]
 max_workers = 3                  # W adapts up to this: min(max, ceil(think/eval)+1)
@@ -83,7 +106,7 @@ worker = { permission_mode = "full" }   # optional: provider, model, permission_
 max_submissions_per_worker = 3
 ```
 
-Rules: globs are repo-relative (`**` spans directories). `bench_hosts` must be empty or `["local"]` until remote bench hosts land. Unknown keys are rejected.
+Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries must name enrolled BB machines (checked when you call `study_propose`). Unknown keys are rejected.
 
 ## 4. Submit
 
@@ -98,3 +121,7 @@ Then tell the human, in two or three lines:
 The plugin doesn't start turns in this thread to report calibration: the result is a notice on the Studies page, and it reaches you with the human's next message here.
 
 Never run those commands yourself: approval, calibration, starting, and pausing are the human's decisions.
+
+## Revising the spec later
+
+Once the study has run, `study_propose` with the same slug records a **pending** spec; the study keeps running on the old one. If the oracle is unchanged (budget, agents, scope limits), the human applies it with `bb study approve <slug>`. If the oracle changed (metric, guardrails, commands, protocol, bench hosts, holdout, protected paths), the human runs `bb study calibrate <slug>`: in-flight measurements are cancelled, best is calibrated under the new oracle, and `bb study start` opens a new segment.

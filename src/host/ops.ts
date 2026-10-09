@@ -40,19 +40,38 @@ class Tail {
   }
 }
 
-export async function exec(input: ExecInput, signal?: AbortSignal): Promise<ExecResult> {
+export interface SpawnOptions {
+  cwd: string;
+  command: string;
+  timeoutMs: number;
+  env?: Record<string, string>;
+  tailBytes?: number;
+  signal?: AbortSignal;
+  /** Called with the last complete output line, at most every `progressMs`. */
+  onLine?: (line: string) => void;
+  progressMs?: number;
+}
+
+/** Run a shell command in its own process group; kill the group on timeout or abort. */
+export async function spawnCommand(o: SpawnOptions): Promise<ExecResult> {
   const started = Date.now();
-  const tailBytes = input.tailBytes ?? 16 * 1024;
+  const tailBytes = o.tailBytes ?? 16 * 1024;
   return await new Promise<ExecResult>((resolve, reject) => {
-    const child = spawn("/bin/sh", ["-c", input.command], {
-      cwd: input.cwd,
-      env: { ...process.env, ...input.env },
+    if (o.signal?.aborted) {
+      reject(new Error("aborted before start"));
+      return;
+    }
+    const child = spawn("/bin/sh", ["-c", o.command], {
+      cwd: o.cwd,
+      env: { ...process.env, ...o.env },
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const out = new Tail(tailBytes);
     const err = new Tail(tailBytes);
     let timedOut = false;
+    let lastLine = "";
+    let lastEmit = 0;
     const kill = () => {
       try {
         if (child.pid) process.kill(-child.pid, "SIGKILL");
@@ -63,19 +82,36 @@ export async function exec(input: ExecInput, signal?: AbortSignal): Promise<Exec
     const timer = setTimeout(() => {
       timedOut = true;
       kill();
-    }, input.timeoutMs);
+    }, o.timeoutMs);
     const onAbort = () => kill();
-    signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (c: Buffer) => out.push(c));
-    child.stderr.on("data", (c: Buffer) => err.push(c));
+    o.signal?.addEventListener("abort", onAbort, { once: true });
+    const line = (c: Buffer) => {
+      if (!o.onLine) return;
+      const text = c.toString("utf8");
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (lines.length) lastLine = lines[lines.length - 1]!.slice(0, 500);
+      const now = Date.now();
+      if (now - lastEmit >= (o.progressMs ?? 5_000)) {
+        lastEmit = now;
+        o.onLine(lastLine);
+      }
+    };
+    child.stdout.on("data", (c: Buffer) => {
+      out.push(c);
+      line(c);
+    });
+    child.stderr.on("data", (c: Buffer) => {
+      err.push(c);
+      line(c);
+    });
     child.on("error", (e) => {
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+      o.signal?.removeEventListener("abort", onAbort);
       reject(e);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+      o.signal?.removeEventListener("abort", onAbort);
       resolve({
         exitCode: code,
         timedOut,
@@ -85,6 +121,10 @@ export async function exec(input: ExecInput, signal?: AbortSignal): Promise<Exec
       });
     });
   });
+}
+
+export async function exec(input: ExecInput, signal?: AbortSignal): Promise<ExecResult> {
+  return await spawnCommand({ ...input, ...(signal ? { signal } : {}) });
 }
 
 /** Run git with argv (no shell) and return trimmed stdout; throws on non-zero exit. */

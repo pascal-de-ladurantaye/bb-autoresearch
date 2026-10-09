@@ -11,6 +11,7 @@ import { MIGRATIONS } from "./src/db/schema.ts";
 import { Store } from "./src/db/store.ts";
 import { Engine } from "./src/engine.ts";
 import { hostContract, hostSignals } from "./src/host/contract.ts";
+import { ProgressBus } from "./src/host/runner.ts";
 import { errText } from "./src/pipeline.ts";
 import type { BbPort } from "./src/ports.ts";
 import { seededRng } from "./src/stats.ts";
@@ -32,7 +33,10 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     const now = deps.now ?? Date.now;
     const store = new Store(db, now);
     const client = bb.hosts.experimental_client({ contract: hostContract, experimental_signals: hostSignals });
-    const port = deps.port ? deps.port(bb) : createBbPort(bb, client);
+    // Host job progress streams back as signals; runners subscribe by job id.
+    const progress = new ProgressBus();
+    client.experimental_onSignal("progress", ({ payload }) => progress.emit(payload.key, payload.message));
+    const port = deps.port ? deps.port(bb) : createBbPort(bb, client, progress);
     const ctx: Ctx = {
       store,
       bb: port,
@@ -62,9 +66,10 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     bb.events.on("thread.deleted", ({ thread }) => safe("thread.deleted", () => engine.onThreadGone(thread.id, "deleted")));
     bb.events.on("turn.failed", (event) => safe("turn.failed", () => engine.onTurnFailed(event)));
     client.experimental_onWorkerExit(({ hostId }) => {
-      // In-flight host calls failed; the pipeline retries them on its next pass.
+      // In-flight host calls and jobs died with the worker: measurements on
+      // that host restart from scratch (partial samples discarded).
       bb.log.warn(`host worker exited on ${hostId}`);
-      engine.kick();
+      engine.onHostWorkerExit(hostId);
     });
 
     bb.background.service("engine", {

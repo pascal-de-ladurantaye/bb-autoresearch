@@ -224,4 +224,97 @@ export const MIGRATIONS: string[] = [
     delivered_round INTEGER
   )`,
   `CREATE INDEX notices_study ON notices (study_id, id)`,
+  // ---- M2 ----
+  /** A spec proposed while Running/Paused waits here until the human approves it. */
+  `ALTER TABLE studies ADD COLUMN pending_spec_version INTEGER`,
+  /** The active spec before a mid-run recalibration; restored if the new oracle fails calibration. */
+  `ALTER TABLE studies ADD COLUMN prev_spec_version INTEGER`,
+  `ALTER TABLE spec_versions ADD COLUMN bench_json TEXT`,
+  `ALTER TABLE segments ADD COLUMN spec_version INTEGER`,
+  `ALTER TABLE segments ADD COLUMN details_json TEXT`,
+  `ALTER TABLE candidates ADD COLUMN bench_host_id TEXT`,
+  /** 'pass' | 'fail' | null. The numbers stay in holdout_results and never reach agents. */
+  `ALTER TABLE candidates ADD COLUMN holdout TEXT`,
+  `ALTER TABLE candidates ADD COLUMN measure_restarts INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE threads ADD COLUMN profiles INTEGER NOT NULL DEFAULT 0`,
+  /** Bench hosts of a study (from the active spec), with health, cache, drift, and calibration per host. */
+  `CREATE TABLE bench_hosts (
+    study_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    entry TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    repo_path TEXT,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    status_at INTEGER,
+    offline_since INTEGER,
+    offline_notified_at INTEGER,
+    best_build_sha TEXT,
+    health_ok INTEGER,
+    health_at INTEGER,
+    health_json TEXT,
+    unhealthy_since INTEGER,
+    unhealthy_notified_at INTEGER,
+    deferred_until INTEGER,
+    evals_since_drift INTEGER NOT NULL DEFAULT 0,
+    drift_status TEXT,
+    drift_at INTEGER,
+    noise_floor REAL,
+    mde REAL,
+    eval_seconds REAL,
+    baseline_json TEXT,
+    PRIMARY KEY (study_id, host_id)
+  )`,
+  `CREATE TABLE health_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    context TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    problems_json TEXT NOT NULL,
+    report_json TEXT NOT NULL
+  )`,
+  `CREATE INDEX health_checks_study ON health_checks (study_id, host_id, id)`,
+  `CREATE TABLE drift_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    segment INTEGER NOT NULL,
+    best_sha TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    status TEXT NOT NULL,
+    pairs INTEGER,
+    noise REAL,
+    calibrated REAL,
+    ratio REAL,
+    median REAL
+  )`,
+  `CREATE TABLE transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    chunks INTEGER NOT NULL,
+    ms REAL NOT NULL,
+    ok INTEGER NOT NULL,
+    error TEXT,
+    at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX transfers_study ON transfers (study_id, id)`,
+  /** Private: holdout numbers. Never read by any view, prompt, tool, or event. */
+  `CREATE TABLE holdout_results (
+    candidate_id INTEGER PRIMARY KEY,
+    study_id TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    pass INTEGER NOT NULL,
+    runs INTEGER NOT NULL,
+    effect REAL,
+    details_json TEXT NOT NULL
+  )`,
 ];

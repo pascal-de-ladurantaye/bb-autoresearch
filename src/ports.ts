@@ -29,8 +29,18 @@ export interface SpawnWorkerArgs {
   permissionMode?: "accept-edits" | "auto" | "full";
 }
 
+export interface HostInfo {
+  id: string;
+  name: string;
+  status: "connected" | "disconnected";
+}
+
 export interface BbPort {
   primaryHostId(): Promise<string | null>;
+  /** Enrolled BB machines (bench host names and ids are resolved against these). */
+  listHosts(): Promise<HostInfo[]>;
+  /** Connection state of one machine; "unknown" when BB can't say. */
+  hostStatus(hostId: string): Promise<"connected" | "disconnected" | "unknown">;
   /** The project's checkout on `hostId`, if it has one. */
   projectCheckout(projectId: string, hostId: string): Promise<string | null>;
   ensureSection(name: string): Promise<string | null>;

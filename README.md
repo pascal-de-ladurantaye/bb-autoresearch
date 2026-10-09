@@ -7,10 +7,11 @@ every keep or discard decision.
 Design: [docs/design.md](docs/design.md) (see "Implementation notes" for where
 the code differs from the design).
 
-Status: **M1** (parallel workers with a serialized bench queue, adaptive W,
-rebase/conflict handling, the Studies page and thread badge). The BB server's
-own machine is still both edit and bench host. M2 (remote bench hosts, drift,
-holdout, segments) and M3 (harvest, remaining tabs) are not built yet.
+Status: **M2** (remote bench hosts fed by git bundles, machine health
+checks, drift checks, a hidden holdout, guardrails, oracle segments, audited
+human controls) on top of M1 (parallel workers, serialized bench queue,
+adaptive W, the Studies page and thread badge). M3 (harvest, remaining tabs,
+budgets and notifications) is not built yet.
 
 ## Use it
 
@@ -20,8 +21,11 @@ holdout, segments) and M3 (harvest, remaining tabs) are not built yet.
    becomes the study thread.
 2. `bb study show <slug>`: review the spec.
 3. `bb study calibrate <slug> [--wait]`: approve the spec; gates run on the base
-   commit, then A/A measurement finds the noise floor and minimum detectable
-   effect.
+   commit, then A/A measurement on every bench host finds the noise floor and
+   minimum detectable effect. `oracle.bench_hosts` names BB machines (or
+   `local`); a named machine keeps its own clone under the plugin's host data
+   dir (`<dataDir>/bench/<slug>/repo.git`) and receives commits only as git
+   bundles.
 4. `bb study start <slug>`: approve calibration. Up to `max_workers` workers
    spawn (hidden threads in managed worktrees from `studies/<slug>/best`; W
    adapts to think and eval times), submit candidates, and get verdicts as
@@ -32,7 +36,13 @@ holdout, segments) and M3 (harvest, remaining tabs) are not built yet.
    veto), Candidates (verdicts, samples, diffs, worker threads). Study and
    worker threads carry a header badge. The CLI has the same controls:
    `bb study ideas add <slug> "<idea>"`, `bb study concurrency <slug> <n|auto>`,
-   `bb study pause|resume`, and `bb study archive <slug>` to stop for good.
+   `bb study pause|resume`, `bb study bench <slug>` (health, bundles, drift,
+   segments), and `bb study archive <slug>` to stop for good (it also deletes
+   the bench clones).
+6. To change the oracle mid-run, have the study thread call `study_propose`
+   again: the spec waits for approval. `bb study approve` applies a change
+   that leaves the oracle alone; `bb study calibrate` + `bb study start`
+   recalibrate on best and open a new segment.
 
 Wins are squashed onto the local branch `studies/<slug>/best`, one commit per
 promoted idea. Every candidate is kept under `refs/studies/<slug>/c/<n>`.
@@ -46,8 +56,13 @@ Nothing is pushed.
 | `app.tsx` | Frontend entry: Studies nav panel and the thread-header badge |
 | `src/app/` | Study page (Overview, Ideas, Candidates), trajectory chart, badge, rpc data hooks |
 | `components/`, `lib/` | Vendored UI source from the BB registry (button, card, input, icon) |
-| `host.ts` | `bb.host` entry: git and command execution on the edit/bench host |
-| `src/host/` | Host RPC contract, host-side ops, server-side `HostRunner` (RPC or in-process) |
+| `host.ts` | `bb.host` entry: git, background jobs, bundles, bench clone and health on the edit/bench host |
+| `src/host/` | Host RPC contract, host-side ops (`ops`, `jobs`, `bundle`, `health`), server-side `HostRunner` (RPC or in-process) |
+| `src/bench.ts` | Bench host resolution and the per-host measuring site (transfer, cached best build, checkouts, runs) |
+| `src/transfer.ts` | Chunked `git bundle` relay from the edit host to a bench clone, within the host RPC limits |
+| `src/health.ts` | Health policy and the pre-measurement check (deferral, notices) |
+| `src/drift.ts` | A/A drift checks on best |
+| `src/holdout.ts` | Holdout runs before promotion; numbers stay in a private table |
 | `src/spec.ts` | TOML spec parsing, validation, oracle hash, ref names |
 | `src/scope.ts` | Scope check (globs, protected paths, diff limits) |
 | `src/stats.ts` | Paired relative differences, bootstrap CI of the median, sequential test, A/A calibration |

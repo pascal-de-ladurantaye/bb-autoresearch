@@ -37,6 +37,8 @@ export interface StudyRow {
   target_workers: number | null;
   running_since: number | null;
   running_seconds: number;
+  pending_spec_version: number | null;
+  prev_spec_version: number | null;
 }
 
 export interface SpecVersionRow {
@@ -47,6 +49,7 @@ export interface SpecVersionRow {
   oracle_hash: string;
   created_at: number;
   approved_at: number | null;
+  bench_json: string | null;
 }
 
 export interface SegmentRow {
@@ -60,6 +63,8 @@ export interface SegmentRow {
   gate_seconds: number | null;
   report: string | null;
   created_at: number;
+  spec_version: number | null;
+  details_json: string | null;
 }
 
 export interface IdeaRow {
@@ -101,6 +106,7 @@ export interface ThreadRow {
   conflict_refunds: number;
   pending_notice: string | null;
   finishing_at: number | null;
+  profiles: number;
 }
 
 export interface CandidateRow {
@@ -134,6 +140,9 @@ export interface CandidateRow {
   lines_added: number;
   lines_deleted: number;
   rebases: number;
+  bench_host_id: string | null;
+  holdout: "pass" | "fail" | null;
+  measure_restarts: number;
 }
 
 export interface FindingRow {
@@ -163,7 +172,7 @@ export interface BenchIntervalRow {
   study_id: string;
   host_id: string;
   lock_key: string;
-  kind: "measure" | "profile" | "calibration";
+  kind: "measure" | "profile" | "calibration" | "drift";
   candidate_id: number | null;
   started_at: number;
   ended_at: number | null;
@@ -176,6 +185,87 @@ export interface NoticeRow {
   kind: string;
   text: string;
   delivered_round: number | null;
+}
+
+export type BenchMode = "shared" | "clone";
+
+export interface BenchHostRow {
+  study_id: string;
+  host_id: string;
+  name: string;
+  /** The spec entry it was resolved from ("local", an id, or a name). */
+  entry: string;
+  mode: BenchMode;
+  position: number;
+  active: number;
+  /** Clone mode: the bench-owned bare clone on that host. Shared mode: the project checkout. */
+  repo_path: string | null;
+  status: "unknown" | "online" | "offline";
+  status_at: number | null;
+  offline_since: number | null;
+  offline_notified_at: number | null;
+  best_build_sha: string | null;
+  health_ok: number | null;
+  health_at: number | null;
+  health_json: string | null;
+  unhealthy_since: number | null;
+  unhealthy_notified_at: number | null;
+  deferred_until: number | null;
+  evals_since_drift: number;
+  drift_status: "ok" | "drift" | "running" | null;
+  drift_at: number | null;
+  noise_floor: number | null;
+  mde: number | null;
+  eval_seconds: number | null;
+  baseline_json: string | null;
+}
+
+export interface HealthCheckRow {
+  id: number;
+  study_id: string;
+  host_id: string;
+  at: number;
+  context: string;
+  ok: number;
+  problems_json: string;
+  report_json: string;
+}
+
+export interface DriftCheckRow {
+  id: number;
+  study_id: string;
+  host_id: string;
+  segment: number;
+  best_sha: string;
+  started_at: number;
+  finished_at: number | null;
+  status: "running" | "ok" | "drift" | "aborted" | "error";
+  pairs: number | null;
+  noise: number | null;
+  calibrated: number | null;
+  ratio: number | null;
+  median: number | null;
+}
+
+export interface TransferRow {
+  id: number;
+  study_id: string;
+  host_id: string;
+  sha: string;
+  purpose: string;
+  bytes: number;
+  chunks: number;
+  ms: number;
+  ok: number;
+  error: string | null;
+  at: number;
+}
+
+export interface ResolvedBenchHost {
+  entry: string;
+  hostId: string;
+  name: string;
+  mode: BenchMode;
 }
 
 export interface Budget {
@@ -248,6 +338,10 @@ export class Store {
       this.event(id, "study.state", actor, { from: before?.state, to: state, ...data });
     });
   }
+  /** True once the study has ever been Running (a mid-run oracle change, not a first calibration). */
+  hasRun(studyId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM events WHERE study_id = ? AND kind = 'study.state' AND data_json LIKE '%"to":"running"%' LIMIT 1`).get(studyId));
+  }
   budget(study: StudyRow): Budget {
     try {
       return { bench_seconds: 0, ...(JSON.parse(study.budget) as Partial<Budget>) };
@@ -264,16 +358,31 @@ export class Store {
   }
 
   // ---- spec versions ----
-  addSpecVersion(studyId: string, toml: string, spec: StudySpec, oracleHash: string, actor: string): number {
+  /**
+   * Record a spec version. Before Running it becomes the active version at
+   * once (and resets calibration); with `pending` it waits for the human's
+   * approval while the study keeps running on the active version.
+   */
+  addSpecVersion(studyId: string, toml: string, spec: StudySpec, oracleHash: string, actor: string, opts: { bench?: ResolvedBenchHost[]; pending?: boolean } = {}): number {
     return this.tx(() => {
       const v = ((this.db.prepare(`SELECT COALESCE(MAX(version), 0) AS v FROM spec_versions WHERE study_id = ?`).get(studyId) as { v: number }).v) + 1;
       this.db
-        .prepare(`INSERT INTO spec_versions (study_id, version, spec_toml, spec_json, oracle_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run(studyId, v, toml, JSON.stringify(spec), oracleHash, this.now());
-      this.updateStudy(studyId, { spec_version: v, calibration_status: null, calibration_json: null, calibration_approved_at: null });
-      this.event(studyId, "spec.proposed", actor, { version: v, oracle_hash: oracleHash });
+        .prepare(`INSERT INTO spec_versions (study_id, version, spec_toml, spec_json, oracle_hash, created_at, bench_json) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(studyId, v, toml, JSON.stringify(spec), oracleHash, this.now(), opts.bench ? JSON.stringify(opts.bench) : null);
+      if (opts.pending) this.updateStudy(studyId, { pending_spec_version: v });
+      else this.updateStudy(studyId, { spec_version: v, pending_spec_version: null, calibration_status: null, calibration_json: null, calibration_approved_at: null });
+      this.event(studyId, "spec.proposed", actor, { version: v, oracle_hash: oracleHash, pending: Boolean(opts.pending) });
       return v;
     });
+  }
+  specOfVersion(studyId: string, version: number): StudySpec {
+    const row = this.specVersion(studyId, version);
+    if (!row) throw new Error(`spec v${version} not found`);
+    return JSON.parse(row.spec_json) as StudySpec;
+  }
+  resolvedBench(studyId: string, version: number): ResolvedBenchHost[] {
+    const row = this.specVersion(studyId, version);
+    return row?.bench_json ? (JSON.parse(row.bench_json) as ResolvedBenchHost[]) : [];
   }
   specVersion(studyId: string, version: number): SpecVersionRow | undefined {
     return this.db.prepare(`SELECT * FROM spec_versions WHERE study_id = ? AND version = ?`).get(studyId, version) as SpecVersionRow | undefined;
@@ -291,16 +400,19 @@ export class Store {
   }
 
   // ---- segments ----
-  upsertSegment(row: Omit<SegmentRow, "created_at">): void {
+  upsertSegment(row: Omit<SegmentRow, "created_at" | "spec_version" | "details_json"> & { spec_version?: number | null; details_json?: string | null }): void {
     this.db
       .prepare(
-        `INSERT INTO segments (study_id, k, baseline_sha, oracle_hash, noise_floor, mde, eval_seconds, gate_seconds, report, created_at)
-         VALUES (@study_id, @k, @baseline_sha, @oracle_hash, @noise_floor, @mde, @eval_seconds, @gate_seconds, @report, @created_at)
+        `INSERT INTO segments (study_id, k, baseline_sha, oracle_hash, noise_floor, mde, eval_seconds, gate_seconds, report, created_at, spec_version, details_json)
+         VALUES (@study_id, @k, @baseline_sha, @oracle_hash, @noise_floor, @mde, @eval_seconds, @gate_seconds, @report, @created_at, @spec_version, @details_json)
          ON CONFLICT (study_id, k) DO UPDATE SET baseline_sha = excluded.baseline_sha, oracle_hash = excluded.oracle_hash,
            noise_floor = excluded.noise_floor, mde = excluded.mde, eval_seconds = excluded.eval_seconds,
-           gate_seconds = excluded.gate_seconds, report = excluded.report`,
+           gate_seconds = excluded.gate_seconds, report = excluded.report, spec_version = excluded.spec_version, details_json = excluded.details_json`,
       )
-      .run({ ...row, created_at: this.now() });
+      .run({ spec_version: null, details_json: null, ...row, created_at: this.now() });
+  }
+  segments(studyId: string): SegmentRow[] {
+    return this.db.prepare(`SELECT * FROM segments WHERE study_id = ? ORDER BY k`).all(studyId) as SegmentRow[];
   }
   segment(studyId: string, k: number): SegmentRow | undefined {
     return this.db.prepare(`SELECT * FROM segments WHERE study_id = ? AND k = ?`).get(studyId, k) as SegmentRow | undefined;
@@ -565,5 +677,88 @@ export class Store {
       .run(studyId, JSON.stringify(proposal), authorThreadId, this.now());
     this.event(studyId, "harvest.proposed", authorThreadId, { proposal: Number(r.lastInsertRowid) });
     return Number(r.lastInsertRowid);
+  }
+
+  // ---- bench hosts (M2) ----
+  /** Make the study's bench host rows match `hosts` (the active spec); removed hosts become inactive. */
+  syncBenchHosts(studyId: string, hosts: ResolvedBenchHost[]): void {
+    this.tx(() => {
+      this.db.prepare(`UPDATE bench_hosts SET active = 0 WHERE study_id = ?`).run(studyId);
+      hosts.forEach((h, i) => {
+        this.db
+          .prepare(
+            `INSERT INTO bench_hosts (study_id, host_id, name, entry, mode, position, active) VALUES (?, ?, ?, ?, ?, ?, 1)
+             ON CONFLICT (study_id, host_id) DO UPDATE SET name = excluded.name, entry = excluded.entry, mode = excluded.mode, position = excluded.position, active = 1`,
+          )
+          .run(studyId, h.hostId, h.name, h.entry, h.mode, i);
+      });
+    });
+  }
+  benchHosts(studyId: string, opts: { all?: boolean } = {}): BenchHostRow[] {
+    return this.db.prepare(`SELECT * FROM bench_hosts WHERE study_id = ?${opts.all ? "" : " AND active = 1"} ORDER BY position, host_id`).all(studyId) as BenchHostRow[];
+  }
+  benchHost(studyId: string, hostId: string): BenchHostRow | undefined {
+    return this.db.prepare(`SELECT * FROM bench_hosts WHERE study_id = ? AND host_id = ?`).get(studyId, hostId) as BenchHostRow | undefined;
+  }
+  updateBenchHost(studyId: string, hostId: string, patch: Partial<Omit<BenchHostRow, "study_id" | "host_id">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    const sets = keys.map((k) => `${k} = @${k}`).join(", ");
+    this.db.prepare(`UPDATE bench_hosts SET ${sets} WHERE study_id = @__s AND host_id = @__h`).run({ ...patch, __s: studyId, __h: hostId });
+  }
+  /** Every study's bench hosts on `hostId` (a host worker exit affects all of them). */
+  benchHostsOn(hostId: string): BenchHostRow[] {
+    return this.db.prepare(`SELECT * FROM bench_hosts WHERE host_id = ? AND active = 1`).all(hostId) as BenchHostRow[];
+  }
+
+  addHealthCheck(row: Omit<HealthCheckRow, "id" | "at">): number {
+    const r = this.db
+      .prepare(`INSERT INTO health_checks (study_id, host_id, at, context, ok, problems_json, report_json) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.study_id, row.host_id, this.now(), row.context, row.ok, row.problems_json, row.report_json);
+    return Number(r.lastInsertRowid);
+  }
+  healthChecks(studyId: string, opts: { hostId?: string; limit?: number } = {}): HealthCheckRow[] {
+    const host = opts.hostId ? ` AND host_id = ?` : "";
+    return this.db
+      .prepare(`SELECT * FROM health_checks WHERE study_id = ?${host} ORDER BY id DESC LIMIT ?`)
+      .all(studyId, ...(opts.hostId ? [opts.hostId] : []), opts.limit ?? 20) as HealthCheckRow[];
+  }
+
+  openDriftCheck(row: Pick<DriftCheckRow, "study_id" | "host_id" | "segment" | "best_sha">): number {
+    const r = this.db
+      .prepare(`INSERT INTO drift_checks (study_id, host_id, segment, best_sha, started_at, status) VALUES (?, ?, ?, ?, ?, 'running')`)
+      .run(row.study_id, row.host_id, row.segment, row.best_sha, this.now());
+    return Number(r.lastInsertRowid);
+  }
+  closeDriftCheck(id: number, patch: Partial<Pick<DriftCheckRow, "status" | "pairs" | "noise" | "calibrated" | "ratio" | "median">>): void {
+    const keys = Object.keys(patch);
+    const sets = keys.map((k) => `${k} = @${k}`).join(", ");
+    this.db.prepare(`UPDATE drift_checks SET ${sets}${keys.length ? ", " : ""}finished_at = @__now WHERE id = @__id`).run({ ...patch, __now: this.now(), __id: id });
+  }
+  driftChecks(studyId: string, limit = 20): DriftCheckRow[] {
+    return this.db.prepare(`SELECT * FROM drift_checks WHERE study_id = ? ORDER BY id DESC LIMIT ?`).all(studyId, limit) as DriftCheckRow[];
+  }
+  /** Drift checks left running by a crash (reconcile). */
+  abortRunningDriftChecks(): number {
+    return this.db.prepare(`UPDATE drift_checks SET status = 'aborted', finished_at = ? WHERE status = 'running'`).run(this.now()).changes;
+  }
+
+  addTransfer(row: Omit<TransferRow, "id" | "at">): void {
+    this.db
+      .prepare(`INSERT INTO transfers (study_id, host_id, sha, purpose, bytes, chunks, ms, ok, error, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.study_id, row.host_id, row.sha, row.purpose, row.bytes, row.chunks, row.ms, row.ok, row.error, this.now());
+  }
+  transfers(studyId: string, limit = 50): TransferRow[] {
+    return this.db.prepare(`SELECT * FROM transfers WHERE study_id = ? ORDER BY id DESC LIMIT ?`).all(studyId, limit) as TransferRow[];
+  }
+
+  /** Private holdout numbers: written here, read only by tests and the human's own SQLite access. */
+  recordHoldout(row: { candidate_id: number; study_id: string; pass: boolean; runs: number; effect: number | null; details: unknown }): void {
+    this.db
+      .prepare(
+        `INSERT INTO holdout_results (candidate_id, study_id, at, pass, runs, effect, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (candidate_id) DO UPDATE SET at = excluded.at, pass = excluded.pass, runs = excluded.runs, effect = excluded.effect, details_json = excluded.details_json`,
+      )
+      .run(row.candidate_id, row.study_id, this.now(), row.pass ? 1 : 0, row.runs, row.effect, JSON.stringify(row.details));
   }
 }

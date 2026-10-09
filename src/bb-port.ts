@@ -1,7 +1,7 @@
 // Adapts bb.sdk + bb.hosts to the engine's BbPort.
 import type { BbPluginApi, ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type { HostContract, hostSignals } from "./host/contract.ts";
-import { BbHostRunner, type HostRunner } from "./host/runner.ts";
+import { BbHostRunner, type HostRunner, type ProgressBus } from "./host/runner.ts";
 import type { BbPort, EnvironmentInfo, SpawnWorkerArgs, ThreadInfo } from "./ports.ts";
 
 function isNotFound(e: unknown): boolean {
@@ -9,11 +9,25 @@ function isNotFound(e: unknown): boolean {
   return /\b404\b|not[ _]found/iu.test(msg);
 }
 
-export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<HostContract, typeof hostSignals>): BbPort {
+export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<HostContract, typeof hostSignals>, progress?: ProgressBus): BbPort {
   const runners = new Map<string, HostRunner>();
   return {
     async primaryHostId() {
       return (await bb.sdk.system.config()).primaryHostId ?? null;
+    },
+    async listHosts() {
+      const hosts = await bb.sdk.hosts.list();
+      return hosts.filter((h) => h.lifecycle.phase === "active").map((h) => ({ id: h.id, name: h.name, status: h.status }));
+    },
+    async hostStatus(hostId) {
+      try {
+        const h = await bb.sdk.hosts.get({ hostId });
+        if (h.lifecycle.phase !== "active") return "disconnected";
+        return h.status;
+      } catch (e) {
+        if (isNotFound(e)) return "disconnected";
+        return "unknown";
+      }
     },
     async projectCheckout(projectId, hostId) {
       const project = await bb.sdk.projects.get({ projectId });
@@ -100,7 +114,7 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
     hostRunner(hostId) {
       let r = runners.get(hostId);
       if (!r) {
-        r = new BbHostRunner(client, hostId);
+        r = new BbHostRunner(client, hostId, progress);
         runners.set(hostId, r);
       }
       return r;

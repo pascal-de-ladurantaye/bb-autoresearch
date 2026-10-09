@@ -63,6 +63,9 @@ describe("frontend: Studies panel and thread badge", () => {
     await page.findByText("Trajectory");
     await page.findByText(/Bench utilization/u);
     expect(page.getAllByText("−20.0%").length).toBeGreaterThan(0);
+    // M2: bench hosts with health, drift and segment on the Overview.
+    await page.findByText(/Bench hosts \(1\) · segment 1 · oracle [0-9a-f]{16}/u);
+    expect(page.getByLabelText("Bench hosts").textContent).toMatch(/local checkouts.*healthy.*drift not run/u);
     // Pause from the page: the real handler runs.
     fireEvent.click(await page.findByText("Pause"));
     await waitFor(() => expect(page.inspection.rpcCalls.some((c) => c.method === "study.pause")).toBe(true));

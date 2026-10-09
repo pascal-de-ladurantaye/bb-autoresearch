@@ -2,15 +2,34 @@
 // handling, strategist rounds, budget), worker tools, and reconciliation.
 // Only this module and the pipeline change study state.
 import { randomUUID } from "node:crypto";
+import { resolveBenchHosts } from "./bench.ts";
 import { recordCalibration, runCalibration, type CalibrationReport } from "./calibration.ts";
 import type { Ctx } from "./context.ts";
-import type { CandidateRow, IdeaRow, StudyRow, ThreadRow } from "./db/store.ts";
+import type { BenchHostRow, CandidateRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
+import { checkHealth } from "./health.ts";
 import { BENCH_BOUND_STAGES, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
 import { clip, formatDuration, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
 import { budgetExhausted, idleAction, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
 
 export type Role = "worker" | "strategist" | "creator";
+
+/**
+ * Who changed a human control. BB gives plugins no caller-thread identity
+ * for RPC (app, CLI and agents are all "client"), and the CLI's thread id
+ * comes from the invoking shell, so this is recorded, not trusted.
+ */
+export interface Caller {
+  via: "cli" | "rpc" | "internal";
+  threadId?: string | null;
+  pluginId?: string | null;
+}
+
+export function callerActor(c: Caller): string {
+  if (c.via === "cli") return c.threadId ? `cli:thread:${c.threadId}` : "cli:human";
+  if (c.via === "rpc") return c.pluginId ? `rpc:plugin:${c.pluginId}` : "rpc:client";
+  return "plugin";
+}
 
 export class EngineError extends Error {
   constructor(message: string) {
@@ -33,6 +52,7 @@ export class Engine {
       systemPause: (study, reason) => this.systemPause(study.id, reason),
       maxWorkers: (study) => this.maxWorkers(study),
       bestMoved: (study, winner, promoted) => void this.notifyBestMoved(study, winner, promoted).catch((e) => this.ctx.bb.log("warn", `best-moved notice: ${errText(e)}`)),
+      notify: (study, kind, text) => this.notify(study.id, kind, text),
     });
   }
 
@@ -104,21 +124,26 @@ export class Engine {
     const { spec, warnings } = parsed;
     const existingRow = this.store.threadById(threadId);
     let study: StudyRow | undefined;
+    let hostId: string;
     if (existingRow) {
       study = this.store.study(existingRow.study_id);
       if (!study || study.slug !== spec.study.slug) {
         throw new EngineError(`This thread already drives study ${study?.slug ?? "?"}; a revised spec must keep that slug.`);
       }
-      if (!["draft", "calibrating"].includes(study.state)) {
-        throw new EngineError(`Study ${study.slug} is ${study.state}. Oracle changes after start (new segments) arrive in M2; pause and archive to start over.`);
-      }
+      if (study.state === "archived") throw new EngineError(`Study ${study.slug} is archived.`);
       if (this.calibrations.has(study.id)) throw new EngineError("Calibration is running; wait for it before revising the spec.");
+      hostId = study.host_id!;
     } else {
       if (this.store.study(spec.study.slug)) throw new EngineError(`A study named ${spec.study.slug} already exists; pick another slug.`);
-      const hostId = await this.ctx.bb.primaryHostId();
-      if (!hostId) throw new EngineError("The BB server has no local machine identity; M0 runs studies on the server's own machine.");
+      const primary = await this.ctx.bb.primaryHostId();
+      if (!primary) throw new EngineError("The BB server has no local machine identity; studies edit on the server's own machine.");
+      hostId = primary;
+    }
+    const resolved = resolveBenchHosts(spec.oracle.bench_hosts, await this.ctx.bb.listHosts().catch(() => []), hostId);
+    if (!resolved.ok) throw new EngineError(`Spec is invalid:\n${resolved.errors.map((e) => `- ${e}`).join("\n")}`);
+    if (!study) {
       const repo = await this.ctx.bb.projectCheckout(projectId, hostId);
-      if (!repo) throw new EngineError("This project has no checkout on the server's machine; M0 needs one (remote edit hosts arrive in M2).");
+      if (!repo) throw new EngineError("This project has no checkout on the server's machine; the edit host must be the server's machine.");
       const id = `std_${randomUUID().replace(/-/gu, "").slice(0, 12)}`;
       this.store.tx(() => {
         this.store.insertStudy({ id, slug: spec.study.slug, project_id: projectId, host_id: hostId, repo_path: repo, study_thread_id: threadId });
@@ -128,32 +153,110 @@ export class Engine {
       study = this.store.study(id)!;
       await this.ctx.bb.setMetadata(threadId, { study: spec.study.slug, role: "strategist" }).catch((e) => this.ctx.bb.log("warn", `metadata: ${errText(e)}`));
     }
-    const version = this.store.addSpecVersion(study.id, toml, spec, oracleHash(spec), threadId);
+    const benchText = resolved.hosts.map((h) => `${h.name} (${h.mode === "clone" ? "own clone, git bundles" : "local checkouts"})`).join(", ");
+    const hasRun = this.store.hasRun(study.id);
+    if (hasRun) {
+      // Mid-run: the study keeps its active spec until the human approves this one.
+      const active = this.store.spec(study);
+      const changed = oracleHash(active) !== oracleHash(spec);
+      const version = this.store.addSpecVersion(study.id, toml, spec, oracleHash(spec), threadId, { bench: resolved.hosts, pending: true });
+      this.publish(study.id);
+      await this.notify(study.id, "spec.proposed", `Spec v${version} for \`${study.slug}\` was proposed and waits for approval (${changed ? "the oracle changed: approving starts a new segment with recalibration, `bb study calibrate`" : "oracle unchanged: `bb study approve` applies it"}).`);
+      return [
+        `Spec v${version} recorded for \`${spec.study.slug}\`; the study keeps running on spec v${study.spec_version} until the human approves it.`,
+        changed
+          ? `The oracle changed (${oracleHash(active)} → ${oracleHash(spec)}). Approval (\`bb study calibrate ${spec.study.slug}\`) moves the study to Calibrating: in-flight measurements are cancelled, best is calibrated under the new oracle, and a new segment starts once the human runs \`bb study start\`.`
+          : `The oracle is unchanged, so no recalibration is needed: \`bb study approve ${spec.study.slug}\` applies it.`,
+        ...warnings.map((w) => `Warning: ${w}`),
+      ].join("\n");
+    }
+    const version = this.store.addSpecVersion(study.id, toml, spec, oracleHash(spec), threadId, { bench: resolved.hosts });
     if (study.state === "calibrating") this.store.setStudyState(study.id, "draft", threadId, { reason: "spec revised" });
     this.publish(study.id);
     return [
-      `Study \`${spec.study.slug}\` drafted with spec v${version} (oracle ${oracleHash(spec)}), repo ${study.repo_path} on this machine.`,
+      `Study \`${spec.study.slug}\` drafted with spec v${version} (oracle ${oracleHash(spec)}), repo ${study.repo_path} on this machine. Bench: ${benchText}.`,
       ...warnings.map((w) => `Warning: ${w}`),
       "",
       "Next steps are the human's: review with `bb study show " + spec.study.slug + "`, then approve and calibrate with `bb study calibrate " + spec.study.slug + "`.",
-      "Calibration runs the gates on the base commit and repeated A/A measurements to find the noise floor. Then `bb study start` begins the run.",
+      "Calibration runs the gates on the base commit and repeated A/A measurements on every bench host to find the noise floor. Then `bb study start` begins the run.",
       "Seed ideas now with `bb study ideas add` (human) or wait for your first strategist round.",
     ].join("\n");
   }
 
-  /** Approve the current spec and start calibration in the background. */
+  /** Bench hosts of a spec version (pre-M2 versions: the edit host, shared). */
+  private benchOf(study: StudyRow, version: number): ResolvedBenchHost[] {
+    const r = this.store.resolvedBench(study.id, version);
+    return r.length ? r : [{ entry: "local", hostId: study.host_id!, name: "local", mode: "shared" }];
+  }
+
+  /** Apply a pending spec whose oracle is unchanged (budget, agents, scope limits): no recalibration. */
+  approve(slug: string, actor: string): string {
+    const study = this.study(slug);
+    const pending = study.pending_spec_version;
+    if (pending === null) throw new EngineError(`${slug} has no pending spec to approve`);
+    const next = this.store.specOfVersion(study.id, pending);
+    if (oracleHash(next) !== oracleHash(this.store.spec(study))) {
+      throw new EngineError(`spec v${pending} changes the oracle; approve it with \`bb study calibrate ${slug}\` (new segment, recalibration)`);
+    }
+    this.store.approveSpec(study.id, pending, actor);
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, { spec_version: pending, pending_spec_version: null });
+      this.store.event(study.id, "spec.applied", actor, { version: pending, from: study.spec_version, recalibrated: false });
+    });
+    this.publish(study.id);
+    this.kick();
+    return `${slug}: spec v${pending} applied (oracle unchanged, segment ${study.segment} continues).`;
+  }
+
+  /**
+   * Approve the current (or pending) spec and start calibration in the
+   * background. Before Running this is the first calibration. Mid-run it is
+   * an oracle change: in-flight measurements are cancelled, queued
+   * candidates go back to the gate, best is calibrated under the new oracle,
+   * and `bb study start` then opens a new segment.
+   */
   async calibrate(slug: string, actor: string): Promise<string> {
     const study = this.study(slug);
-    if (!["draft", "calibrating"].includes(study.state)) throw new EngineError(`study ${slug} is ${study.state}; calibrate applies to draft studies in M0`);
     if (this.calibrations.has(study.id)) return `Calibration of ${slug} is already running.`;
-    if (this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length) throw new EngineError("workers are still running");
-    this.store.approveSpec(study.id, study.spec_version, actor);
+    const midRun = this.store.hasRun(study.id);
+    if (!midRun) {
+      if (!["draft", "calibrating"].includes(study.state)) throw new EngineError(`study ${slug} is ${study.state}`);
+      if (this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length) throw new EngineError("workers are still running");
+      this.store.approveSpec(study.id, study.spec_version, actor);
+      this.store.syncBenchHosts(study.id, this.benchOf(study, study.spec_version));
+      this.store.tx(() => {
+        this.store.updateStudy(study.id, { calibration_status: "running", calibration_json: null, calibration_approved_at: null });
+        this.store.setStudyState(study.id, "calibrating", actor, { spec_version: study.spec_version });
+      });
+      this.startCalibrationJob(study.id);
+      return `Spec v${study.spec_version} approved. Calibrating ${slug}: gates on the base commit, then A/A measurement on ${this.store.benchHosts(study.id).length} bench host(s). Check progress with \`bb study show ${slug}\`.`;
+    }
+    if (study.state === "archived") throw new EngineError(`${slug} is archived`);
+    const version = study.pending_spec_version ?? study.spec_version;
+    // Measurements under the old oracle stop now; queued candidates are gated again under the new one.
+    const cancelled = this.pipeline.cancelMeasurements((e) => e.studyId === study.id, "oracle change: recalibrating", { regate: true });
+    const regated = this.store.candidates(study.id, { stages: ["queued"] });
+    this.store.approveSpec(study.id, version, actor);
     this.store.tx(() => {
-      this.store.updateStudy(study.id, { calibration_status: "running", calibration_json: null, calibration_approved_at: null });
-      this.store.setStudyState(study.id, "calibrating", actor, { spec_version: study.spec_version });
+      for (const c of regated) {
+        this.store.deleteSamples(c.id);
+        this.store.updateCandidate(c.id, { stage: "gating" });
+      }
+      this.store.updateStudy(study.id, {
+        prev_spec_version: study.spec_version,
+        spec_version: version,
+        pending_spec_version: null,
+        calibration_status: "running",
+        calibration_json: null,
+        calibration_approved_at: null,
+      });
+      this.store.setStudyState(study.id, "calibrating", actor, { spec_version: version, from_spec: study.spec_version, mid_run: true });
+      this.store.event(study.id, "segment.recalibrating", actor, { from_segment: study.segment, spec_version: version, cancelled, regated: regated.length });
     });
+    this.store.syncBenchHosts(study.id, this.benchOf(study, version));
     this.startCalibrationJob(study.id);
-    return `Spec v${study.spec_version} approved. Calibrating ${slug}: gates on the base commit, then A/A measurement. Check progress with \`bb study show ${slug}\`.`;
+    this.publish(study.id);
+    return `Spec v${version} approved for ${slug}: recalibrating on the current best (${cancelled} measurement(s) cancelled, ${regated.length} queued candidate(s) sent back to the gate). Workers keep editing; \`bb study start ${slug}\` approves the calibration and opens segment ${study.segment + 1}.`;
   }
 
   private startCalibrationJob(studyId: string): void {
@@ -161,6 +264,11 @@ export class Engine {
       try {
         const report = await runCalibration(this.ctx, this.pipeline, studyId);
         const study = this.store.study(studyId)!;
+        if (!report.ok && study.prev_spec_version !== null && this.store.hasRun(study.id)) {
+          // A new oracle that fails calibration mid-run: keep the old one and pause.
+          this.restorePreviousSpec(study, report);
+          return;
+        }
         await recordCalibration(this.ctx, study, report);
         await this.notify(studyId, report.ok ? "calibration.ready" : "calibration.failed", calibrationNotice(this.store.study(studyId)!, report));
       } catch (e) {
@@ -175,6 +283,20 @@ export class Engine {
       }
     })();
     this.calibrations.set(studyId, job);
+  }
+
+  private restorePreviousSpec(study: StudyRow, report: CalibrationReport): void {
+    const prev = study.prev_spec_version!;
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, { spec_version: prev, prev_spec_version: null, calibration_status: "ready", calibration_json: JSON.stringify(report), calibration_approved_at: this.ctx.now() });
+      this.store.setStudyState(study.id, "paused", "plugin", { reason: `the new oracle (spec v${study.spec_version}) failed calibration; kept spec v${prev}`, system: true });
+    });
+    this.store.syncBenchHosts(study.id, this.benchOf(study, prev));
+    void this.notify(
+      study.id,
+      "calibration.failed",
+      `Recalibration of \`${study.slug}\` under spec v${study.spec_version} failed, so the study is back on spec v${prev} (segment ${study.segment}) and paused.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}\nResume with \`bb study resume ${study.slug}\`, or propose a fixed spec.`,
+    );
   }
 
   async waitForCalibration(slug: string, timeoutMs: number): Promise<void> {
@@ -192,11 +314,18 @@ export class Engine {
     if (study.state !== "calibrating" || study.calibration_status !== "ready") {
       throw new EngineError(`${slug} needs a finished calibration first (state ${study.state}, calibration ${study.calibration_status ?? "none"}); run \`bb study calibrate ${slug}\``);
     }
+    const midRun = this.store.hasRun(study.id);
     this.store.tx(() => {
-      this.store.updateStudy(study.id, { calibration_approved_at: this.ctx.now() });
-      this.store.event(study.id, "calibration.approved", actor, { segment: study.segment });
+      this.store.updateStudy(study.id, { calibration_approved_at: this.ctx.now(), prev_spec_version: null });
+      this.store.event(study.id, "calibration.approved", actor, { segment: study.segment, mid_run: midRun });
       this.store.setStudyState(study.id, "running", actor);
     });
+    if (midRun) {
+      this.pipeline.resetAttempts(study.id);
+      this.kick();
+      const seg = this.store.segment(study.id, study.segment);
+      return `${slug} is running again in segment ${study.segment} (oracle ${seg?.oracle_hash ?? "?"}, MDE ${formatPct(seg?.mde ?? null)}).`;
+    }
     // Strategist tools apply when the provider session next starts: release
     // the study thread's runtime so the first round starts a fresh session.
     if (study.study_thread_id) {
@@ -213,14 +342,43 @@ export class Engine {
     const study = this.study(slug);
     if (study.state === "archived") throw new EngineError(`${slug} is archived`);
     if (maxWorkers !== null && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 64)) throw new EngineError("concurrency must be an integer from 1 to 64");
+    const spec = this.store.spec(study);
+    // A control can only lower concurrency below the approved spec, never raise it.
+    const clamped = maxWorkers === null ? null : Math.min(maxWorkers, spec.budget.max_workers);
     this.store.tx(() => {
-      this.store.updateStudy(study.id, { max_workers_override: maxWorkers });
-      this.store.event(study.id, "study.concurrency", actor, { max_workers: maxWorkers });
+      this.store.updateStudy(study.id, { max_workers_override: clamped === spec.budget.max_workers ? null : clamped });
+      this.store.event(study.id, "study.concurrency", actor, { requested: maxWorkers, max_workers: clamped, clamped: clamped !== maxWorkers });
     });
     this.publish(study.id);
     this.kick();
-    const spec = this.store.spec(study);
-    return maxWorkers === null ? `${slug}: max workers back to the spec's ${spec.budget.max_workers}.` : `${slug}: max workers set to ${maxWorkers}. Running workers above the limit finish their current idea.`;
+    if (clamped === null) return `${slug}: max workers back to the spec's ${spec.budget.max_workers}.`;
+    const note = clamped !== maxWorkers ? ` (clamped from ${maxWorkers}: the approved spec allows at most ${spec.budget.max_workers}; raise it with a spec change)` : "";
+    return `${slug}: max workers set to ${clamped}${note}. Running workers above the limit finish their current idea.`;
+  }
+
+  /**
+   * Audit a human control: an event with the caller information BB gives
+   * (via, thread id from the CLI's environment, plugin id for plugin RPC)
+   * and which of the study's own agent turns were running at that moment,
+   * plus a notice. The study thread is marked unread only when a study agent
+   * turn was running (the case worth a look).
+   */
+  async auditControl(slug: string, kind: string, caller: Caller, detail: string, data: Record<string, unknown> = {}): Promise<void> {
+    const study = this.store.study(slug);
+    if (!study) return;
+    const agents = [
+      ...this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }),
+      ...this.store.threads(study.id, { role: "strategist", states: ["active"] }),
+    ].filter((t) => t.thread_id);
+    const active: string[] = [];
+    for (const t of agents) {
+      const info = await this.ctx.bb.getThread(t.thread_id!).catch(() => null);
+      if (info?.status === "active" || info?.status === "starting") active.push(`${t.thread_id} (${t.role === "worker" ? "worker" : "study thread"})`);
+    }
+    const actor = callerActor(caller);
+    this.store.event(study.id, `control.${kind}`, actor, { ...data, via: caller.via, thread: caller.threadId ?? null, plugin: caller.pluginId ?? null, active_agent_turns: active });
+    const text = `Control: ${detail} (via ${actor}).${active.length ? ` Study agent turn(s) running at that moment: ${active.join(", ")}. BB does not identify RPC callers; if you did not do this, check those threads.` : ""}`;
+    await this.notify(study.id, `control.${kind}`, text, { quiet: active.length === 0 });
   }
 
   /** Effective max_workers: the human override, else the spec. */
@@ -257,7 +415,21 @@ export class Engine {
     for (const c of this.store.candidates(study.id, { stages: ["submitted", "gating", "queued", "measuring", "confirming"] })) {
       this.pipeline.decide(c, { verdict: "inconclusive", reasons: ["study archived before evaluation finished"] }, { reported: true });
     }
+    // Stop host jobs still measuring for this study (their candidates are decided above).
+    this.pipeline.cancelMeasurements((e) => e.studyId === study.id, "study archived");
     const s = this.store.study(study.id)!;
+    let clones = 0;
+    for (const h of this.store.benchHosts(s.id, { all: true })) {
+      if (h.mode !== "clone") continue;
+      const runner = this.ctx.bb.hostRunner(h.host_id);
+      try {
+        const repo = h.repo_path ?? (await runner.benchRepo(s.slug)).path;
+        await runner.removeCheckouts(repo, `${s.slug}-bench-`);
+        if (await runner.removeBenchRepo(s.slug)) clones += 1;
+      } catch (e) {
+        this.ctx.bb.log("warn", `bench clone cleanup on ${h.host_id}: ${errText(e)}`);
+      }
+    }
     if (s.host_id && s.repo_path) {
       await this.ctx.bb.hostRunner(s.host_id).removeCheckouts(s.repo_path, `${s.slug}-`).catch((e) => this.ctx.bb.log("warn", `checkout cleanup: ${errText(e)}`));
     }
@@ -266,7 +438,7 @@ export class Engine {
       this.store.setStudyState(study.id, "archived", actor);
     });
     this.publish(study.id);
-    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
+    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed${clones ? `, ${clones} bench clone(s) deleted` : ""}. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
   }
 
   addIdea(slug: string, idea: { title: string; rationale?: string; theme?: string; priority?: number; pinned?: boolean; startRef?: string | null; variationOf?: number | null }, actor: string, source: IdeaRow["source"] = "human"): IdeaRow {
@@ -399,27 +571,47 @@ export class Engine {
     return "Assignment finished. End your turn now; the plugin archives this thread and removes its worktree. Candidate refs are kept.";
   }
 
+  /**
+   * Run `oracle.profile` on a bench host for best or the worker's latest
+   * candidate. It holds that host's bench lock, counts against the bench
+   * budget (and is refused when the budget is spent), is capped per worker,
+   * and returns a bounded summary: DIAG lines first, then the output tail.
+   */
   async requestProfile(threadId: string, target: "best" | "candidate"): Promise<string> {
     const { study, row } = await this.requireRole(threadId, "worker");
     const spec = this.store.spec(study!);
     if (!spec.oracle.profile) return "This study has no profile command (oracle.profile). Ask the human to add one if profiling would help.";
+    if (row!.profiles >= spec.agents.max_profiles_per_worker) return `Profile limit reached (${spec.agents.max_profiles_per_worker} per worker).`;
+    const spent = this.store.budget(study!).bench_seconds;
+    const est = this.pipeline.recentEvalSeconds(study!) ?? 0;
+    if (spent + est > spec.budget.max_bench_hours * 3600) return `Not enough bench budget left for a profile (${formatDuration(spent)} of ${spec.budget.max_bench_hours} h used).`;
     let sha = study!.best_sha!;
+    let purpose: "best" | "candidate" = "best";
     if (target === "candidate") {
       const c = this.store.candidates(study!.id, { threadId: row!.thread_id!, order: "desc", limit: 1 })[0];
       if (!c?.prepared_sha) return "You have no measured candidate yet; submit first or profile best.";
       sha = c.prepared_sha;
+      purpose = "candidate";
     }
-    const runner = this.ctx.bb.hostRunner(study!.host_id!);
+    const hosts = this.pipeline.benchHosts(study!).filter((h) => h.status !== "offline");
+    const host = hosts.find((h) => (h.deferred_until ?? 0) <= this.ctx.now()) ?? hosts[0];
+    if (!host) return "No bench host is online right now; try again later.";
+    this.store.updateThread(row!.id, { profiles: row!.profiles + 1 });
     const started = this.ctx.now();
-    const out = await withBench(this.ctx, study!, "profile", null, async () => {
-      const dir = await runner.checkout(study!.repo_path!, `${study!.slug}-profile`, sha);
-      if (spec.oracle.build) await runner.exec({ cwd: dir, command: spec.oracle.build, timeoutMs: spec.oracle.timeout_minutes * 60_000 });
-      return await runner.exec({ cwd: dir, command: spec.oracle.profile!, timeoutMs: spec.oracle.timeout_minutes * 60_000, tailBytes: 8000 });
+    const site = this.pipeline.site(study!, host);
+    const out = await withBench(this.ctx, study!, host.host_id, "profile", null, async () => {
+      const health = await checkHealth(this.ctx, study!, host, spec, "profile", (kind, text) => this.notify(study!.id, kind, text));
+      if (!health.ok) return null;
+      const dir = await site.checkout("profile", sha, purpose, "profile");
+      const built = await site.build(dir, spec, "profile");
+      if (!built.ok) return { exitCode: -1, stdout: "", stderr: "build failed on the bench host" };
+      return await site.runner.run({ cwd: dir, command: spec.oracle.profile!, timeoutMs: spec.oracle.timeout_minutes * 60_000, tailBytes: 64 * 1024, label: "profile" });
     });
     const seconds = (this.ctx.now() - started) / 1000;
     this.store.addBenchSeconds(study!.id, seconds);
-    this.store.event(study!.id, "profile.ran", threadId, { target, sha, seconds });
-    return clip(`Profile of ${target} ${sha.slice(0, 10)} (exit ${out.exitCode}, ${formatDuration(seconds)} of bench time):\n${out.stdout}\n${out.stderr}`.trim(), 8000);
+    this.store.event(study!.id, "profile.ran", threadId, { target, sha, seconds, host: host.host_id });
+    if (out === null) return `The bench host failed its health check, so the profile was not run (${formatDuration(seconds)}). Try again later.`;
+    return `Profile of ${target} ${sha.slice(0, 10)} on ${host.name} (exit ${out.exitCode}, ${formatDuration(seconds)} of bench time, ${row!.profiles + 1}/${spec.agents.max_profiles_per_worker} profiles used):\n${profileSummary(out.stdout, out.stderr)}`;
   }
 
   // ---------------------------------------------------- strategist tools
@@ -671,6 +863,7 @@ export class Engine {
       }
     }
 
+    await this.refreshBenchHosts(study);
     const { w } = this.workerTarget(this.store.study(study.id)!);
     if (study.state === "running") {
       const exhausted = budgetExhausted({
@@ -928,7 +1121,7 @@ export class Engine {
    * notice (study page, header badge, `bb study show`), the study thread is
    * marked unread, and the notice rides along in the next strategist round.
    */
-  async notify(studyId: string, kind: string, text: string): Promise<void> {
+  async notify(studyId: string, kind: string, text: string, opts: { quiet?: boolean } = {}): Promise<void> {
     const study = this.store.study(studyId);
     if (!study) return;
     this.store.tx(() => {
@@ -936,7 +1129,34 @@ export class Engine {
       this.store.event(studyId, "notice.added", "plugin", { notice: id, kind });
     });
     this.publish(studyId);
-    if (study.study_thread_id) await this.ctx.bb.markUnread(study.study_thread_id).catch((e) => this.ctx.bb.log("warn", `mark unread: ${errText(e)}`));
+    if (study.study_thread_id && !opts.quiet) await this.ctx.bb.markUnread(study.study_thread_id).catch((e) => this.ctx.bb.log("warn", `mark unread: ${errText(e)}`));
+  }
+
+  /** A host worker exited (server.ts): measurements on it restart from scratch. */
+  onHostWorkerExit(hostId: string): void {
+    const n = this.pipeline.hostWorkerExited(hostId);
+    for (const h of this.store.benchHostsOn(hostId)) this.store.event(h.study_id, "bench.worker_exit", "plugin", { host: hostId, cancelled: n });
+    this.kick();
+  }
+
+  /** Refresh bench host connection states (cached per host for hostStatusTtlMs). */
+  private async refreshBenchHosts(study: StudyRow): Promise<void> {
+    const now = this.ctx.now();
+    for (const h of this.pipeline.benchHosts(study)) {
+      if (h.status_at !== null && now - h.status_at < this.ctx.config.hostStatusTtlMs && h.status !== "offline") continue;
+      const status = await this.ctx.bb.hostStatus(h.host_id).catch(() => "unknown" as const);
+      this.pipeline.noteHostStatus(study, h, status);
+    }
+  }
+
+  /** Request a drift check on every bench host now (human control). */
+  requestDrift(slug: string, actor: string): string {
+    const study = this.study(slug);
+    if (study.state !== "running") throw new EngineError(`${slug} is ${study.state}; drift checks run while Running`);
+    if (this.store.spec(study).oracle.noise === "deterministic") throw new EngineError("deterministic oracles have no drift check");
+    this.pipeline.requestDrift(study.id);
+    this.store.event(study.id, "drift.requested", actor, {});
+    return `${slug}: a drift check (A/A on best) runs on each bench host at its next free slot.`;
   }
 
   async systemPause(studyId: string, reason: string): Promise<void> {
@@ -1011,6 +1231,14 @@ export class Engine {
   private publish(studyId: string): void {
     this.ctx.bb.publish("study-changed", { study: studyId });
   }
+}
+
+/** Bounded profile output for an agent: DIAG lines first, then the tail. */
+export function profileSummary(stdout: string, stderr: string): string {
+  const diag = stdout.split("\n").filter((l) => /^\s*DIAG\s/u.test(l)).slice(0, 40).join("\n");
+  const rest = `${stdout}\n${stderr}`.trim().split("\n").filter((l) => !/^\s*DIAG\s/u.test(l));
+  const tailLines = rest.slice(-60).join("\n");
+  return clip([diag && `DIAG lines:\n${diag}`, tailLines && `Output (last ${Math.min(60, rest.length)} of ${rest.length} lines):\n${tailLines}`].filter(Boolean).join("\n\n") || "(no output)", 6000);
 }
 
 function calibrationNotice(study: StudyRow, report: CalibrationReport): string {

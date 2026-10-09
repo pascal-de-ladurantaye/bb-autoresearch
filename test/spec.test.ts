@@ -61,7 +61,9 @@ describe("parseSpec", () => {
     expect(r.spec.oracle.protocol).toMatchObject({ n_min: 6, n_max: 20, confidence: 0.95, min_effect: 0.01, confirm: true });
     expect(r.spec.agents).toMatchObject({ max_submissions_per_worker: 3, strategist_every: 5, stall_after: 10 });
     expect(r.spec.agents.worker.provider).toBe("codex");
-    expect(r.warnings.some((w) => w.includes("holdout"))).toBe(true);
+    expect(r.spec.oracle.holdout).toMatchObject({ runs: 3, max_regression: 0.01 });
+    expect(r.spec.oracle.drift).toEqual({ every: 10, pairs: 6, max_ratio: 2 });
+    expect(r.spec.oracle.health).toMatchObject({ enabled: true, max_load: 0.8, retry_seconds: 60 });
     expect(r.warnings.some((w) => w.includes("W=1"))).toBe(false);
   });
 
@@ -88,15 +90,17 @@ describe("parseSpec", () => {
     }
   });
 
-  it("rejects unknown keys, n_min > n_max, bad percentages, and remote bench hosts", () => {
+  it("rejects unknown keys, n_min > n_max, bad percentages, and duplicate bench hosts", () => {
     expect(parseSpec(DETERMINISTIC_SPEC.replace("[budget]", "[budget]\nmax_tokens = 5")).ok).toBe(false);
     const p = parseSpec(DETERMINISTIC_SPEC.replace('noise = "deterministic"', 'noise = "noisy"\n[oracle.protocol]\nn_min = 30\nn_max = 10'));
     expect(p.ok).toBe(false);
     if (!p.ok) expect(p.errors.join()).toContain("n_min must be <= n_max");
     expect(parseSpec(DETERMINISTIC_SPEC.replace('max_regression = "5%"', 'max_regression = "five"')).ok).toBe(false);
-    const remote = parseSpec(DETERMINISTIC_SPEC.replace('noise = "deterministic"', 'noise = "deterministic"\nbench_hosts = ["bench-x86-01"]'));
-    expect(remote.ok).toBe(false);
-    if (!remote.ok) expect(remote.errors.join()).toContain("M2");
+    // Remote bench host names parse here and are resolved against BB hosts by the engine.
+    expect(parseSpec(DETERMINISTIC_SPEC.replace('noise = "deterministic"', 'noise = "deterministic"\nbench_hosts = ["bench-x86-01"]')).ok).toBe(true);
+    const dup = parseSpec(DETERMINISTIC_SPEC.replace('noise = "deterministic"', 'noise = "deterministic"\nbench_hosts = ["a", "A"]'));
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.errors.join()).toContain("listed twice");
   });
 
   it("rejects globs that escape the repo and paths both editable and protected", () => {
@@ -118,6 +122,10 @@ describe("oracle hash and refs", () => {
     expect(oracleHash(a.spec)).toBe(oracleHash(b.spec));
     expect(oracleHash(a.spec)).not.toBe(oracleHash(c.spec));
     expect(oracleHash(a.spec, "p1")).not.toBe(oracleHash(a.spec, "p2"));
+    // Bench operations (health, drift schedule) are not part of how a commit is judged.
+    const tuned = parseSpec(`${DETERMINISTIC_SPEC}\n[oracle.health]\nmax_load = 3\n[oracle.drift]\nevery = 50\n`);
+    if (!tuned.ok) throw new Error(tuned.errors.join());
+    expect(oracleHash(tuned.spec)).toBe(oracleHash(a.spec));
   });
   it("names refs per the git model", () => {
     expect(bestBranch("x")).toBe("studies/x/best");

@@ -2,9 +2,10 @@ import Database from "better-sqlite3";
 import { HostMutex, type Ctx } from "../src/context.ts";
 import { MIGRATIONS } from "../src/db/schema.ts";
 import { Store } from "../src/db/store.ts";
-import type { DiffSummary, ExecInput, ExecResult, PrepareInput, PrepareResult, SnapshotInput, SnapshotResult } from "../src/host/contract.ts";
-import type { HostRunner } from "../src/host/runner.ts";
-import type { BbPort, EnvironmentInfo, SpawnWorkerArgs, ThreadInfo } from "../src/ports.ts";
+import { createHash, randomBytes } from "node:crypto";
+import type { BundleInfo, DiffSummary, ExecInput, ExecResult, HealthReport, JobInput, PrepareInput, PrepareResult, SnapshotInput, SnapshotResult } from "../src/host/contract.ts";
+import { HostJobLostError, RunAbortedError, type HostRunner, type RunOptions } from "../src/host/runner.ts";
+import type { BbPort, EnvironmentInfo, HostInfo, SpawnWorkerArgs, ThreadInfo } from "../src/ports.ts";
 import { seededRng } from "../src/stats.ts";
 
 export function makeDb(): Database.Database {
@@ -27,9 +28,34 @@ export function fakeSha(): string {
   return shaCounter.toString(16).padStart(12, "a");
 }
 
-/** In-memory host: commits are {tree, parent}; a commit's "tree" is an opaque content id. */
+export function healthyReport(over: Partial<HealthReport> = {}): HealthReport {
+  return {
+    hostname: "fake",
+    platform: "linux",
+    arch: "x64",
+    cpus: 8,
+    loadavg: [0.2, 0.2, 0.2],
+    freeMemMb: 8000,
+    totalMemMb: 16000,
+    topProcesses: [{ pid: 10, cpu: 3, command: "sshd" }],
+    governor: "performance",
+    turbo: false,
+    onAcPower: null,
+    cpuSpeedLimit: null,
+    notDetectable: ["power source"],
+    at: 0,
+    ...over,
+  };
+}
+
+/**
+ * In-memory host: commits are {tree, parent}; a commit's "tree" is an opaque
+ * content id. A bench FakeHost built with `shareWith` sees the edit host's
+ * commits/metrics (the "same code") but its bench clone only holds commits
+ * that arrived by bundle.
+ */
 export class FakeHost implements HostRunner {
-  readonly hostId = "host_test";
+  readonly hostId: string;
   refs = new Map<string, string>();
   commits = new Map<string, { tree: string; parent: string | null; message: string }>();
   checkouts = new Map<string, string>();
@@ -40,6 +66,8 @@ export class FakeHost implements HostRunner {
   nextSnapshotFor = new Map<string, Partial<SnapshotResult> & { tree?: string }>();
   /** Metric value by tree id. */
   metric = new Map<string, number>();
+  /** Guardrail metric rss by tree id (default 100). */
+  rss = new Map<string, number>();
   noise: () => number = () => 0;
   gateFailures = new Map<string, number>(); // tree -> how many times the gate fails
   conflicts = new Set<string>();
@@ -51,6 +79,42 @@ export class FakeHost implements HostRunner {
   maxActive = { gate: 0, measure: 0 };
   /** Called before every measure run (tests mutate state mid-measurement). */
   onMeasure: ((cwd: string) => void | Promise<void>) | null = null;
+  /** Health report returned by health(). */
+  healthReport: HealthReport = healthyReport();
+  healthCalls = 0;
+  /** Commits in this host's bench clone (clone mode), and the refs pinning them. */
+  present = new Set<string>();
+  benchRefs = new Map<string, string>();
+  /** Bundle files on this host (sender: payload; receiver: received base64). */
+  bundles = new Map<string, string>();
+  received = new Map<string, string>();
+  bundlesCreated: Array<{ tip: string; bytes: number; commits: number }> = [];
+  /** Pretend bundles are this many bytes (size-limit tests). */
+  bundleSizeOverride: number | null = null;
+  /** The next run() loses its job (host worker restart). */
+  loseNextJob = false;
+  /** Runs of the build command, by cwd. */
+  builds: string[] = [];
+  /** Commands seen by run()/exec (holdout secrecy checks look at these). */
+  commands: string[] = [];
+  /** Extra metric value for the holdout command, by tree. */
+  holdoutMetric = new Map<string, number>();
+
+  constructor(hostId = "host_test", shareWith?: FakeHost) {
+    this.hostId = hostId;
+    if (shareWith) {
+      this.commits = shareWith.commits;
+      this.metric = shareWith.metric;
+      this.holdoutMetric = shareWith.holdoutMetric;
+      this.rss = shareWith.rss;
+    }
+  }
+  private isBenchRepo(repo: string): boolean {
+    return repo.startsWith("/bench/");
+  }
+  private coPath(key: string): string {
+    return this.hostId === "host_test" ? `/co/${key}` : `/co/${this.hostId}/${key}`;
+  }
 
   commit(tree: string, parent: string | null, message = "c"): string {
     const sha = fakeSha();
@@ -86,8 +150,96 @@ export class FakeHost implements HostRunner {
     }
     return false;
   }
+  async run(input: JobInput, opts: RunOptions = {}): Promise<ExecResult> {
+    if (opts.signal?.aborted) throw new RunAbortedError();
+    if (this.loseNextJob) {
+      this.loseNextJob = false;
+      throw new HostJobLostError("host lost job (worker restarted)");
+    }
+    if (!opts.signal) return await this.exec({ cwd: input.cwd, command: input.command, timeoutMs: Math.min(input.timeoutMs, 29 * 60_000) });
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new RunAbortedError());
+      opts.signal!.addEventListener("abort", onAbort, { once: true });
+    });
+    aborted.catch(() => undefined);
+    try {
+      const run = this.exec({ cwd: input.cwd, command: input.command, timeoutMs: Math.min(input.timeoutMs, 29 * 60_000) });
+      return await Promise.race([run, aborted]);
+    } finally {
+      if (onAbort) opts.signal.removeEventListener("abort", onAbort);
+    }
+  }
+  async health(): Promise<HealthReport> {
+    this.healthCalls += 1;
+    return { ...this.healthReport, at: Date.now() };
+  }
+  async benchRepo(key: string) {
+    this.calls.push("benchRepo");
+    return { path: `/bench/${this.hostId}/${key}`, tips: [...new Set(this.benchRefs.values())] };
+  }
+  async removeBenchRepo(_key: string) {
+    const had = this.present.size > 0;
+    this.present.clear();
+    this.benchRefs.clear();
+    return had;
+  }
+  async hasCommits(repo: string, shas: string[]) {
+    if (this.isBenchRepo(repo)) return shas.filter((s) => this.present.has(s));
+    return shas.filter((s) => this.commits.has(s));
+  }
+  async bundleCreate(_repo: string, tip: string, basis: string[]): Promise<BundleInfo> {
+    this.calls.push("bundleCreate");
+    const id = randomBytes(8).toString("hex");
+    const stop = new Set<string>();
+    for (const b of basis) {
+      let cur: string | null = b;
+      while (cur && !stop.has(cur)) {
+        stop.add(cur);
+        cur = this.commits.get(cur)?.parent ?? null;
+      }
+    }
+    const chain: string[] = [];
+    let cur: string | null = tip;
+    while (cur && !stop.has(cur)) {
+      chain.push(cur);
+      cur = this.commits.get(cur)?.parent ?? null;
+    }
+    if (!chain.length) return { id, bytes: 0, sha256: "", empty: true };
+    const data = Buffer.from(JSON.stringify({ commits: chain })).toString("base64");
+    this.bundles.set(id, data);
+    const bytes = this.bundleSizeOverride ?? Buffer.byteLength(data, "base64");
+    this.bundlesCreated.push({ tip, bytes, commits: chain.length });
+    return { id, bytes, sha256: createHash("sha256").update(Buffer.from(data, "base64")).digest("hex"), empty: false };
+  }
+  async bundleRead(id: string, offset: number, length: number) {
+    const raw = Buffer.from(this.bundles.get(id) ?? "", "base64");
+    const part = raw.subarray(offset, offset + length);
+    return { data: part.toString("base64"), eof: offset + part.length >= raw.length };
+  }
+  async bundleWrite(id: string, offset: number, data: string) {
+    const have = Buffer.from(this.received.get(id) ?? "", "base64");
+    if (offset !== have.length) throw new Error("out of order");
+    const next = Buffer.concat([have, Buffer.from(data, "base64")]);
+    this.received.set(id, next.toString("base64"));
+    return next.length;
+  }
+  async bundleApply(input: { repoPath: string; id: string; sha: string; ref: string; sha256: string }) {
+    this.calls.push("bundleApply");
+    const raw = Buffer.from(this.received.get(input.id) ?? "", "base64");
+    this.received.delete(input.id);
+    if (createHash("sha256").update(raw).digest("hex") !== input.sha256) return { ok: false, detail: "corrupt" };
+    for (const c of (JSON.parse(raw.toString("utf8")) as { commits: string[] }).commits) this.present.add(c);
+    this.benchRefs.set(input.ref, input.sha);
+    return { ok: true, detail: "ok" };
+  }
+  async bundleDiscard(id: string) {
+    this.bundles.delete(id);
+    this.received.delete(id);
+  }
   async exec(input: ExecInput): Promise<ExecResult> {
     this.maybeFail("exec");
+    this.commands.push(input.command);
     if (input.command.startsWith("gate")) return await this.timed("gate", () => this.execNow(input));
     if (input.command.startsWith("measure")) {
       return await this.timed("measure", async () => {
@@ -112,7 +264,17 @@ export class FakeHost implements HostRunner {
     if (input.command.startsWith("measure")) {
       const v = this.metric.get(tree);
       if (v === undefined) return { exitCode: 2, timedOut: false, durationMs: 5, stdout: "", stderr: "no such tree" };
-      return { exitCode: 0, timedOut: false, durationMs: 1000, stdout: `METRIC size=${v * (1 + this.noise())}\nMETRIC rss=100\nDIAG tree=${tree}\n`, stderr: "" };
+      const rss = this.rss.get(tree) ?? 100;
+      return { exitCode: 0, timedOut: false, durationMs: 1000, stdout: `METRIC size=${v * (1 + this.noise())}\nMETRIC rss=${rss}\nDIAG tree=${tree}\n`, stderr: "" };
+    }
+    if (input.command.startsWith("holdout")) {
+      const v = this.holdoutMetric.get(tree) ?? this.metric.get(tree);
+      if (v === undefined) return { exitCode: 3, timedOut: false, durationMs: 5, stdout: "", stderr: "holdout: no such tree" };
+      return { exitCode: 0, timedOut: false, durationMs: 1000, stdout: `METRIC size=${v}\nDIAG holdout-secret-input=/srv/holdout\n`, stderr: "" };
+    }
+    if (input.command.startsWith("build")) {
+      this.builds.push(input.cwd);
+      return { exitCode: 0, timedOut: false, durationMs: 5, stdout: "built", stderr: "" };
     }
     return { exitCode: 0, timedOut: false, durationMs: 1, stdout: "", stderr: "" };
   }
@@ -158,9 +320,10 @@ export class FakeHost implements HostRunner {
     const c = this.commits.get(sha)!;
     return this.commit(c.tree, c.parent, message);
   }
-  async checkout(_repo: string, key: string, sha: string) {
+  async checkout(repo: string, key: string, sha: string) {
     this.maybeFail("checkout");
-    const path = `/co/${key}`;
+    if (this.isBenchRepo(repo) && !this.present.has(sha)) throw new Error(`checkout ${sha}: commit not in the bench clone ${repo} (it was never sent)`);
+    const path = this.coPath(key);
     this.checkouts.set(path, sha);
     return path;
   }
@@ -170,7 +333,7 @@ export class FakeHost implements HostRunner {
   }
   async removeCheckouts(_repo: string, prefix: string) {
     let n = 0;
-    for (const k of [...this.checkouts.keys()]) if (k.startsWith(`/co/${prefix}`)) {
+    for (const k of [...this.checkouts.keys()]) if (k.startsWith(this.coPath(prefix))) {
       this.checkouts.delete(k);
       n += 1;
     }
@@ -196,12 +359,30 @@ export class FakePort implements BbPort {
   /** Like core when the worktree is still provisioning: spawn returns no environment id. */
   spawnWithoutEnvironment = false;
   private n = 0;
+  /** Other machines (bench hosts) by id; the edit host is `host`. */
+  hosts = new Map<string, HostRunner>();
+  hostNames = new Map<string, string>();
+  hostStatuses = new Map<string, "connected" | "disconnected">();
   constructor(
     readonly host: HostRunner,
     readonly hostId = "host_test",
   ) {}
+  /** Enroll a fake machine. */
+  addHost(runner: HostRunner, name: string) {
+    this.hosts.set(runner.hostId, runner);
+    this.hostNames.set(runner.hostId, name);
+  }
   async primaryHostId() {
     return this.hostId;
+  }
+  async listHosts(): Promise<HostInfo[]> {
+    return [
+      { id: this.hostId, name: "edit-machine", status: this.hostStatuses.get(this.hostId) ?? "connected" },
+      ...[...this.hosts.keys()].map((id) => ({ id, name: this.hostNames.get(id) ?? id, status: this.hostStatuses.get(id) ?? ("connected" as const) })),
+    ];
+  }
+  async hostStatus(hostId: string) {
+    return this.hostStatuses.get(hostId) ?? "connected";
   }
   async projectCheckout() {
     return "/repo";
@@ -263,8 +444,8 @@ export class FakePort implements BbPort {
     this.released.push(id);
   }
   async retryTurn() {}
-  hostRunner() {
-    return this.host;
+  hostRunner(hostId?: string) {
+    return (hostId && this.hosts.get(hostId)) || this.host;
   }
   log(level: string, message: string) {
     this.logs.push(`${level}: ${message}`);
@@ -275,7 +456,7 @@ export class FakePort implements BbPort {
 export function makeCtx(host: HostRunner = new FakeHost(), clock = new Clock()): { ctx: Ctx; store: Store; port: FakePort; clock: Clock } {
   const store = new Store(makeDb(), clock.now);
   const port = new FakePort(host);
-  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000 } };
+  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0 } };
   return { ctx, store, port, clock };
 }
 

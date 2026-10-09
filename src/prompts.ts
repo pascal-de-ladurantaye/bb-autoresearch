@@ -59,6 +59,7 @@ export function workerBrief(b: BriefInput): string {
     "",
     `Primary metric: ${metric}.${b.mde !== null ? ` A win must clear about ${formatPct(b.mde)} with confidence.` : ""}`,
     spec.guardrail.length ? `Guardrails (a win that breaks one is a lose): ${spec.guardrail.map((g) => `${g.name} max ${formatPct(g.max_regression)} worse`).join(", ")}.` : "",
+    spec.oracle.holdout ? "A win must also pass a hidden holdout workload on the bench host before it is promoted. You only learn pass or fail; do not special-case the benchmark input." : "",
     "",
     "## Scope (enforced at submission)",
     scopeBlock(spec),
@@ -115,6 +116,15 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
     const keys = [opts.spec.metric.name, ...opts.spec.guardrail.map((g) => g.name)];
     const parts = keys.filter((k) => metrics.best?.[k] !== undefined).map((k) => `${k}: best ${fmtNum(metrics.best![k]!)} → candidate ${fmtNum(metrics.candidate?.[k])}`);
     if (parts.length) lines.push(`Metrics (median): ${parts.join("; ")}`);
+  }
+  if (metrics?.guardrails && opts.spec.guardrail.length) {
+    const parts = opts.spec.guardrail.map((g) => {
+      const r = metrics.guardrails?.[g.name];
+      if (r === undefined || r === null || Number.isNaN(r)) return `${g.name} missing`;
+      const abs = `${(Math.abs(r) * 100).toFixed(2)}%`;
+      return `${g.name} ${r > 0 ? `${abs} worse` : `${abs} better`} (limit ${(g.max_regression * 100).toFixed(2)}% worse) ${r > g.max_regression ? "BROKEN" : "ok"}`;
+    });
+    lines.push(`Guardrails vs best: ${parts.join("; ")}`);
   }
   if (c.gate_output) lines.push("Gate output (tail):", "```", clip(c.gate_output, 2500), "```");
   if (diag.length) lines.push("Diagnostics:", "```", clip(diag.join("\n"), 1500), "```");

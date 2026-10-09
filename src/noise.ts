@@ -7,8 +7,9 @@ import {
   deterministicDecision,
   improvement,
   median,
-  robustSd,
+  sampleSd,
   sequentialDecision,
+  tQuantile,
   type Rng,
 } from "./stats.ts";
 
@@ -50,6 +51,10 @@ export interface MeasureContext {
   record: (sample: Sample) => void;
   /** A previous run of the current best, when the class allows reusing it. */
   bestCache?: RunResult | null;
+  /** expensive: runs of the current best on this bench host (calibration, or the promoted winner's confirmation runs). */
+  baseline?: RunResult[] | null;
+  /** Calibrated per-run noise (expensive: σ of one run, relative). */
+  noiseFloor?: number | null;
   signal?: AbortSignal;
 }
 
@@ -70,6 +75,10 @@ export interface MeasureOutcome {
   candidateDiag: string[];
   /** A best run the caller may cache for the next candidate. */
   bestRun: RunResult | null;
+  /** expensive: the baseline runs used (cache them for the next candidate). */
+  baselineRuns?: RunResult[];
+  /** expensive: the candidate's confirmation runs (the new baseline if it is promoted). */
+  confirmRuns?: RunResult[];
 }
 
 export interface CalibrationContext {
@@ -91,6 +100,8 @@ export interface CalibrationOutcome {
   report: string;
   details: Record<string, number | string | boolean>;
   bestRun: RunResult | null;
+  /** expensive: every baseline run (the bench host's baseline for the segment). */
+  baselineRuns?: RunResult[];
 }
 
 export interface NoiseStrategy {
@@ -291,70 +302,118 @@ export const deterministicStrategy: NoiseStrategy = {
 };
 
 /**
- * Expensive class: one run per candidate against the calibrated noise floor;
- * a run that clears the MDE is confirmed with `confirm_runs` more runs.
- * Minimal in M0 (open question 8 tracks the right confirmation count).
+ * Expensive class: a run costs minutes to hours, so pairs are unaffordable.
+ *
+ * - Calibration takes `calibration_runs` baseline runs. σ is the per-run
+ *   relative noise: the sample SD of the runs around their median. (With so
+ *   few runs the robust MAD estimate underestimates σ too often.)
+ * - A candidate gets ONE screening run, compared against the median of the
+ *   bench host's baseline runs (m of them). It is promising when its
+ *   improvement e1 > max(min_effect, z·σ·√(1 + 1/m)), a clear lose below the
+ *   negative of that, and inconclusive in between.
+ * - A promising run is confirmed with k = `confirm_runs` (default 3) fresh
+ *   runs. The screening run is left out of the decision (it was selected
+ *   because it looked good, so it is biased). The confirmed effect is the
+ *   mean of the k runs; a win needs it above max(min_effect, z·σ·√(1/k + 1/m)).
+ * - z is the one-sided Student-t quantile of `confidence` with
+ *   calibration_runs - 1 degrees of freedom, because σ is itself estimated
+ *   from a handful of runs. k = 3 cuts the confirmation threshold to
+ *   √(1/3 + 1/m)/√(1 + 1/m) ≈ 0.6 of the screen. Simulated with σ estimated
+ *   from 5 runs (see the M2 implementation notes): about 1% false wins at no
+ *   effect, and most 3σ effects found.
+ * - The winner's k confirmation runs become the next best's baseline on that
+ *   host, so a promotion costs no extra baseline run.
  */
 export const expensiveStrategy: NoiseStrategy = {
   kind: "expensive",
   benchLock: true,
   async calibrate(ctx) {
     const metric = ctx.spec.metric;
+    const p = ctx.spec.oracle.protocol;
     const runs: RunResult[] = [];
-    for (let i = 0; i < 3; i++) {
-      const r = await ctx.bench.run(i % 2 ? "candidate" : "best");
-      ctx.record({ pair: i, side: i % 2 ? "candidate" : "best", metrics: r.metrics });
+    for (let i = 0; i < p.calibration_runs; i++) {
+      checkAborted(ctx.signal);
+      const side: Side = i % 2 ? "candidate" : "best";
+      const r = await ctx.bench.run(side);
+      ctx.record({ pair: i, side, metrics: r.metrics });
       runs.push(r);
     }
     const values = runs.map((r) => r.metrics[metric.name]!);
     const m = median(values);
     const rel = values.map((v) => improvement(m, v, metric.direction));
-    const noiseFloor = robustSd(rel) || Math.max(...rel.map(Math.abs));
-    const mde = Math.max(ctx.spec.oracle.protocol.min_effect, 2 * noiseFloor);
+    const noiseFloor = sampleSd(rel);
+    const z = tQuantile(p.confidence, p.calibration_runs - 1);
+    const k = p.confirm_runs;
+    const mde = Math.max(p.min_effect, z * noiseFloor * Math.sqrt(1 / k + 1 / runs.length));
     const evalSeconds = median(runs.map((r) => r.durationMs)) / 1000;
-    const problems = mde > ctx.spec.oracle.protocol.max_mde ? [`minimum detectable effect ${fmt(mde)} exceeds max_mde`] : [];
+    const problems = mde > p.max_mde ? [`minimum detectable effect ${fmt(mde)} exceeds max_mde ${fmt(p.max_mde)}: the oracle is too noisy`] : [];
     return {
       ok: problems.length === 0,
       problems,
       noiseFloor,
       mde,
       evalSeconds,
-      report: `Expensive: 3 baseline runs, noise floor ${fmt(noiseFloor)}, win threshold ${fmt(mde)}, about ${duration(evalSeconds)} per run.`,
-      details: { baseline: m },
+      report:
+        `Expensive: ${runs.length} baseline runs, per-run noise ${fmt(noiseFloor)}. One screening run per candidate; a promising run is confirmed with ${k} more, ` +
+        `and a win needs the confirmed mean above ${fmt(mde)}. About ${duration(evalSeconds)} per run (${duration(evalSeconds * (1 + k))} for a confirmed win).`,
+      details: { baseline: m, runs: runs.length, confirmRuns: k, z },
       bestRun: runs[0]!,
+      baselineRuns: runs,
     };
   },
   async measure(ctx) {
     const metric = ctx.spec.metric;
-    const best = ctx.bestCache ?? (await ctx.bench.run("best"));
-    ctx.record({ pair: 0, side: "best", metrics: best.metrics });
-    const runs: RunResult[] = [await ctx.bench.run("candidate")];
-    ctx.record({ pair: 0, side: "candidate", metrics: runs[0]!.metrics });
-    let effect = improvement(best.metrics[metric.name]!, runs[0]!.metrics[metric.name]!, metric.direction);
-    let decision: Decision = effect < -ctx.mde ? "lose" : "inconclusive";
-    if (effect > ctx.mde) {
-      for (let k = 0; k < ctx.spec.oracle.protocol.confirm_runs; k++) {
+    const p = ctx.spec.oracle.protocol;
+    const z = tQuantile(p.confidence, p.calibration_runs - 1);
+    const k = p.confirm_runs;
+    let baseline = ctx.baseline?.length ? [...ctx.baseline] : [];
+    if (!baseline.length) {
+      const b = ctx.bestCache ?? (await ctx.bench.run("best"));
+      baseline = [b];
+    }
+    baseline.forEach((b, i) => ctx.record({ pair: i, side: "best", metrics: b.metrics }));
+    const m = baseline.length;
+    const baseVal = median(baseline.map((b) => b.metrics[metric.name]!));
+    // Without a calibrated σ, fall back to the MDE as a two-sigma band.
+    const sigma = ctx.noiseFloor ?? ctx.mde / 2;
+    const screen = await ctx.bench.run("candidate");
+    ctx.record({ pair: 0, side: "candidate", metrics: screen.metrics });
+    const e1 = improvement(baseVal, screen.metrics[metric.name]!, metric.direction);
+    const thr1 = Math.max(p.min_effect, z * sigma * Math.sqrt(1 + 1 / m));
+    const bestMetrics = medianMetrics(baseline.map((b) => b.metrics));
+    let decision: Decision = e1 < -thr1 ? "lose" : "inconclusive";
+    let effect = e1;
+    let half = thr1;
+    let confirmRuns: RunResult[] = [];
+    if (e1 > thr1) {
+      for (let i = 0; i < k; i++) {
         checkAborted(ctx.signal);
         const r = await ctx.bench.run("candidate");
-        ctx.record({ pair: k + 1, side: "candidate", metrics: r.metrics });
-        runs.push(r);
+        ctx.record({ pair: i + 1, side: "candidate", metrics: r.metrics });
+        confirmRuns.push(r);
       }
-      effect = median(runs.map((r) => improvement(best.metrics[metric.name]!, r.metrics[metric.name]!, metric.direction)));
-      decision = effect > ctx.mde ? "win" : "inconclusive";
+      const effects = confirmRuns.map((r) => improvement(baseVal, r.metrics[metric.name]!, metric.direction));
+      effect = effects.reduce((a, b) => a + b, 0) / effects.length;
+      half = z * sigma * Math.sqrt(1 / k + 1 / m);
+      const thr2 = Math.max(p.min_effect, half);
+      decision = effect > thr2 ? "win" : effect < -thr2 ? "lose" : "inconclusive";
     }
-    const candidateMetrics = medianMetrics(runs.map((r) => r.metrics));
+    const judged = confirmRuns.length ? confirmRuns : [screen];
+    const candidateMetrics = medianMetrics(judged.map((r) => r.metrics));
     return {
       decision,
       effect,
-      ciLo: null,
-      ciHi: null,
-      n: runs.length,
-      guardrails: guardrailRegressions(ctx.spec, [{ best: best.metrics, candidate: candidateMetrics }]),
-      bestMetrics: best.metrics,
+      ciLo: effect - half,
+      ciHi: effect + half,
+      n: 1 + confirmRuns.length,
+      guardrails: guardrailRegressions(ctx.spec, [{ best: bestMetrics, candidate: candidateMetrics }]),
+      bestMetrics,
       candidateMetrics,
-      bestDiag: best.diag,
-      candidateDiag: runs.at(-1)!.diag,
-      bestRun: best,
+      bestDiag: baseline.at(-1)!.diag,
+      candidateDiag: judged.at(-1)!.diag,
+      bestRun: baseline[0]!,
+      baselineRuns: baseline,
+      ...(confirmRuns.length ? { confirmRuns } : {}),
     };
   },
 };

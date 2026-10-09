@@ -13,10 +13,13 @@ A **study** improves one metric of a codebase over hours or days. The plugin run
 |---|---|
 | `bb study list` | Studies with state, best vs base, budget |
 | `bb study show <slug> [--events N]` | Spec, calibration, best, ideas, last candidates, workers, recent events |
-| `bb study calibrate <slug> [--wait]` | Approve the current spec; run gates on base and A/A noise measurement |
+| `bb study calibrate <slug> [--wait]` | Approve the current (or pending) spec; run gates and A/A noise measurement on every bench host. Mid-run this is an oracle change: new segment |
+| `bb study approve <slug>` | Apply a pending spec whose oracle is unchanged (budget, agents), without recalibration |
 | `bb study start <slug>` | Approve calibration and start running (or resume) |
+| `bb study bench <slug>` | Bench hosts: health checks, git bundle transfers, drift checks, segments |
+| `bb study drift <slug>` | Run a drift check (A/A on best) on every bench host at its next free slot |
 | `bb study pause <slug>` / `resume <slug>` | Pause: no new workers; running workers finish their submission |
-| `bb study concurrency <slug> <n\|auto>` | Override `max_workers` (1-64), or return to the spec's value |
+| `bb study concurrency <slug> <n\|auto>` | Lower the worker limit below the spec's `max_workers` (requests above it are clamped), or return to the spec's value |
 | `bb study ideas add <slug> "<title>" [--rationale --theme --priority --start-ref c/N --variation-of ID --no-pin]` | Queue (and pin) an idea |
 | `bb study ideas list <slug>` | The idea board |
 | `bb study workers <slug>` | Worker threads and their state |
@@ -25,15 +28,15 @@ A **study** improves one metric of a codebase over hours or days. The plugin run
 
 The same controls (and the idea board, candidate details, and worker links) are on the **Studies** page in the BB sidebar; study and worker threads show a header badge with live status.
 
-`calibrate`, `start`, `pause`, `resume`, `concurrency`, and `archive` are human controls: the plugin refuses them from a study's own worker or strategist thread. If the user asks you to run one, you may, from an ordinary thread.
+`calibrate`, `approve`, `start`, `pause`, `resume`, `concurrency`, `drift`, and `archive` are human controls: the plugin refuses them from a study's own worker or strategist thread. If the user asks you to run one, you may, from an ordinary thread. Every control change is recorded as a `control.*` event and a notice, with the caller and any study agent turns running at that moment.
 
 ## Lifecycle
 
-Draft (spec proposed with `study_propose`) → Calibrating (`bb study calibrate`) → Running (`bb study start`) ⇄ Paused → Archived. Calibration failing (gates red on base, oracle too noisy) returns the study to Draft. The system pauses a running study itself when the budget is exhausted, the oracle breaks (best fails to build or measure), the host keeps failing, or the study thread goes away. It records a notice (study page, `bb study show`), marks the study thread unread without starting a turn, and includes the notice in the next strategist round.
+Draft (spec proposed with `study_propose`) → Calibrating (`bb study calibrate`) → Running (`bb study start`) ⇄ Paused → Archived. Running → Calibrating again when the human approves an oracle change; that starts a new **segment** (`refs/studies/<slug>/segment/<k>` pins its baseline). Calibration failing (gates red on base, oracle too noisy) returns a new study to Draft; a failed mid-run recalibration keeps the old spec and pauses. The system pauses a running study itself when the budget is exhausted, the oracle breaks (best fails to build or measure, the holdout fails on best), a drift check finds noise above 2× the calibrated level, the host keeps failing, or the study thread goes away. A bench host that fails its health check or goes offline only defers measurements on that host; the human is notified after a grace period. It records a notice (study page, `bb study show`), marks the study thread unread without starting a turn, and includes the notice in the next strategist round.
 
 ## Verdicts
 
-`win` (promoted: squashed onto `studies/<slug>/best`), `lose` (worse, or broke a guardrail), `inconclusive` (did not clear the minimum detectable effect), `gate_failed`, `conflict` (no longer applies onto best; the worker rebases and resubmits, and the first two conflicts don't count against its submission limit), `rejected` (touched protected or out-of-scope paths, or too large). Candidates are rebased onto best automatically when best moves; a win measured against a best that moved is measured again before promotion. Every candidate is kept as `refs/studies/<slug>/c/<n>`. Nothing is pushed.
+`win` (promoted: squashed onto `studies/<slug>/best`; it passed confirmation and, when configured, the hidden holdout), `lose` (worse, broke a guardrail relative to best, or failed the holdout), `inconclusive` (did not clear the minimum detectable effect), `gate_failed`, `conflict` (no longer applies onto best; the worker rebases and resubmits, and the first two conflicts don't count against its submission limit), `rejected` (touched protected or out-of-scope paths, or too large). Candidates are rebased onto best automatically when best moves; a win measured against a best that moved is measured again before promotion. Every candidate is kept as `refs/studies/<slug>/c/<n>`. Nothing is pushed.
 
 ## If you are the strategist (the study thread)
 
@@ -49,9 +52,11 @@ Messages starting with `[autoresearch] Strategist round` carry a digest: recent 
 
 You never edit code, run benchmarks, or decide verdicts. Concurrency, budget, the oracle, and pausing belong to the human.
 
-## Constraints (M1)
+The holdout is secret: verdicts say only "passed/failed the holdout check". Never try to find or reproduce the holdout workload.
+
+## Constraints (M2)
 
 - Up to `max_workers` workers at once; W adapts as min(max_workers, ceil(think/eval)+1), and no worker spawns while the bench queue is at least W deep.
-- The server's own machine is both edit host and bench host (remote bench hosts arrive in M2).
+- The server's own machine is the edit host (workers, gates). Bench hosts are `local` (plugin checkouts here) or BB machines with their own clone, fed by git bundles; queued candidates go oldest first to whichever bench host is free, online and healthy.
 - `noisy` and `expensive` oracles take the bench lock: one measurement at a time per bench host; gates run in parallel outside it.
-- The spec lives in plugin storage, not the repo. Changing it after start (new oracle segment) is not supported yet: archive and create a new study.
+- The spec lives in plugin storage, not the repo. Proposing a revised spec after start makes it pending until the human approves it (`approve` without an oracle change, `calibrate` with one).

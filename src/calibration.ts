@@ -1,9 +1,14 @@
-// Calibration: gates on the baseline, then repeated A/A measurement. Produces
-// the noise floor, the minimum detectable effect, and the cost of one
-// evaluation, recorded as a segment.
+// Calibration: gates on the baseline, then repeated A/A measurement on every
+// bench host. Produces the noise floor, the minimum detectable effect, and
+// the cost of one evaluation per host, recorded as a segment (the segment
+// takes the worst host). Changing the oracle mid-run calibrates again on the
+// current best and starts a new segment.
 import { createHash } from "node:crypto";
+import { BenchTransferError } from "./bench.ts";
 import type { Ctx } from "./context.ts";
-import type { StudyRow } from "./db/store.ts";
+import type { BenchHostRow, StudyRow } from "./db/store.ts";
+import { checkHealth } from "./health.ts";
+import { parseMeasureOutput } from "./metrics.ts";
 import { strategyFor, BenchError, type CalibrationOutcome } from "./noise.ts";
 import { withBench, type Pipeline } from "./pipeline.ts";
 import { clip } from "./prompts.ts";
@@ -20,6 +25,8 @@ export interface CalibrationReport {
   evalSeconds: number | null;
   oracleHash: string;
   details: Record<string, number | string | boolean>;
+  /** Per bench host results (noise floor, MDE, eval cost). */
+  hosts: Array<{ hostId: string; name: string; mode: string; noiseFloor: number; mde: number; evalSeconds: number; report: string }>;
   finishedAt: number;
 }
 
@@ -45,6 +52,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     mde: null,
     evalSeconds: null,
     details: {},
+    hosts: [],
     finishedAt: ctx.now(),
     ...partial,
   });
@@ -52,8 +60,10 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   // 1. Baseline: the existing best (re-calibration) or the spec's base ref.
   const existingBest = await runner.resolveRef(repo, `refs/heads/${bestBranch(study.slug)}`);
   // Before any promotion the baseline follows the spec's base ref; after one, re-calibration measures best.
+  // Mid-run (an oracle change) it always measures the current best.
   const hasPromotions = Boolean(study.best_sha && study.base_sha && study.best_sha !== study.base_sha);
-  const baseSha = hasPromotions ? study.best_sha : await runner.resolveRef(repo, spec.study.base);
+  const useBest = Boolean(study.best_sha) && (hasPromotions || store.hasRun(study.id));
+  const baseSha = useBest ? study.best_sha : await runner.resolveRef(repo, spec.study.base);
   if (!baseSha) {
     problems.push(`base ref ${JSON.stringify(spec.study.base)} not found in ${repo}`);
     return finish({ baselineSha: "", oracleHash: oracleHash(spec) });
@@ -81,51 +91,102 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   }
   const gateSeconds = (ctx.now() - gateStarted) / 1000;
 
-  // 4. A/A measurement on two checkouts of the baseline, holding the bench lock.
+  // 4. A/A measurement on two checkouts of the baseline on every bench host, each holding its own lock.
   const strategy = strategyFor(spec.oracle.noise);
-  let outcome: CalibrationOutcome;
-  try {
-    outcome = await withBench(ctx, study, "calibration", null, async () => {
-      const a = await runner.checkout(repo, `${study.slug}-best`, baseSha);
-      const b = await runner.checkout(repo, `${study.slug}-cand`, baseSha);
-      if (spec.oracle.build) {
-        for (const dir of [a, b]) {
-          const r = await runner.exec({ cwd: dir, command: spec.oracle.build, timeoutMs });
-          if (r.exitCode !== 0) throw new BenchError("best", `build failed on the baseline (exit ${r.exitCode})`, `${r.stdout}\n${r.stderr}`);
-        }
-      }
-      store.deleteCalibrationSamples(study.id);
-      const bench = pipeline.makeBench(runner, spec, { best: a, candidate: b });
-      return await strategy.calibrate({
-        bench,
-        spec,
-        rng: ctx.rng,
-        record: (s) => {
-          for (const [metric, value] of Object.entries(s.metrics)) {
-            store.addSample({ study_id: study.id, candidate_id: null, run: "calibration", pair: s.pair, side: s.side, metric, value, host_id: runner.hostId });
-          }
-        },
-      });
-    });
-  } catch (e) {
-    if (!(e instanceof BenchError)) throw e;
-    problems.push(`${e.message}: ${clip(e.output.trim(), 600)}`);
+  store.deleteCalibrationSamples(study.id);
+  const hosts = pipeline.benchHosts(study);
+  if (!hosts.length) {
+    problems.push("the study has no bench host");
     return finish({ baselineSha: baseSha, oracleHash: hash, gateSeconds });
   }
-  problems.push(...outcome.problems);
-  if (outcome.bestRun) {
-    store.updateStudy(study.id, { best_run_json: JSON.stringify(outcome.bestRun), best_run_sha: baseSha });
+  const perHost = await Promise.all(
+    hosts.map(async (h) => {
+      try {
+        return { h, outcome: await calibrateHost(ctx, pipeline, study, h, baseSha, timeoutMs), problem: null as string | null };
+      } catch (e) {
+        if (e instanceof BenchError) return { h, outcome: null, problem: `${h.name}: ${e.message}: ${clip(e.output.trim(), 600)}` };
+        if (e instanceof BenchTransferError || e instanceof HealthError) return { h, outcome: null, problem: `${h.name}: ${e.message}` };
+        throw e;
+      }
+    }),
+  );
+  for (const r of perHost) if (r.problem) problems.push(r.problem);
+  const ok = perHost.filter((r): r is { h: BenchHostRow; outcome: CalibrationOutcome; problem: null } => r.outcome !== null);
+  if (ok.length !== perHost.length) return finish({ baselineSha: baseSha, oracleHash: hash, gateSeconds });
+  for (const r of ok) problems.push(...r.outcome.problems.map((p) => (ok.length > 1 ? `${r.h.name}: ${p}` : p)));
+  const first = ok[0]!.outcome;
+  if (first.bestRun) {
+    store.updateStudy(study.id, { best_run_json: JSON.stringify(first.bestRun), best_run_sha: baseSha });
   }
+  // The segment takes the worst host: a win must clear every host's noise.
+  const noiseFloor = Math.max(...ok.map((r) => r.outcome.noiseFloor));
+  const mde = Math.max(...ok.map((r) => r.outcome.mde));
+  const evalSeconds = Math.max(...ok.map((r) => r.outcome.evalSeconds));
   const gateLine = spec.oracle.gate.length ? ` Gates take ${gateSeconds.toFixed(1)} s on the edit host.` : "";
+  const hostLines = ok.length > 1 ? ` Per host: ${ok.map((r) => `${r.h.name} MDE ${(r.outcome.mde * 100).toFixed(2)}%`).join(", ")}.` : "";
+  const holdoutLine = spec.oracle.holdout ? " Holdout runs on every bench host." : "";
   return finish({
     baselineSha: baseSha,
     oracleHash: hash,
     gateSeconds,
-    noiseFloor: outcome.noiseFloor,
-    mde: outcome.mde,
-    evalSeconds: outcome.evalSeconds,
-    report: outcome.report + gateLine,
-    details: { ...outcome.details, existingBest: existingBest ?? "" },
+    noiseFloor,
+    mde,
+    evalSeconds,
+    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine,
+    details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length },
+    hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report })),
+  });
+}
+
+class HealthError extends Error {}
+
+/** Calibrate one bench host: health, transfer, two baseline checkouts, build, A/A, a holdout smoke run. */
+async function calibrateHost(ctx: Ctx, pipeline: Pipeline, study: StudyRow, h: BenchHostRow, baseSha: string, timeoutMs: number): Promise<CalibrationOutcome> {
+  const { store } = ctx;
+  const spec = store.spec(study);
+  const strategy = strategyFor(spec.oracle.noise);
+  return await withBench(ctx, study, h.host_id, "calibration", null, async () => {
+    const health = await checkHealth(ctx, study, h, spec, "calibration", async () => undefined);
+    if (!health.ok) throw new HealthError(`health check failed: ${health.problems.join("; ")}`);
+    const site = pipeline.site(study, h);
+    site.invalidateBest();
+    const a = await site.checkout("best", baseSha, "best", "baseline");
+    const b = await site.checkout("cand", baseSha, "best", "baseline");
+    if (spec.oracle.build) {
+      for (const dir of [a, b]) {
+        const r = await site.build(dir, spec, "baseline");
+        if (!r.ok) throw new BenchError("best", "build failed on the baseline", r.output);
+      }
+    }
+    if (spec.oracle.holdout) {
+      // The holdout must work on this host; its output is discarded (agents never see it).
+      const r = await site.runner.run({ cwd: a, command: spec.oracle.holdout.measure, timeoutMs, label: "holdout" });
+      const metric = spec.oracle.holdout.metric ?? spec.metric.name;
+      if (r.exitCode !== 0 || parseMeasureOutput(r.stdout).metrics[metric] === undefined) {
+        throw new BenchError("best", `the holdout command does not work on this host (exit ${r.exitCode}, or no METRIC ${metric} line)`, "");
+      }
+    }
+    site.markBestBuilt(baseSha, a);
+    const bench = site.bench(spec, { best: a, candidate: b }, { label: "calibration" });
+    const outcome = await strategy.calibrate({
+      bench,
+      spec,
+      rng: ctx.rng,
+      record: (s) => {
+        for (const [metric, value] of Object.entries(s.metrics)) {
+          store.addSample({ study_id: study.id, candidate_id: null, run: "calibration", pair: s.pair, side: s.side, metric, value, host_id: h.host_id });
+        }
+      },
+    });
+    store.updateBenchHost(study.id, h.host_id, {
+      noise_floor: outcome.noiseFloor,
+      mde: outcome.mde,
+      eval_seconds: outcome.evalSeconds,
+      evals_since_drift: 0,
+      drift_status: null,
+      baseline_json: outcome.baselineRuns ? JSON.stringify({ sha: baseSha, runs: outcome.baselineRuns.slice(0, 20) }) : null,
+    });
+    return outcome;
   });
 }
 
@@ -164,6 +225,8 @@ export async function recordCalibration(ctx: Ctx, study: StudyRow, report: Calib
       eval_seconds: report.evalSeconds,
       gate_seconds: report.gateSeconds,
       report: report.report,
+      spec_version: study.spec_version,
+      details_json: JSON.stringify({ hosts: report.hosts }),
     });
     store.updateStudy(study.id, {
       calibration_status: "ready",
@@ -172,6 +235,7 @@ export async function recordCalibration(ctx: Ctx, study: StudyRow, report: Calib
       best_sha: report.baselineSha,
       segment: k,
     });
-    store.event(study.id, "calibration.ready", "plugin", { segment: k, mde: report.mde, noise_floor: report.noiseFloor, eval_seconds: report.evalSeconds });
+    store.event(study.id, "calibration.ready", "plugin", { segment: k, mde: report.mde, noise_floor: report.noiseFloor, eval_seconds: report.evalSeconds, oracle: report.oracleHash, hosts: report.hosts.length });
+    if (k > Math.max(1, study.segment)) store.event(study.id, "segment.started", "plugin", { segment: k, baseline: report.baselineSha, oracle: report.oracleHash, spec_version: study.spec_version });
   });
 }

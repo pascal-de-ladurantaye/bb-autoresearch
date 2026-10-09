@@ -5,7 +5,7 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: autoresearch
 brandSublabel: BB plugin design
-pills: Draft | M0-M1 built | M2-M3 to do
+pills: Draft | M0-M2 built | M3 to do
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -481,6 +481,27 @@ The dossier is stored as a versioned text blob per study. Git refs are the sourc
 - **Holdout data never enters agent context.** Workers only see a pass or fail.
 - **Nothing leaves the machine before harvest,** and harvest PRs start as drafts.
 
+### Threat model
+
+**What the plugin protects against.** Accidental or casual metric gaming by agents through the tools and context they are given:
+
+- editing the benchmark, tests, or harness: scope check at submission, protected paths hashed into the oracle;
+- keeping a regression or a lucky number: the plugin owns every verdict, with paired sequential tests and confirmation runs;
+- special-casing the benchmark input: the holdout, whose inputs and numbers never enter agent context (only pass or fail);
+- widening their own resources: control RPCs are clamped to the approved spec (concurrency can only go down), and the spec and oracle can't be approved over RPC at all;
+- approving their own oracle: approval commands refuse a study's own worker and strategist threads, and a revised spec from the study thread stays pending until a human approves it;
+- doing any of this unnoticed: every human control is an append-only `control.*` event with the caller information BB provides and the study agent turns running at that moment, plus a notice (and an unread study thread when an agent turn was running).
+
+**What it cannot protect against on a full-access local machine.** An agent with a shell running as the user can do anything the user can:
+
+- BB gives plugins no caller-thread identity for RPC: the app, the `bb` CLI, and agents are all `client`, so an agent can call the plugin's RPC with `bb plugin rpc call`.
+- The CLI's thread id comes from the invoking shell's environment; an agent can drop it and look like the human.
+- Plugin forms (`bb.ui.requestInput`) can be answered with `bb thread interactions respond`, so a form is no stronger an approval channel.
+- With a `local` bench host, the holdout's files sit on the same disk the agents can read.
+- Nothing stops it from editing the plugin's SQLite database or source, or pushing.
+
+There, the defenses are detection (the audit trail above) and isolation: a separate bench machine that holds the holdout, and agent permission modes and sandboxes that don't allow arbitrary shell access. A study whose results matter should run its bench on a machine its workers can't reach.
+
 ## Budget and cost
 
 - **Limits.** `max_workers`, `max_candidates`, `max_bench_hours`, `deadline`. Token or dollar limits too, if BB exposes per-thread usage to plugins (see [Open questions](#open-questions)).
@@ -516,9 +537,10 @@ The main assumption: short-lived workers with good briefs, judged by the plugin,
 
 ### M2: remote bench and trust
 
-- [ ] Bench hosts through `bb.host`, `git bundle` transfer, cached `best` builds
-- [ ] Machine health checks, drift checks, holdout, guardrails
-- [ ] Oracle versioning and segments
+- [x] Bench hosts through `bb.host`, `git bundle` transfer, cached `best` builds
+- [x] Machine health checks, drift checks, holdout, guardrails
+- [x] Oracle versioning and segments
+- [ ] Exit criterion: not run, because only one BB machine exists (see the M2 notes)
 
 **Exit:** a study runs a full day on a remote x86 bench host without a human stepping in.
 
@@ -554,12 +576,12 @@ The main assumption: short-lived workers with good briefs, judged by the plugin,
 
 1. Can plugins read per-thread token or cost usage? Token budgets and tokens per win depend on it.
 2. What notification channel should be the default: study-thread attention only, or a push or Slack path a plugin can use directly?
-3. What are the host RPC limits for long calls? Benchmarks of 30 minutes or more need to know the maximum call duration, how cancellation works, and whether progress can stream through signals.
+3. ~~What are the host RPC limits for long calls?~~ Answered in M2: a call is capped at 30 minutes, input at 32 MiB and output at 8 MiB. Long commands run as host background jobs polled in short calls, cancelled through `jobCancel`, with progress through host signals (see the M2 notes).
 4. Do hidden threads count against concurrency limits? Is a link from the study page enough for users to find them?
 5. Is `threads.compact` enough for the study thread, or should the plugin replace it with a fresh thread that starts from a digest?
 6. Does mixing providers across workers improve idea diversity enough to justify the setup? Test this in M1.
 7. Where should gates run by default: the edit host (parallel, no extra machine) or a separate gate pool (keeps laptops quiet)?
-8. For `expensive` oracles, what's the right number of confirmation runs, given that a single evaluation can take an hour?
+8. For `expensive` oracles, what's the right number of confirmation runs, given that a single evaluation can take an hour? M2 chose k = 3 with Student-t thresholds (simulated: 1.4% false wins, 71% of 3σ effects found, 1.15 runs per no-effect candidate). Revisit with real long-running benchmarks.
 
 ## Implementation notes
 
@@ -569,7 +591,7 @@ What M0 built, and every place it differs from the design above. Checked against
 
 - **SDK pin.** `bb plugin types` selects 0.6.15, which is not published to npm. The plugin pins 0.6.14, the newest published version (`engines.bbPluginSdk: ">=0.6.14"`). Every API used exists in both.
 - **Host RPC is the only path to the machine.** Git, gates, builds and measurements run through the `bb.host` entry (`host.ts`) via `bb.hosts.experimental_client`, targeting `bb.sdk.system.config().primaryHostId`. The server never touches the repo with `child_process`. The same ops also run in-process behind the `HostRunner` interface (`LocalHostRunner`), which the tests use. M2 adds remote bench hosts by pointing a `HostRunner` at another host id.
-- **Call duration.** A host call is capped at 30 minutes, so one `build`, `gate` or `measure` command is capped at 29 (`oracle.timeout_minutes`, default 20). A paired measurement is many calls, so a whole evaluation can run longer. Benchmarks that need more than 29 minutes per run need a background job on the host that reports through signals (open question 3, M2).
+- **Call duration.** A host call is capped at 30 minutes, so one `build`, `gate` or `measure` command is capped at 29 (`oracle.timeout_minutes`, default 20). A paired measurement is many calls, so a whole evaluation can run longer. Benchmarks that need more than 29 minutes per run need a background job on the host that reports through signals (open question 3, M2). *(M2: built as host jobs; see the M2 notes.)*
 - **Repo location.** The study's repo is the project's checkout on the server's machine (`projects.get().sources`). Projects without one are refused in M0.
 
 ### Git model
@@ -740,3 +762,207 @@ Three studies ran on one toy Python pipeline with a `noisy` metric. All had `max
 - **Mixed providers.** Mixing providers across workers (open question 6).
 - **Tabs.** The Findings, Oracle, Bench, and Harvest tabs.
 - **Remote bench hosts.** Remote bench hosts and everything else in M2 (the `HostRunner` seam and per-key bench queues are ready for them).
+
+## Implementation notes: M2
+
+What M2 added, and every place it differs from the design or from M1. Same platform pins (BB 0.45.x, SDK 0.6.14). Only one BB machine existed while building it, so remote bench hosts are exercised for real against the local machine in clone mode (below), and with fake hosts in unit tests.
+
+### Bench hosts
+
+- **Two modes, chosen by the spec entry.**
+  - `"local"` (or an empty list) is the M1 path: plugin checkouts of the project repo on the edit host, no transfer.
+  - Any other entry is a BB machine name or host id, resolved against `bb.sdk.hosts.list()` when `study_propose` runs. Unknown or ambiguous names are spec errors that list the known machines. That machine gets **clone mode**, even when it is the server's own machine: this is how the live smoke test took the full remote path.
+  - The resolved list is stored per spec version (`spec_versions.bench_json`) and becomes the study's `bench_hosts` rows when that version is approved.
+- **Edit host.** Workers, snapshots, gates, and promotion refs stay on the server's machine. Remote edit hosts aren't built.
+- **Bench clone.** Each clone-mode host keeps a bare clone per study at `<dataDir>/bench/<slug>/repo.git`, where `dataDir` is the host entry's `experimental_paths.dataDir` (on the test machine, `~/.bb/plugins/autoresearch/host-data/`). Measurement checkouts are worktrees of that clone, `<dataDir>/checkouts/<slug>-bench-{best,cand,drift,profile}`. Every received commit is pinned as `refs/bench/s/<sha>`, and `gc.auto` is off. `bb study archive` cancels the study's jobs, removes the checkouts, and deletes the clone.
+- **Per-study clone (decision).** A clone per project would save bootstrap transfers across studies, but a per-study clone can be deleted safely when the study is archived.
+
+### Transfer
+
+- **What a bundle carries.** The edit host bundles the commit minus everything reachable from the bench's pinned tips (newest 4,096) into a temp file. The server relays it in chunks of 4 MiB raw (5.33 MiB base64): under the 8 MiB output cap on `bundleRead` and far under the 32 MiB input cap on `bundleWrite`. The bench checks the sha256, runs `git bundle verify`, fetches, and pins the commit.
+- **Size limit.** A bundle above `oracle.max_bundle_mib` (default 256) fails before any chunk moves. For a candidate that's verdict `rejected`, with the size and limit in the reason. For best or the baseline it's a system pause. Failed transfers are recorded too.
+- **Bootstrap by bundle (decision).** The first transfer carries the baseline's full history, instead of a `git clone` from origin. That works for repos without a remote and keeps "nothing leaves the machine". A very large repo needs a larger `max_bundle_mib` (open issue below).
+- **Promotion.** The promoted commit has the same tree as the measured candidate, so refreshing best on a bench host is a one-commit bundle.
+- **Audit.** Every transfer is a row in `transfers` (bytes, chunks, ms) and a `bench.transfer` event. `bb study bench` lists them.
+
+### Long commands, progress, cancellation
+
+- **Host jobs.** Build, gate, each measure run, holdout, and profile run as host background jobs:
+  - `jobStart` returns at once.
+  - `jobWait` blocks at most 60 s; the server polls every 20 s with a 30 s call timeout.
+  - `jobCancel` kills the process group.
+  - A running job holds an `experimental_retainWorker` lease, so the host worker's idle stop doesn't kill it.
+  - No host call comes near the 30-minute cap. `oracle.timeout_minutes` is per command and may now go up to 1,440.
+- **Progress.** A job's last output line goes to the server as a `progress` host signal, at most every 5 s, and also comes back with each poll. The pipeline adds the pair and side, and the Overview shows them on the bench host's row.
+- **Cancellation.** Every measurement has an AbortController. Cancelling it cancels the current host job. Three things cancel measurements:
+  - an oracle change (the candidate is sent back to the gate);
+  - archiving the study;
+  - a host worker exit (the measurement restarts).
+
+### Dispatch, caches, calibration
+
+- **Dispatch.** Queued candidates are sorted oldest first. Each goes to the first of its study's bench hosts (in spec order) that is free, online, and not deferred. Each host has its own bench lock, so hosts measure in parallel, one measurement per host.
+- **Calibration on every host.** Calibration runs on all bench hosts in parallel. Each host records its own noise floor, MDE, and eval cost. The segment takes the worst host (decision: a win must clear every host's noise), and drift checks compare a host against its own floor.
+- **Calibration checks.** Calibration on an unhealthy host fails calibration (decision: a noise floor measured on a disturbed machine is wrong). With a holdout configured, calibration also runs the holdout once per host to check that it works there.
+- **Cached best builds.** Each bench host caches its build of best, recorded as `best_build_sha` plus the checkout path in memory. While the cache is valid the checkout isn't touched, so untracked build outputs survive.
+  - Every promotion invalidates it on all hosts (`bench.cache_invalidated`).
+  - So does reconciliation: a new process doesn't trust the old one's checkouts.
+
+### Health checks
+
+- **When.** The `health` host op runs before every measurement, drift check, calibration, and profile.
+- **What it reports.**
+  - Load averages.
+  - The busiest processes: on Linux from two `/proc` samples 500 ms apart, because `ps` gives lifetime averages there; on macOS from `ps`. Only the host worker itself is excluded: gates on the same machine are real competing load.
+  - Linux: the CPU governor, and turbo from `intel_pstate/no_turbo` or `cpufreq/boost`.
+  - macOS: AC or battery power, and the pmset CPU speed limit.
+  - What the platform can't report is listed as not detectable (on macOS: governor, turbo, and on Apple Silicon the speed limit), not guessed.
+- **Policy.** `[oracle.health]` sets per-CPU load, competing-process CPU, an optional required governor, turbo off, AC power, and the CPU speed limit.
+- **Deferral.** A failing check leaves the candidate queued in its place. The host waits `retry_seconds` (60). A notice goes out once per unhealthy streak, after `notify_after_minutes` (15).
+- **Where it shows.** `bb study show` and `bb study bench` show the last report per host, and `health_checks` keeps the history.
+
+### Drift checks
+
+- **Engine-timed, not a cron schedule (decision).** The design asks for a check every N evaluations, and a `bb.background.schedule` cron can't count evaluations.
+- **When.** Every `oracle.drift.every` evaluations per host (default 10, 0 turns it off), the host's next free slot runs an A/A check on best. A drift check takes priority over queued candidates.
+- **noisy.** `pairs` pairs of best against a second built checkout of best. The statistic is the robust SD of the paired differences, the same statistic as the calibrated noise floor.
+- **expensive.** `pairs` runs of best, compared with the host's baseline as the RMS relative deviation.
+- **deterministic.** No drift checks.
+- **Result.** Above `max_ratio` (2) × the calibrated level, the study pauses with the numbers in the reason. `bb study drift` requests a check now. Drift runs are kept in `drift_checks`, not as samples.
+- **Finding from the smoke test.** Relative noise grows when runs get much shorter. After a 99% speedup, the 6 ms best was 4.9× noisier relative to itself than the calibrated 600 ms baseline. The drift check paused the study, and the fix was an oracle change (more pairs) with recalibration on best: exactly the path the design intends.
+
+### Holdout
+
+- **When.** It runs only for wins (after confirmation, for `noisy`), on the bench host, before promotion.
+- **Protocol.** `runs` paired best/candidate runs (default 3). It passes when the median paired change is no worse than `max_regression` (default 1%).
+- **"No worse", not "better" (decision).** Genuine wins often help the holdout less than the benchmark, and requiring an improvement would fail them on noise.
+- **Outcomes.** A fail is a `lose` with a fixed reason text. A holdout that fails on best itself means the oracle is broken: the study pauses, and the reason carries no output.
+- **Secrecy.**
+  - The numbers go only to the private `holdout_results` table.
+  - The holdout's output is never stored: no samples, DIAG lines, gate output, or progress lines.
+  - Verdicts, events, notices, views, and RPC carry only pass or fail.
+  - `bb study show` prints "holdout: configured (hidden from agents)", and no view exposes the spec TOML.
+  - A test checks every agent-reachable surface for the holdout's numbers, command, and DIAG text.
+- **Limits.** The creating agent drafts the spec, so it knows the command. A `local` bench host's holdout files are readable by agents on that machine (see the threat model).
+
+### Guardrails
+
+- **Already enforced since M0.** Guardrails relative to best were enforced in `decideVerdict` for all three noise classes, and inside confirmation: per-pair medians for `noisy`, and the candidate's median against the baseline's for `expensive`.
+- **M2 completes them.** The verdict message now carries the deltas, for example "Guardrails vs best: precision_digits 0.20% worse (limit 5.00% worse) ok", or BROKEN. There's a pipeline-level test of a primary-metric win turned into a `lose` by a guardrail.
+
+### Expensive class
+
+- **Calibration.** `calibration_runs` (default 5) baseline runs give σ: the sample SD of the runs around their median.
+- **Screening.** Each candidate gets one screening run against the median of the host's m baseline runs. It is promising above max(min_effect, t·σ·√(1 + 1/m)), and a lose below the negative of that.
+- **Confirmation.** A promising run gets k = `confirm_runs` (default 3) fresh runs. The screening run is excluded from the decision, because it was selected for looking good. A win needs the k-run mean above max(min_effect, t·σ·√(1/k + 1/m)).
+- **t, not z (decision).** t is the one-sided Student-t quantile with `calibration_runs − 1` degrees of freedom. σ comes from a handful of runs, and a normal quantile with a robust σ gave 5.3% false wins in simulation.
+- **Simulation** (σ estimated from 5 runs, 4,000 candidates per effect size):
+
+  | True effect | Win rate | Candidate runs per evaluation |
+  |---|---|---|
+  | 0 | 1.4% | 1.15 |
+  | 1σ | 11.5% | 1.57 |
+  | 2σ | 39.3% | 2.33 |
+  | 3σ | 71.4% | 3.18 |
+  | 4σ | 91.6% | 3.75 |
+
+- **Baselines.** The winner's k confirmation runs become the new best's baseline on that host, so a promotion costs no extra baseline run. Another host with no baseline for the new best runs best once.
+
+### Oracle versions and segments
+
+- **The oracle hash** covers the metric, the guardrails, the oracle (commands, protocol, noise class, bench hosts, holdout, timeout) and the protected globs, plus the content hash of the protected paths at the segment baseline.
+- **Bench operations aren't part of it (decision).** `[oracle.health]`, `[oracle.drift]`, `max_bundle_mib`, and `offline_grace_minutes` don't change how a commit is judged, so tuning them is not a new segment.
+- **A spec revised after the study has run** (`study_propose` from the study thread) is **pending**. The study keeps running on the active spec, and a notice says which approval applies:
+  - **Oracle unchanged:** `bb study approve <slug>` applies it in place.
+  - **Oracle changed:** `bb study calibrate <slug>` (lifecycle Running → Calibrating) does the following:
+    - cancels in-flight measurements;
+    - sends queued candidates back to the gate, keeping their queue position;
+    - activates the spec;
+    - calibrates on the current best on every bench host.
+  - `bb study start` then opens segment k+1, with `segments.spec_version` set and `refs/studies/<slug>/segment/<k+1>` pointing at best.
+  - Workers keep editing during recalibration. Their submissions are accepted and wait at the gate.
+  - If the new oracle fails calibration, the study goes back to the previous spec and segment and pauses, instead of dropping to Draft.
+- **"Has run"** is decided from the append-only state log, not from `running_seconds`, which a fast test clock leaves at 0.
+
+### Failure handling, as in the design's table
+
+- **Bench host offline.**
+  - BB's host status (`bb.sdk.hosts.get`, cached 15 s) is refreshed every control-loop pass, and offline hosts get no new measurements.
+  - A measurement that fails while its host is disconnected restarts from scratch and isn't counted as a pipeline error.
+  - The human is notified after `offline_grace_minutes` (10). The study isn't paused: workers keep editing until backpressure stops new spawns.
+- **Host worker restart mid-measurement.**
+  - `experimental_onWorkerExit` cancels the in-flight measurements on that host.
+  - A `jobWait` that answers `unknown`, because the job registry died with the worker, is the same case.
+  - The measurement restarts from scratch, and its partial samples are deleted. `measure_restarts` counts restarts; after 6 the study pauses.
+- **Plugin restart.** Reconciliation requeues measuring and confirming candidates, deletes their samples, aborts drift checks that were running, and drops build caches.
+
+### Trust
+
+- **Threat model.** The threat model above is new.
+- **Controls are clamped.** `study.concurrency` (RPC and CLI) can only lower `max_workers` below the approved spec; asking for more is clamped, with a message saying so. Idea priorities were already clamped to ±100, and reorders to 200 ids.
+- **Controls are audited.** Every control is audited: pause, resume (with the pause reason it cleared), concurrency, the idea board, calibrate, approve, start, drift, and archive. Each is a `control.<kind>` event whose actor is `rpc:client`, `rpc:plugin:<id>`, `cli:human`, or `cli:thread:<id>`, with the study agent turns that were running at that moment. Each also raises a notice. The study thread is marked unread only when an agent turn was running.
+- **Approval is CLI-only.** Oracle and spec approval (calibrate, approve, start) exist only in the CLI, and the CLI refuses a study's own worker and strategist threads. The SDK gives no reliable way to tell an agent from a human: RPC callers are all `client`, the CLI thread id comes from the shell environment, and plugin forms can be answered with `bb thread interactions respond`. So approval can't be made impossible from an agent shell, only refused for the cooperative case and audited.
+- **Smoke-test evidence.** The audit recorded `cli:thread:<id>` for CLI calls made from the building agent's own thread, and `rpc:client` for a `bb plugin rpc call`.
+
+### Profiles
+
+- **How `study_request_profile` runs.** It runs `oracle.profile` on the first online, non-deferred bench host, under that host's bench lock, after a health check. A candidate profile transfers the commit there first.
+- **Bench budget.** Its time counts against the bench budget, and it is refused when the remaining budget can't cover one evaluation.
+- **Cap.** It is capped per worker (`agents.max_profiles_per_worker`, default 2).
+- **Output.** It returns a bounded summary: DIAG lines first, then the last 60 lines, at most 6,000 characters.
+
+### Human surface
+
+- **Overview.** It gains a Bench hosts section. Each host shows its mode, online status, health with problems and summary, what it's measuring with live progress, the shared queue depth, drift status with evaluations since the last check, the cached best build, and bundles sent. It also shows the current segment and oracle hash, and a banner for a pending spec that says which command applies it.
+- **The full Bench/Oracle tabs are M3.**
+- **CLI.** New: `bb study approve`, `bb study bench` (transfers, health history, drift checks, segments), and `bb study drift`. `show` gains segment, pending-spec, and bench host lines, and marks the holdout as hidden.
+- **Candidates.** Rows carry the bench host and holdout pass or fail.
+
+### Data model
+
+M2's migrations are append-only:
+
+- `studies`: `pending_spec_version`, `prev_spec_version`;
+- `spec_versions`: `bench_json`;
+- `segments`: `spec_version`, `details_json` (per-host calibration);
+- `candidates`: `bench_host_id`, `holdout` (pass, fail, or null), `measure_restarts`;
+- `threads`: `profiles`;
+- new tables `bench_hosts`, `health_checks`, `drift_checks`, `transfers`, and `holdout_results` (private).
+
+New events: `bench.transfer`, `bench.unhealthy`, `bench.healthy`, `bench.offline`, `bench.online`, `bench.worker_exit`, `bench.cache_invalidated`, `measure.deferred`, `measure.restarted`, `drift.checked`, `drift.requested`, `holdout.checked`, `spec.applied`, `segment.recalibrating`, `segment.started`, and `control.*`.
+
+### Smoke test (BB 0.45, one MacBook, toy repo under /tmp)
+
+- **Setup.**
+  - A Python midpoint-rule integration (about 600 ms per run at the start), on a temporary project.
+  - Bench host `<host>`, named by its host id, so clone mode on the server's own machine.
+  - A holdout script outside the repo (a different interval), and the guardrail `precision_digits` (higher is better, 5%).
+  - `max_workers = 2`, `max_candidates = 5`, `drift.every = 2`.
+- **Spec v2, no oracle change.** Spec v1 asked for worker permission mode `auto`, which the default provider (pi) refuses. The study thread proposed spec v2 without it, `bb study approve` applied it without recalibration, and `bb study resume` continued.
+- **Bundles.** All bundles went to the bench-owned clone `~/.bb/plugins/autoresearch/host-data/bench/toy-m2/repo.git`, a bare repository with no alternates, outside `/tmp/ar-m2-toy`, with checkouts as its own worktrees. Each bundle was one chunk and took about 0.4–0.5 s.
+
+  | Bundle | Size |
+  |---|---|
+  | Bootstrap (baseline) | 2,136 B |
+  | Candidates c/1, c/2, c/3, c/5 | 701, 944, 802, 716 B |
+  | Best refreshes | 1,040 and 1,443 B |
+  | Segment-2 baseline | 1,173 B |
+
+- **Health.** 7 health checks were recorded, all passing: calibration ×2, measurement ×4, drift ×1. The reports said governor and turbo are not detectable on macOS.
+- **Drift.** 1 drift check ran after 2 evaluations. It measured A/A noise 7.96% per pair against the calibrated 1.64% (4.85×, over 6 pairs), and the study paused itself.
+- **Oracle change.** The study thread proposed spec v3 (calibration_pairs and n_max 10 → 16), and it went pending. `bb study calibrate` recalibrated on best `8e90d2e` and created segment 2 (oracle `d4aa483b…`, noise floor 3.66%, MDE 2.86%), with `refs/studies/toy-m2/segment/1` and `segment/2` in the repo. `bb study start` resumed in segment 2.
+- **Holdout.** It passed on all 4 promotions (c/1, c/2, c/3, c/5; only the private table holds the numbers).
+- **Results.** Verdicts were 4 wins and 1 conflict. Best vs base was +99.6% (616 ms → about 2.7 ms).
+- **No guardrail-driven `lose`.** Two human ideas meant to trade precision for speed, "10x fewer steps" and "3,000 steps, no extrapolation", were handled by the workers anticipating the guardrail. One used Richardson extrapolation instead and won. The other recorded a `not_attempted` finding ("certain to break the precision guardrail"). Guardrail rejection is covered by unit tests.
+- **Audit.** A `bb plugin rpc call autoresearch study.concurrency {maxWorkers: 10}` was clamped to 2 and audited as `control.concurrency` by `rpc:client`.
+- **Code version.** The smoke test ran on commit `ed044fe`. The later changes (the expensive class switched to t thresholds, bench tuning moved out of the oracle hash, and a transfer label) don't touch the noisy path it exercised.
+- **Cleanup.** The study and every thread were archived, and archive deleted the bench clone. The temporary project and worktree, the `/tmp` files, and the empty bench directory were deleted. The plugin is left installed from the M2 worktree, disabled.
+
+### Not in M2
+
+- **Exit criterion.** "A full day on a remote x86 bench host" wasn't run: only one BB machine exists, and enrolling machines was out of bounds. Multi-host behavior (parallel hosts, per-host dispatch, offline, worker exit) is covered by fake-host unit tests only.
+- **Remote edit hosts.** Workers and gates run on the server's machine.
+- **Bootstrap without a big bundle.** A very large repo would need a large `max_bundle_mib` or a bench clone from origin.
+- **Health tuning.** Health thresholds aren't calibrated per machine: the defaults suit a quiet dedicated host, and a busy laptop needs looser `[oracle.health]` limits.
+- **Caller identity.** Approval from an agent shell can't be prevented without caller identity from BB (see the threat model).
+- **M3 tabs.** The Findings, Oracle, Bench, and Harvest tabs.

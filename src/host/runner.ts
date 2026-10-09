@@ -6,17 +6,109 @@
 //   host RPC is unavailable on a machine).
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type {
+  BundleInfo,
   DiffSummary,
   ExecInput,
   ExecResult,
+  HealthReport,
   HostContract,
+  JobInput,
+  JobStatus,
   PrepareInput,
   PrepareResult,
   SnapshotInput,
   SnapshotResult,
   hostSignals,
 } from "./contract.ts";
+import * as bundle from "./bundle.ts";
+import { health } from "./health.ts";
+import { JobRegistry } from "./jobs.ts";
 import * as ops from "./ops.ts";
+
+/** The host lost a background job: its worker restarted mid-command. */
+export class HostJobLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HostJobLostError";
+  }
+}
+
+/** A run was cancelled through its AbortSignal. */
+export class RunAbortedError extends Error {
+  constructor(message = "run cancelled") {
+    super(message);
+    this.name = "RunAbortedError";
+  }
+}
+
+export interface RunOptions {
+  signal?: AbortSignal;
+  /** Latest output line while the job runs (host signals and/or polling). */
+  onProgress?: (line: string) => void;
+}
+
+interface JobApi {
+  start(input: JobInput): Promise<string>;
+  wait(jobId: string, waitMs: number): Promise<JobStatus>;
+  cancel(jobId: string): Promise<boolean>;
+  subscribe?(jobId: string, fn: (line: string) => void): () => void;
+}
+
+/**
+ * Run a long command as a host background job: one short call to start it,
+ * short polls until it ends, and a cancel call on abort. No call comes near
+ * the 30-minute host call cap, however long the command runs.
+ */
+export async function runJob(api: JobApi, input: JobInput, opts: RunOptions = {}, pollMs = 20_000): Promise<ExecResult> {
+  const { signal } = opts;
+  if (signal?.aborted) throw new RunAbortedError();
+  const jobId = await api.start(input);
+  let last = "";
+  const progress = (line: string) => {
+    if (line && line !== last) {
+      last = line;
+      opts.onProgress?.(line);
+    }
+  };
+  const unsubscribe = api.subscribe?.(jobId, progress);
+  let abortListener: (() => void) | undefined;
+  const aborted = new Promise<"aborted">((resolve) => {
+    abortListener = () => resolve("aborted");
+    signal?.addEventListener("abort", abortListener, { once: true });
+  });
+  try {
+    for (;;) {
+      const status = await Promise.race([api.wait(jobId, pollMs), aborted]);
+      if (status === "aborted") {
+        await api.cancel(jobId).catch(() => false);
+        throw new RunAbortedError();
+      }
+      if (status.state === "unknown") throw new HostJobLostError(`host lost job ${jobId} (its worker restarted)`);
+      progress(status.tail);
+      if (status.state === "done" && status.result) return status.result;
+    }
+  } finally {
+    unsubscribe?.();
+    if (abortListener) signal?.removeEventListener("abort", abortListener);
+  }
+}
+
+/** Fan-out of host `progress` signals by job id (server.ts feeds it). */
+export class ProgressBus {
+  private subs = new Map<string, Set<(line: string) => void>>();
+  subscribe(key: string, fn: (line: string) => void): () => void {
+    const set = this.subs.get(key) ?? new Set();
+    set.add(fn);
+    this.subs.set(key, set);
+    return () => {
+      set.delete(fn);
+      if (!set.size) this.subs.delete(key);
+    };
+  }
+  emit(key: string, line: string): void {
+    for (const fn of this.subs.get(key) ?? []) fn(line);
+  }
+}
 
 export interface HostRunner {
   readonly hostId: string;
@@ -30,6 +122,17 @@ export interface HostRunner {
   checkout(repoPath: string, key: string, sha: string): Promise<string>;
   removeCheckouts(repoPath: string, keyPrefix: string): Promise<number>;
   diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number): Promise<DiffSummary>;
+  /** A long command as a background job (see runJob). */
+  run(input: JobInput, opts?: RunOptions): Promise<ExecResult>;
+  health(): Promise<HealthReport>;
+  benchRepo(key: string): Promise<{ path: string; tips: string[] }>;
+  removeBenchRepo(key: string): Promise<boolean>;
+  hasCommits(repoPath: string, shas: string[]): Promise<string[]>;
+  bundleCreate(repoPath: string, tip: string, basis: string[]): Promise<BundleInfo>;
+  bundleRead(id: string, offset: number, length: number): Promise<{ data: string; eof: boolean }>;
+  bundleWrite(id: string, offset: number, data: string): Promise<number>;
+  bundleApply(input: { repoPath: string; id: string; sha: string; ref: string; sha256: string }): Promise<{ ok: boolean; detail: string }>;
+  bundleDiscard(id: string): Promise<void>;
 }
 
 const GIT_TIMEOUT = 5 * 60_000;
@@ -38,6 +141,7 @@ export class BbHostRunner implements HostRunner {
   constructor(
     private readonly client: ExperimentalHostClient<HostContract, typeof hostSignals>,
     readonly hostId: string,
+    private readonly progress?: ProgressBus,
   ) {}
   private opts(timeoutMs = GIT_TIMEOUT, signal?: AbortSignal) {
     return { hostId: this.hostId, timeoutMs, ...(signal ? { signal } : {}) };
@@ -73,13 +177,58 @@ export class BbHostRunner implements HostRunner {
   async diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number) {
     return await this.client.call("diffSummary", { repoPath, from, to, maxPatchBytes }, this.opts(60_000));
   }
+  async run(input: JobInput, opts: RunOptions = {}) {
+    return await runJob(
+      {
+        start: async (i) => (await this.client.call("jobStart", i, this.opts(60_000))).jobId,
+        wait: async (jobId, waitMs) => await this.client.call("jobWait", { jobId, waitMs }, this.opts(waitMs + 30_000)),
+        cancel: async (jobId) => (await this.client.call("jobCancel", { jobId }, this.opts(30_000))).cancelled,
+        ...(this.progress ? { subscribe: (jobId: string, fn: (line: string) => void) => this.progress!.subscribe(jobId, fn) } : {}),
+      },
+      input,
+      opts,
+    );
+  }
+  async health() {
+    return await this.client.call("health", null, this.opts(60_000));
+  }
+  async benchRepo(key: string) {
+    return await this.client.call("benchRepo", { key }, this.opts());
+  }
+  async removeBenchRepo(key: string) {
+    return (await this.client.call("removeBenchRepo", { key }, this.opts())).removed;
+  }
+  async hasCommits(repoPath: string, shas: string[]) {
+    return (await this.client.call("hasCommits", { repoPath, shas }, this.opts(60_000))).present;
+  }
+  async bundleCreate(repoPath: string, tip: string, basis: string[]) {
+    return await this.client.call("bundleCreate", { repoPath, tip, basis }, this.opts(15 * 60_000));
+  }
+  async bundleRead(id: string, offset: number, length: number) {
+    return await this.client.call("bundleRead", { id, offset, length }, this.opts(5 * 60_000));
+  }
+  async bundleWrite(id: string, offset: number, data: string) {
+    return (await this.client.call("bundleWrite", { id, offset, data }, this.opts(5 * 60_000))).bytes;
+  }
+  async bundleApply(input: { repoPath: string; id: string; sha: string; ref: string; sha256: string }) {
+    return await this.client.call("bundleApply", input, this.opts(15 * 60_000));
+  }
+  async bundleDiscard(id: string) {
+    await this.client.call("bundleDiscard", { id }, this.opts());
+  }
 }
 
 export class LocalHostRunner implements HostRunner {
+  private jobs: JobRegistry;
   constructor(
     private readonly dataDir: string,
     readonly hostId = "local",
-  ) {}
+    opts: { progressMs?: number; pollMs?: number } = {},
+  ) {
+    this.jobs = new JobRegistry(opts.progressMs ?? 5_000);
+    this.pollMs = opts.pollMs ?? 1_000;
+  }
+  private readonly pollMs: number;
   exec(input: ExecInput, signal?: AbortSignal) {
     return ops.exec(input, signal);
   }
@@ -109,5 +258,50 @@ export class LocalHostRunner implements HostRunner {
   }
   diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number) {
     return ops.diffSummary(repoPath, from, to, maxPatchBytes);
+  }
+  async run(input: JobInput, opts: RunOptions = {}) {
+    const progress = new ProgressBus();
+    return await runJob(
+      {
+        start: async (i) => this.jobs.start(i, { onProgress: (id, _label, line) => progress.emit(id, line) }),
+        wait: (jobId, waitMs) => this.jobs.wait(jobId, waitMs),
+        cancel: async (jobId) => this.jobs.cancel(jobId),
+        subscribe: (jobId, fn) => progress.subscribe(jobId, fn),
+      },
+      input,
+      opts,
+      this.pollMs,
+    );
+  }
+  /** Simulate a host worker restart: every job is forgotten (tests). */
+  loseJobs(): void {
+    this.jobs.forgetAll();
+  }
+  health() {
+    return health();
+  }
+  benchRepo(key: string) {
+    return bundle.benchRepo(this.dataDir, key);
+  }
+  async removeBenchRepo(key: string) {
+    return (await bundle.removeBenchRepo(this.dataDir, key)).removed;
+  }
+  async hasCommits(repoPath: string, shas: string[]) {
+    return (await bundle.hasCommits(repoPath, shas)).present;
+  }
+  bundleCreate(repoPath: string, tip: string, basis: string[]) {
+    return bundle.bundleCreate(this.dataDir, repoPath, tip, basis);
+  }
+  async bundleRead(id: string, offset: number, length: number) {
+    return bundle.bundleRead(this.dataDir, id, offset, length);
+  }
+  async bundleWrite(id: string, offset: number, data: string) {
+    return bundle.bundleWrite(this.dataDir, id, offset, data).bytes;
+  }
+  bundleApply(input: { repoPath: string; id: string; sha: string; ref: string; sha256: string }) {
+    return bundle.bundleApply(this.dataDir, input.repoPath, input.id, input.sha, input.ref, input.sha256);
+  }
+  async bundleDiscard(id: string) {
+    bundle.bundleDiscard(this.dataDir, id);
   }
 }

@@ -53,7 +53,9 @@ describe("rpc: study page data and controls", () => {
     expect(o.utilization.overlaps).toBe(0);
     expect(o.utilization.runningSeconds).toBeGreaterThanOrEqual(0);
     expect(o.calibration.status).toBe("ready");
-    expect(o.notices[0].kind).toBe("calibration.ready");
+    expect(o.notices.map((n: { kind: string }) => n.kind)).toContain("calibration.ready");
+    // M2: human controls are audited as notices too.
+    expect(o.notices.map((n: { kind: string }) => n.kind)).toContain("control.start");
     expect(o.workerList[0]).toMatchObject({ threadId: "thr_w1", ideaId: 1, state: "active" });
     expect(JSON.stringify(o)).not.toContain("undefined");
   });

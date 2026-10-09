@@ -88,9 +88,66 @@ export const specSchema = z
         measure: command,
         profile: command.optional(),
         noise: z.enum(NOISE_CLASSES),
-        bench_hosts: z.array(z.string().min(1)).max(16).default([]),
-        timeout_minutes: z.number().min(0.1).max(29).default(20),
-        holdout: z.object({ measure: command }).strict().optional(),
+        /**
+         * "local" measures in plugin checkouts of the project repo on the edit
+         * host (no transfer). Any other entry is a BB host id or name, the
+         * server's own machine included: it gets a bench-owned clone that
+         * receives commits only as git bundles (the remote path).
+         */
+        bench_hosts: z.array(z.string().trim().min(1).max(200)).max(16).default([]),
+        /** Per command (build, gate, one measure run). Long commands run as host jobs, so this may exceed the 30-minute host call cap. */
+        timeout_minutes: z.number().min(0.1).max(24 * 60).default(20),
+        /** A git bundle larger than this fails the transfer to a bench host. */
+        max_bundle_mib: z.number().min(1).max(4096).default(256),
+        /** Notify the human when a bench host stays offline this long. */
+        offline_grace_minutes: z.number().min(0.5).max(24 * 60).default(10),
+        /** Hidden workload on the bench host, run only on candidates about to be promoted. Agents see pass/fail only. */
+        holdout: z
+          .object({
+            measure: command,
+            /** Metric to compare (default: the primary metric). */
+            metric: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/u).optional(),
+            /** Paired best/candidate runs. */
+            runs: z.number().int().min(1).max(50).default(3),
+            /** Fail when the candidate's median paired holdout change is worse than this. */
+            max_regression: fraction.default(0.01),
+          })
+          .strict()
+          .optional(),
+        /** Machine health checked before every measurement; a failing check defers it. */
+        health: z
+          .object({
+            enabled: z.boolean().default(true),
+            /** 1-minute load average per CPU. */
+            max_load: z.number().min(0).max(64).default(0.8),
+            /** CPU % (of one core) of the busiest other process. */
+            max_process_cpu: z.number().min(0).max(6400).default(60),
+            /** Process names ignored by the competing-process check. */
+            ignore_processes: z.array(z.string().min(1).max(80)).max(32).default([]),
+            /** Linux: required scaling governor, e.g. "performance". */
+            require_governor: z.string().min(1).max(40).optional(),
+            /** Require turbo/boost off where detectable. */
+            require_turbo_off: z.boolean().default(false),
+            /** Fail on battery power where detectable. */
+            require_ac_power: z.boolean().default(true),
+            /** Fail when macOS reports a CPU speed limit below this (thermal throttling). */
+            min_cpu_speed_limit: z.number().min(0).max(100).default(100),
+            /** How long a deferred bench host waits before the next try. */
+            retry_seconds: z.number().min(1).max(3600).default(60),
+            /** Notify the human when a host stays unhealthy this long. */
+            notify_after_minutes: z.number().min(0).max(24 * 60).default(15),
+          })
+          .strict()
+          .prefault({}),
+        /** Repeat an A/A run on best every `every` evaluations per bench host; pause when noise exceeds max_ratio × calibrated. */
+        drift: z
+          .object({
+            every: z.number().int().min(0).max(10_000).default(10),
+            pairs: z.number().int().min(2).max(200).default(6),
+            max_ratio: z.number().min(1).max(100).default(2),
+          })
+          .strict()
+          .prefault({}),
         protocol: z
           .object({
             warmup: z.number().int().min(0).max(20).default(1),
@@ -104,8 +161,10 @@ export const specSchema = z
             /** deterministic: improvement must exceed this to win. */
             tolerance: fraction.default(0),
             confirm: z.boolean().default(true),
-            /** expensive: extra runs used to confirm a win. */
+            /** expensive: k fresh runs of the candidate that must confirm a promising single run (see design, M2 notes). */
             confirm_runs: z.number().int().min(1).max(20).default(3),
+            /** expensive: baseline runs at calibration (the noise floor). */
+            calibration_runs: z.number().int().min(3).max(50).default(5),
             calibration_pairs: z.number().int().min(4).max(500).default(12),
             bootstrap: z.number().int().min(200).max(20_000).default(2000),
           })
@@ -136,6 +195,8 @@ export const specSchema = z
         stall_after: z.number().int().min(2).max(1000).default(10),
         idle_nudge_minutes: z.number().min(0.1).max(24 * 60).default(15),
         idle_abandon_minutes: z.number().min(0.1).max(24 * 60).default(30),
+        /** study_request_profile calls per worker (each uses bench time). */
+        max_profiles_per_worker: z.number().int().min(0).max(20).default(2),
       })
       .strict()
       .prefault({}),
@@ -164,7 +225,7 @@ export function parseSpec(toml: string): SpecResult {
   return validateSemantics(parsed.data);
 }
 
-/** Cross-field rules zod can't express directly, and M0 capability limits. */
+/** Cross-field rules zod can't express directly. Bench host names are resolved against BB later (engine). */
 export function validateSemantics(spec: StudySpec): SpecResult {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -183,11 +244,15 @@ export function validateSemantics(spec: StudySpec): SpecResult {
       if (e === pr) errors.push(`scope: ${e} is both editable and protected`);
     }
   }
-  // M0 runs everything on the server's own machine. Remote bench hosts land in M2.
-  if (spec.oracle.bench_hosts.some((h) => h !== "local")) {
-    errors.push('oracle.bench_hosts: only "local" (or empty) is supported until remote bench hosts land (M2)');
+  const seen = new Set<string>();
+  for (const h of spec.oracle.bench_hosts) {
+    const k = h.toLowerCase();
+    if (seen.has(k)) errors.push(`oracle.bench_hosts: ${h} is listed twice`);
+    seen.add(k);
   }
-  if (spec.oracle.holdout) warnings.push("oracle.holdout is recorded but not evaluated until M2");
+  if (spec.oracle.holdout && spec.oracle.noise === "deterministic") {
+    warnings.push("oracle.holdout with a deterministic oracle compares one run per side");
+  }
   if (spec.oracle.noise === "noisy" && spec.oracle.gate.length === 0) {
     warnings.push("oracle.gate is empty: candidates are measured without a correctness check");
   }
@@ -211,10 +276,13 @@ function canonical(value: unknown): string {
  * content is folded in separately at segment start (it needs the repo).
  */
 export function oracleHash(spec: StudySpec, protectedContentHash = ""): string {
+  // Bench operations (health thresholds, drift schedule, transfer cap, offline
+  // grace) don't change how a commit is judged, so tuning them is not a new segment.
+  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, ...oracle } = spec.oracle;
   const judged = {
     metric: spec.metric,
     guardrail: spec.guardrail,
-    oracle: spec.oracle,
+    oracle,
     protected: spec.scope.protected,
     protectedContent: protectedContentHash,
   };

@@ -35,6 +35,10 @@ export interface EngineConfig {
   retryDelayMs: number;
   /** A worker that called study_finish but whose turn never ends is stopped after this. */
   finishingTimeoutMs: number;
+  /** Bundle chunk size override (tests); defaults to BUNDLE_CHUNK_BYTES. */
+  bundleChunkBytes?: number;
+  /** How long a bench host's connection status is trusted before asking BB again. */
+  hostStatusTtlMs: number;
 }
 
 export interface Ctx {
@@ -46,4 +50,4 @@ export interface Ctx {
   config: EngineConfig;
 }
 
-export const DEFAULT_CONFIG: EngineConfig = { workerCeiling: 64, tickMs: 10_000, retryDelayMs: 15_000, finishingTimeoutMs: 3 * 60_000 };
+export const DEFAULT_CONFIG: EngineConfig = { workerCeiling: 64, tickMs: 10_000, retryDelayMs: 15_000, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 15_000 };
