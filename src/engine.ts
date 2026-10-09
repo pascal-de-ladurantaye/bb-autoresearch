@@ -1,0 +1,826 @@
+// The study engine: lifecycle transitions, the control loop (spawn, idle
+// handling, strategist rounds, budget), worker tools, and reconciliation.
+// Only this module and the pipeline change study state.
+import { randomUUID } from "node:crypto";
+import { recordCalibration, runCalibration, type CalibrationReport } from "./calibration.ts";
+import type { Ctx } from "./context.ts";
+import type { CandidateRow, IdeaRow, StudyRow, ThreadRow } from "./db/store.ts";
+import { errText, Pipeline } from "./pipeline.ts";
+import { clip, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
+import { budgetExhausted, idleAction, pickIdea, roundTrigger, targetWorkers, type RoundTrigger } from "./scheduler.ts";
+import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
+
+export type Role = "worker" | "strategist" | "creator";
+
+export class EngineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EngineError";
+  }
+}
+
+const LIVE_WORKER_STATES = ["spawning", "active", "finishing"] as const;
+
+export class Engine {
+  readonly pipeline: Pipeline;
+  private currentTick: Promise<void> | null = null;
+  private calibrations = new Map<string, Promise<void>>();
+
+  constructor(readonly ctx: Ctx) {
+    this.pipeline = new Pipeline(ctx, {
+      onDecided: (c) => this.onDecided(c),
+      systemPause: (study, reason) => this.systemPause(study.id, reason),
+    });
+  }
+
+  private get store() {
+    return this.ctx.store;
+  }
+
+  study(slug: string): StudyRow {
+    const s = this.store.study(slug);
+    if (!s) throw new EngineError(`no study named ${JSON.stringify(slug)}; see \`bb study list\``);
+    return s;
+  }
+
+  // ---------------------------------------------------------------- roles
+
+  /**
+   * Role for tool selection. Synchronous (bb.agents.configure is sync; the
+   * database is too). Metadata alone never grants a role: worker metadata
+   * must match a live worker row, and strategists are known only by row.
+   */
+  roleForConfigure(threadId: string, metadata: Readonly<Record<string, unknown>>): Role | null {
+    const row = this.store.threadById(threadId);
+    if (metadata.role === "worker") {
+      const token = typeof metadata.spawnToken === "string" ? metadata.spawnToken : null;
+      const w = row ?? (token ? this.store.threadByToken(token) : undefined);
+      if (!w || w.role !== "worker" || !LIVE_WORKER_STATES.includes(w.state as never)) return null;
+      if (w.thread_id !== null && w.thread_id !== threadId) return null;
+      const study = this.store.study(w.study_id);
+      if (!study || study.slug !== metadata.study) return null;
+      return "worker";
+    }
+    if (row?.role === "strategist" && row.state === "active") return "strategist";
+    if (row) return null;
+    return "creator";
+  }
+
+  /** Role check for every tool call, against the plugin's own threads table. */
+  async requireRole(threadId: string, role: Role): Promise<{ study: StudyRow | null; row: ThreadRow | null }> {
+    let row = this.store.threadById(threadId) ?? null;
+    if (!row && role === "worker") row = await this.bindBySpawnToken(threadId);
+    if (role === "creator") {
+      if (row && row.role !== "strategist") throw new EngineError("study_propose is not available to worker threads");
+      return { study: row ? (this.store.study(row.study_id) ?? null) : null, row };
+    }
+    if (!row || row.role !== role) throw new EngineError(`this tool is only available to autoresearch ${role} threads`);
+    if (role === "worker" && !LIVE_WORKER_STATES.includes(row.state as never)) throw new EngineError(`this worker is ${row.state}`);
+    if (role === "strategist" && row.state !== "active") throw new EngineError("this study thread is no longer active");
+    const study = this.store.study(row.study_id) ?? null;
+    if (!study) throw new EngineError("study not found");
+    return { study, row };
+  }
+
+  /** A tool call can race the spawn call's return; bind the thread id through the spawn token in its metadata. */
+  private async bindBySpawnToken(threadId: string): Promise<ThreadRow | null> {
+    const meta = await this.ctx.bb.getMetadata(threadId).catch(() => ({}) as Record<string, unknown>);
+    const token = typeof meta.spawnToken === "string" ? meta.spawnToken : null;
+    if (!token) return null;
+    const row = this.store.threadByToken(token);
+    if (!row || row.thread_id !== null) return null;
+    this.store.updateThread(row.id, { thread_id: threadId, state: row.state === "spawning" ? "active" : row.state });
+    return this.store.threadRow(row.id) ?? null;
+  }
+
+  // ------------------------------------------------------ human controls
+
+  async proposeStudy(threadId: string, projectId: string, toml: string): Promise<string> {
+    const parsed = parseSpec(toml);
+    if (!parsed.ok) throw new EngineError(`Spec is invalid:\n${parsed.errors.map((e) => `- ${e}`).join("\n")}`);
+    const { spec, warnings } = parsed;
+    const existingRow = this.store.threadById(threadId);
+    let study: StudyRow | undefined;
+    if (existingRow) {
+      study = this.store.study(existingRow.study_id);
+      if (!study || study.slug !== spec.study.slug) {
+        throw new EngineError(`This thread already drives study ${study?.slug ?? "?"}; a revised spec must keep that slug.`);
+      }
+      if (!["draft", "calibrating"].includes(study.state)) {
+        throw new EngineError(`Study ${study.slug} is ${study.state}. Oracle changes after start (new segments) arrive in M2; pause and archive to start over.`);
+      }
+      if (this.calibrations.has(study.id)) throw new EngineError("Calibration is running; wait for it before revising the spec.");
+    } else {
+      if (this.store.study(spec.study.slug)) throw new EngineError(`A study named ${spec.study.slug} already exists; pick another slug.`);
+      const hostId = await this.ctx.bb.primaryHostId();
+      if (!hostId) throw new EngineError("The BB server has no local machine identity; M0 runs studies on the server's own machine.");
+      const repo = await this.ctx.bb.projectCheckout(projectId, hostId);
+      if (!repo) throw new EngineError("This project has no checkout on the server's machine; M0 needs one (remote edit hosts arrive in M2).");
+      const id = `std_${randomUUID().replace(/-/gu, "").slice(0, 12)}`;
+      this.store.tx(() => {
+        this.store.insertStudy({ id, slug: spec.study.slug, project_id: projectId, host_id: hostId, repo_path: repo, study_thread_id: threadId });
+        this.store.insertThread({ study_id: id, role: "strategist", thread_id: threadId, state: "active" });
+        this.store.event(id, "study.created", threadId, { slug: spec.study.slug, project: projectId, repo });
+      });
+      study = this.store.study(id)!;
+      await this.ctx.bb.setMetadata(threadId, { study: spec.study.slug, role: "strategist" }).catch((e) => this.ctx.bb.log("warn", `metadata: ${errText(e)}`));
+    }
+    const version = this.store.addSpecVersion(study.id, toml, spec, oracleHash(spec), threadId);
+    if (study.state === "calibrating") this.store.setStudyState(study.id, "draft", threadId, { reason: "spec revised" });
+    this.publish(study.id);
+    return [
+      `Study \`${spec.study.slug}\` drafted with spec v${version} (oracle ${oracleHash(spec)}), repo ${study.repo_path} on this machine.`,
+      ...warnings.map((w) => `Warning: ${w}`),
+      "",
+      "Next steps are the human's: review with `bb study show " + spec.study.slug + "`, then approve and calibrate with `bb study calibrate " + spec.study.slug + "`.",
+      "Calibration runs the gates on the base commit and repeated A/A measurements to find the noise floor. Then `bb study start` begins the run.",
+      "Seed ideas now with `bb study ideas add` (human) or wait for your first strategist round.",
+    ].join("\n");
+  }
+
+  /** Approve the current spec and start calibration in the background. */
+  async calibrate(slug: string, actor: string): Promise<string> {
+    const study = this.study(slug);
+    if (!["draft", "calibrating"].includes(study.state)) throw new EngineError(`study ${slug} is ${study.state}; calibrate applies to draft studies in M0`);
+    if (this.calibrations.has(study.id)) return `Calibration of ${slug} is already running.`;
+    if (this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length) throw new EngineError("workers are still running");
+    this.store.approveSpec(study.id, study.spec_version, actor);
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, { calibration_status: "running", calibration_json: null, calibration_approved_at: null });
+      this.store.setStudyState(study.id, "calibrating", actor, { spec_version: study.spec_version });
+    });
+    this.startCalibrationJob(study.id);
+    return `Spec v${study.spec_version} approved. Calibrating ${slug}: gates on the base commit, then A/A measurement. Check progress with \`bb study show ${slug}\`.`;
+  }
+
+  private startCalibrationJob(studyId: string): void {
+    const job = (async () => {
+      try {
+        const report = await runCalibration(this.ctx, this.pipeline, studyId);
+        const study = this.store.study(studyId)!;
+        await recordCalibration(this.ctx, study, report);
+        await this.notifyStudyThread(studyId, calibrationNotice(this.store.study(studyId)!, report));
+      } catch (e) {
+        this.ctx.bb.log("error", `calibration failed: ${errText(e)}`);
+        this.store.tx(() => {
+          this.store.updateStudy(studyId, { calibration_status: "failed", calibration_json: JSON.stringify({ ok: false, problems: [errText(e)] }) });
+          this.store.setStudyState(studyId, "draft", "plugin", { reason: "calibration error", error: clip(errText(e), 500) });
+        });
+      } finally {
+        this.calibrations.delete(studyId);
+        this.publish(studyId);
+      }
+    })();
+    this.calibrations.set(studyId, job);
+  }
+
+  async waitForCalibration(slug: string, timeoutMs: number): Promise<void> {
+    const study = this.study(slug);
+    const job = this.calibrations.get(study.id);
+    if (!job) return;
+    await Promise.race([job, new Promise((r) => setTimeout(r, timeoutMs))]);
+  }
+
+  /** Approve the calibration and start running (or resume a paused study). */
+  async start(slug: string, actor: string): Promise<string> {
+    const study = this.study(slug);
+    if (study.state === "paused") return this.resume(slug, actor);
+    if (study.state === "running") return `${slug} is already running.`;
+    if (study.state !== "calibrating" || study.calibration_status !== "ready") {
+      throw new EngineError(`${slug} needs a finished calibration first (state ${study.state}, calibration ${study.calibration_status ?? "none"}); run \`bb study calibrate ${slug}\``);
+    }
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, { calibration_approved_at: this.ctx.now() });
+      this.store.event(study.id, "calibration.approved", actor, { segment: study.segment });
+      this.store.setStudyState(study.id, "running", actor);
+    });
+    // Strategist tools apply when the provider session next starts: release
+    // the study thread's runtime so the first round starts a fresh session.
+    if (study.study_thread_id) {
+      const t = await this.ctx.bb.getThread(study.study_thread_id).catch(() => null);
+      if (t && t.status === "idle") await this.ctx.bb.stop(study.study_thread_id).catch(() => undefined);
+    }
+    this.kick();
+    return `${slug} is running. Workers spawn one at a time (M0: W=1); the study thread gets strategist rounds.`;
+  }
+
+  pause(slug: string, actor: string, reason = "paused by human"): string {
+    const study = this.study(slug);
+    if (study.state !== "running") throw new EngineError(`${slug} is ${study.state}, not running`);
+    this.store.setStudyState(study.id, "paused", actor, { reason });
+    this.publish(study.id);
+    return `${slug} paused. No new workers start; running workers finish their current submission.`;
+  }
+
+  resume(slug: string, actor: string): string {
+    const study = this.study(slug);
+    if (study.state !== "paused") throw new EngineError(`${slug} is ${study.state}, not paused`);
+    this.pipeline.resetAttempts(study.id);
+    this.store.setStudyState(study.id, "running", actor);
+    this.kick();
+    return `${slug} resumed.`;
+  }
+
+  async archiveStudy(slug: string, actor: string): Promise<string> {
+    const study = this.study(slug);
+    if (study.state === "archived") return `${slug} is already archived.`;
+    let stopped = 0;
+    for (const w of this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] })) {
+      await this.endWorker(w, "abandoned", "study archived");
+      stopped += 1;
+    }
+    for (const c of this.store.candidates(study.id, { stages: ["submitted", "gating", "queued", "measuring", "confirming"] })) {
+      this.pipeline.decide(c, { verdict: "inconclusive", reasons: ["study archived before evaluation finished"] }, { reported: true });
+    }
+    const s = this.store.study(study.id)!;
+    if (s.host_id && s.repo_path) {
+      await this.ctx.bb.hostRunner(s.host_id).removeCheckouts(s.repo_path, `${s.slug}-`).catch((e) => this.ctx.bb.log("warn", `checkout cleanup: ${errText(e)}`));
+    }
+    this.store.tx(() => {
+      for (const t of this.store.threads(study.id, { role: "strategist", states: ["active"] })) this.store.updateThread(t.id, { state: "finished", ended_at: this.ctx.now(), end_reason: "study archived" });
+      this.store.setStudyState(study.id, "archived", actor);
+    });
+    this.publish(study.id);
+    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
+  }
+
+  addIdea(slug: string, idea: { title: string; rationale?: string; theme?: string; priority?: number; pinned?: boolean; startRef?: string | null }, actor: string, source: IdeaRow["source"] = "human"): IdeaRow {
+    const study = this.study(slug);
+    if (study.state === "archived") throw new EngineError(`${slug} is archived`);
+    const row = this.store.addIdea(study.id, { title: clip(idea.title.trim(), 200), rationale: clip(idea.rationale ?? "", 2000), theme: clip(idea.theme ?? "", 60), source, priority: idea.priority ?? 0, pinned: idea.pinned ?? source === "human", start_ref: idea.startRef ?? null }, actor);
+    this.kick();
+    return row;
+  }
+
+  // -------------------------------------------------------- worker tools
+
+  async submit(threadId: string, summary: string): Promise<string> {
+    const { study, row } = await this.requireRole(threadId, "worker");
+    let worker = row!;
+    if (!worker.worktree_path) {
+      await this.resolveWorktree(worker);
+      worker = this.store.threadRow(worker.id)!;
+    }
+    return (await this.pipeline.submit(study!, worker, summary)).text;
+  }
+
+  recordFinding(threadId: string, args: { outcome: string; learned: string; revisit_if?: string; evidence?: string; candidate?: number }): Promise<string> {
+    return this.requireRole(threadId, "worker").then(({ study, row }) => {
+      let candidateId: number | null = null;
+      if (args.candidate !== undefined) {
+        const c = this.store.candidateByN(study!.id, args.candidate);
+        if (!c || c.thread_id !== threadId) throw new EngineError(`c/${args.candidate} is not one of your candidates`);
+        candidateId = c.id;
+      } else {
+        candidateId = this.store.candidates(study!.id, { threadId, order: "desc", limit: 1 })[0]?.id ?? null;
+      }
+      const f = this.store.addFinding(
+        {
+          study_id: study!.id,
+          idea_id: row!.idea_id,
+          candidate_id: candidateId,
+          thread_id: threadId,
+          outcome: args.outcome,
+          learned: clip(args.learned, 4000),
+          revisit_if: clip(args.revisit_if ?? "", 1000),
+          evidence: clip(args.evidence ?? "", 2000),
+        },
+        threadId,
+      );
+      return `Finding #${f.id} recorded. Call finish when you are done, or keep refining.`;
+    });
+  }
+
+  async proposeIdea(threadId: string, args: { title: string; rationale: string; theme?: string }): Promise<string> {
+    const { study } = await this.requireRole(threadId, "worker");
+    const idea = this.store.addIdea(study!.id, { title: clip(args.title, 200), rationale: clip(args.rationale, 2000), theme: clip(args.theme ?? "", 60), source: "worker", priority: -1 }, threadId);
+    return `Idea #${idea.id} queued for the strategist to triage.`;
+  }
+
+  async finish(threadId: string): Promise<string> {
+    const { study, row } = await this.requireRole(threadId, "worker");
+    if (!this.store.findings(study!.id, { threadId, limit: 1 }).length) {
+      throw new EngineError("finish refuses until you call record_finding: what you learned, why it won or lost, when it is worth revisiting.");
+    }
+    const pending = this.store.candidates(study!.id, { threadId }).find((c) => c.stage !== "decided");
+    if (pending) throw new EngineError(`c/${pending.n} is still being evaluated. End your turn and wait for its verdict before finishing.`);
+    this.store.tx(() => {
+      this.store.updateThread(row!.id, { state: "finishing", end_reason: "finished" });
+      if (row!.idea_id !== null) {
+        const won = this.store.candidates(study!.id, { threadId }).some((c) => c.verdict === "win");
+        this.store.setIdeaStatus(row!.idea_id, won ? "won" : "lost", threadId);
+      }
+      this.store.event(study!.id, "worker.finish_requested", threadId, { idea: row!.idea_id });
+    });
+    return "Assignment finished. End your turn now; the plugin archives this thread and removes its worktree. Candidate refs are kept.";
+  }
+
+  async requestProfile(threadId: string, target: "best" | "candidate"): Promise<string> {
+    const { study, row } = await this.requireRole(threadId, "worker");
+    const spec = this.store.spec(study!);
+    if (!spec.oracle.profile) return "This study has no profile command (oracle.profile). Ask the human to add one if profiling would help.";
+    let sha = study!.best_sha!;
+    if (target === "candidate") {
+      const c = this.store.candidates(study!.id, { threadId: row!.thread_id!, order: "desc", limit: 1 })[0];
+      if (!c?.prepared_sha) return "You have no measured candidate yet; submit first or profile best.";
+      sha = c.prepared_sha;
+    }
+    const runner = this.ctx.bb.hostRunner(study!.host_id!);
+    const started = this.ctx.now();
+    const out = await this.ctx.benchLock.run(study!.host_id!, async () => {
+      const dir = await runner.checkout(study!.repo_path!, `${study!.slug}-profile`, sha);
+      if (spec.oracle.build) await runner.exec({ cwd: dir, command: spec.oracle.build, timeoutMs: spec.oracle.timeout_minutes * 60_000 });
+      return await runner.exec({ cwd: dir, command: spec.oracle.profile!, timeoutMs: spec.oracle.timeout_minutes * 60_000, tailBytes: 8000 });
+    });
+    const seconds = (this.ctx.now() - started) / 1000;
+    this.store.addBenchSeconds(study!.id, seconds);
+    this.store.event(study!.id, "profile.ran", threadId, { target, sha, seconds });
+    return clip(`Profile of ${target} ${sha.slice(0, 10)} (exit ${out.exitCode}, ${seconds.toFixed(1)} s of bench time):\n${out.stdout}\n${out.stderr}`.trim(), 8000);
+  }
+
+  // ---------------------------------------------------- strategist tools
+
+  async queueIdeas(threadId: string, args: { ideas: Array<{ title: string; rationale: string; theme: string; priority?: number; start_ref?: string }>; reorder?: Array<{ id: number; priority: number }> }): Promise<string> {
+    const { study } = await this.requireRole(threadId, "strategist");
+    const added: number[] = [];
+    for (const i of args.ideas) {
+      if (i.start_ref && !/^(c\/\d+|refs\/studies\/[a-z0-9-]+\/c\/\d+)$/u.test(i.start_ref)) throw new EngineError(`start_ref ${JSON.stringify(i.start_ref)}: use a candidate like "c/12"`);
+      added.push(this.store.addIdea(study!.id, { title: clip(i.title, 200), rationale: clip(i.rationale, 2000), theme: clip(i.theme, 60), source: "strategist", priority: i.priority ?? 0, start_ref: i.start_ref ?? null }, threadId).id);
+    }
+    for (const r of args.reorder ?? []) {
+      const idea = this.store.idea(r.id);
+      if (idea && idea.study_id === study!.id) this.store.setIdeaPriority(r.id, r.priority, threadId);
+    }
+    this.kick();
+    return `Queued ${added.length} idea(s)${added.length ? ` (#${added.join(", #")})` : ""}${args.reorder?.length ? `, reprioritized ${args.reorder.length}` : ""}. Ready ideas: ${this.store.ideas(study!.id, ["queued"]).length}.`;
+  }
+
+  async retireIdea(threadId: string, id: number, reason: string): Promise<string> {
+    const { study } = await this.requireRole(threadId, "strategist");
+    const idea = this.store.idea(id);
+    if (!idea || idea.study_id !== study!.id) throw new EngineError(`idea #${id} not found`);
+    if (idea.status !== "queued") throw new EngineError(`idea #${id} is ${idea.status}; only queued ideas can be retired`);
+    this.store.setIdeaStatus(id, "retired", threadId, clip(reason, 500));
+    return `Idea #${id} retired.`;
+  }
+
+  async updateDossier(threadId: string, text: string): Promise<string> {
+    const { study } = await this.requireRole(threadId, "strategist");
+    const v = this.store.setDossier(study!.id, clip(text, 20_000), threadId);
+    return `Dossier v${v} saved (${text.length} chars). Workers get it in their brief.`;
+  }
+
+  async searchFindings(threadId: string, q: { query?: string; theme?: string; verdict?: string; limit?: number }): Promise<string> {
+    const { study } = await this.requireRole(threadId, "strategist");
+    const rows = this.store.searchFindings(study!.id, { text: q.query, theme: q.theme, verdict: q.verdict, limit: Math.min(q.limit ?? 20, 50) });
+    const lines = [`${rows.length} finding(s)`];
+    for (const f of rows) {
+      lines.push(`- #${f.id} idea #${f.idea_id ?? "?"} ${clip(f.title ?? "", 80)}${f.theme ? ` [${f.theme}]` : ""}${f.n ? ` c/${f.n} ${f.verdict}` : ""} [${f.outcome}]: ${clip(f.learned, 300)}${f.revisit_if ? ` · revisit if: ${clip(f.revisit_if, 120)}` : ""}`);
+    }
+    if (q.verdict || q.query) {
+      const cands = this.store.candidates(study!.id, { stages: ["decided"], order: "desc", limit: 200 }).filter((c) => (!q.verdict || c.verdict === q.verdict) && (!q.query || c.summary.toLowerCase().includes(q.query.toLowerCase())));
+      lines.push(`${cands.length} matching candidate(s)`);
+      for (const c of cands.slice(0, 15)) lines.push(`- c/${c.n} idea #${c.idea_id ?? "?"} ${c.verdict} ${formatPct(c.effect)}: ${clip(c.summary.split("\n")[0] ?? "", 160)}`);
+    }
+    return clip(lines.join("\n"), 8000);
+  }
+
+  async proposeHarvest(threadId: string, groups: Array<{ title: string; candidates: number[]; rationale: string }>): Promise<string> {
+    const { study } = await this.requireRole(threadId, "strategist");
+    const id = this.store.addHarvestProposal(study!.id, groups, threadId);
+    return `Harvest proposal #${id} recorded (${groups.length} changesets). Ablation and PR drafting arrive in M3.`;
+  }
+
+  // -------------------------------------------------------- thread events
+
+  onThreadIdle(threadId: string): void {
+    const row = this.store.threadById(threadId);
+    if (!row) return;
+    const now = this.ctx.now();
+    if (row.role === "strategist") {
+      const study = this.store.study(row.study_id);
+      if (study?.round_in_flight) this.store.updateStudy(study.id, { round_in_flight: 0 });
+      this.kick();
+      return;
+    }
+    this.store.updateThread(row.id, { last_idle_at: now });
+    if (row.state === "finishing") void this.endWorker(row, "finished", "finished").catch((e) => this.ctx.bb.log("warn", `cleanup: ${errText(e)}`));
+  }
+
+  onThreadActive(threadId: string): void {
+    const row = this.store.threadById(threadId);
+    if (!row) return;
+    if (row.role === "worker") {
+      this.store.updateThread(row.id, { last_active_at: this.ctx.now() });
+      return;
+    }
+    const study = this.store.study(row.study_id);
+    if (!study || study.round_in_flight || !["running", "paused"].includes(study.state)) return;
+    // A turn we didn't start: the human sent a message. Treat it as a round
+    // and steer the current digest into it if anything changed.
+    void this.sendRound(study, "human").catch((e) => this.ctx.bb.log("warn", `human round: ${errText(e)}`));
+  }
+
+  onThreadFailed(threadId: string): void {
+    // A failed worker turn counts as idle for the nudge/abandon clock.
+    this.onThreadIdle(threadId);
+  }
+
+  onThreadGone(threadId: string, why: "archived" | "deleted"): void {
+    const row = this.store.threadById(threadId);
+    if (!row) return;
+    if (row.role === "worker" && (row.state === "active" || row.state === "spawning")) {
+      void this.endWorker(row, "abandoned", `thread ${why} outside the plugin`);
+    } else if (row.role === "worker" && row.state === "finishing") {
+      void this.endWorker(row, "finished", "finished");
+    } else if (row.role === "strategist" && row.state === "active") {
+      this.store.updateThread(row.id, { state: "finished", ended_at: this.ctx.now(), end_reason: `study thread ${why}` });
+      const study = this.store.study(row.study_id);
+      if (study?.state === "running") void this.systemPause(study.id, `the study thread was ${why}`);
+    }
+  }
+
+  async onTurnFailed(event: { threadId: string; requestId: string; attemptNumber: number; errorInfo: { category?: string | null } | null; rateLimits: { windows: Array<{ resetsAtMs: number | null }> } | null }): Promise<void> {
+    const row = this.store.threadById(event.threadId);
+    if (!row || event.errorInfo?.category !== "rate-limit" || event.attemptNumber >= 4) return;
+    const reset = event.rateLimits?.windows.find((w) => w.resetsAtMs !== null)?.resetsAtMs ?? null;
+    await this.ctx.bb.retryTurn(event.threadId, event.requestId, reset === null ? this.ctx.now() + 60_000 : reset + 15_000);
+    this.store.event(row.study_id, "turn.retry", "plugin", { thread: event.threadId, attempt: event.attemptNumber, sendAt: reset });
+  }
+
+  // --------------------------------------------------------- control loop
+
+  kick(): void {
+    void this.tick().catch((e) => this.ctx.bb.log("error", `tick: ${errText(e)}`));
+  }
+
+  /** One control-loop pass over running studies. Concurrent callers share one pass. */
+  tick(): Promise<void> {
+    if (this.currentTick) return this.currentTick;
+    this.currentTick = (async () => {
+      await Promise.resolve(); // let the assignment land before any synchronous finally
+      try {
+        for (const study of this.store.studies(["running", "paused"])) {
+          try {
+            await this.tickStudy(study.id);
+          } catch (e) {
+            this.ctx.bb.log("warn", `study ${study.slug}: ${errText(e)}`);
+          }
+        }
+      } finally {
+        this.currentTick = null;
+      }
+      await this.pipeline.pump();
+    })();
+    return this.currentTick;
+  }
+
+  /** Wait until the control loop and pipeline have nothing left to do (tests, CLI --wait). */
+  async settle(rounds = 5): Promise<void> {
+    for (let i = 0; i < rounds; i++) {
+      await this.tick();
+      await this.pipeline.pump();
+    }
+  }
+
+  private workerTarget(study: StudyRow, spec: StudySpec): number {
+    const seg = this.store.segment(study.id, study.segment);
+    const decided = this.store.candidates(study.id, { stages: ["decided"], order: "desc", limit: 20 }).filter((c) => c.bench_seconds > 0);
+    const tEval = decided.length ? decided.reduce((a, c) => a + c.bench_seconds, 0) / decided.length : (seg?.eval_seconds ?? null);
+    const workers = this.store.threads(study.id, { role: "worker" }).slice(-20);
+    const thinks: number[] = [];
+    for (const w of workers) {
+      const first = w.thread_id ? this.store.candidates(study.id, { threadId: w.thread_id, limit: 1 })[0] : undefined;
+      if (first) thinks.push((first.submitted_at - w.spawned_at) / 1000);
+    }
+    const tThink = thinks.length ? thinks.reduce((a, b) => a + b, 0) / thinks.length : null;
+    return targetWorkers({ maxWorkers: spec.budget.max_workers, tThink, tEval, ceiling: this.ctx.config.workerCeiling });
+  }
+
+  private async tickStudy(studyId: string): Promise<void> {
+    const study = this.store.study(studyId)!;
+    const spec = this.store.spec(study);
+    const now = this.ctx.now();
+    const workers = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] });
+
+    // Finishing workers whose turn already ended (missed idle event).
+    for (const w of workers.filter((x) => x.state === "finishing" && x.thread_id)) {
+      const t = await this.ctx.bb.getThread(w.thread_id!).catch(() => null);
+      if (!t || t.status === "idle" || t.status === "error" || t.archivedAt) await this.endWorker(w, "finished", "finished");
+    }
+
+    // Idle nudge, then abandon.
+    for (const w of workers.filter((x) => x.state === "active" && x.thread_id)) {
+      const awaiting = this.store.candidates(study.id, { threadId: w.thread_id! }).some((c) => c.stage !== "decided" || c.reported_at === null);
+      const threadIdle = w.last_idle_at !== null && (w.last_active_at === null || w.last_idle_at >= w.last_active_at);
+      const action = idleAction(w, {
+        now,
+        awaitingVerdict: awaiting,
+        threadIdle,
+        nudgeMs: spec.agents.idle_nudge_minutes * 60_000,
+        abandonMs: spec.agents.idle_abandon_minutes * 60_000,
+      });
+      if (action.kind === "nudge") {
+        this.store.updateThread(w.id, { nudged_at: now });
+        this.store.event(study.id, "worker.nudged", "plugin", { thread: w.thread_id });
+        await this.ctx.bb.send(w.thread_id!, nudgeMessage((now - w.last_idle_at!) / 60_000)).catch(() => undefined);
+      } else if (action.kind === "abandon") {
+        await this.endWorker(w, "abandoned", "idle after nudge");
+      }
+    }
+
+    if (study.state !== "running") return;
+    const w = this.workerTarget(study, spec);
+    const live = this.store.threads(study.id, { role: "worker", states: ["spawning", "active"] });
+    const inFlight = this.store.candidates(study.id, { stages: ["submitted", "gating", "queued", "measuring", "confirming", "promoting"] });
+    const exhausted = budgetExhausted({
+      candidates: this.store.candidateCount(study.id),
+      maxCandidates: spec.budget.max_candidates,
+      benchSeconds: this.store.budget(study).bench_seconds,
+      maxBenchHours: spec.budget.max_bench_hours,
+      deadline: spec.budget.deadline,
+      now,
+    });
+    if (exhausted) {
+      if (!live.length && !inFlight.length) await this.systemPause(study.id, `budget exhausted: ${exhausted}. Harvest arrives in M3; review results with \`bb study show ${study.slug}\`.`);
+    } else if (live.length < w && inFlight.length < w) {
+      const queued = this.store.ideas(study.id, ["queued"]);
+      const running = this.store.ideas(study.id, ["running"]);
+      const idea = pickIdea(queued, running, w);
+      if (idea) await this.spawnWorker(study, spec, idea);
+    }
+
+    // Strategist rounds.
+    const fresh = this.store.study(study.id)!;
+    if (fresh.round_in_flight && fresh.study_thread_id && fresh.last_round_at && now - fresh.last_round_at > 5 * 60_000) {
+      const t = await this.ctx.bb.getThread(fresh.study_thread_id).catch(() => null);
+      if (!t || t.status === "idle" || t.status === "error") this.store.updateStudy(study.id, { round_in_flight: 0 });
+    }
+    const decided = this.store.decided(study.id, Math.max(spec.agents.stall_after, 50));
+    const trigger = roundTrigger({
+      roundInFlight: Boolean(this.store.study(study.id)!.round_in_flight),
+      verdictsSinceRound: fresh.verdicts_since_round,
+      k: spec.agents.strategist_every,
+      readyIdeas: this.store.ideas(study.id, ["queued"]).length,
+      w,
+      recentVerdicts: decided,
+      stallAfter: spec.agents.stall_after,
+      stallSignaledAt: fresh.stall_signaled_at_verdict,
+      totalVerdicts: this.store.candidates(study.id, { stages: ["decided"] }).length,
+      rounds: fresh.rounds,
+    });
+    if (trigger && fresh.study_thread_id) await this.sendRound(fresh, trigger);
+  }
+
+  private async spawnWorker(study: StudyRow, spec: StudySpec, idea: IdeaRow): Promise<void> {
+    const runner = this.ctx.bb.hostRunner(study.host_id!);
+    let baseBranch = bestBranch(study.slug);
+    let forkSha = study.best_sha!;
+    if (idea.start_ref) {
+      const n = Number(/c\/(\d+)$/u.exec(idea.start_ref)?.[1]);
+      const c = Number.isFinite(n) ? this.store.candidateByN(study.id, n) : undefined;
+      if (c) {
+        baseBranch = `studies/${study.slug}/start/${idea.id}`;
+        await runner.updateRef(study.repo_path!, `refs/heads/${baseBranch}`, c.sha, null).catch(() => undefined);
+        forkSha = c.parent_sha;
+      }
+    }
+    const token = randomUUID();
+    const row = this.store.tx(() => {
+      const r = this.store.insertThread({ study_id: study.id, role: "worker", spawn_token: token, idea_id: idea.id, state: "spawning", fork_sha: forkSha });
+      this.store.setIdeaStatus(idea.id, "running", "plugin");
+      return r;
+    });
+    let sectionId = study.section_id;
+    if (!sectionId) {
+      sectionId = await this.ctx.bb.ensureSection(`Study: ${study.slug}`).catch(() => null);
+      if (sectionId) this.store.updateStudy(study.id, { section_id: sectionId });
+    }
+    const related = this.store.searchFindings(study.id, { theme: idea.theme || undefined, limit: 6 });
+    const bestRun = safeJson<{ diag?: string[] }>(study.best_run_json);
+    const prompt = workerBrief({
+      study,
+      spec,
+      idea,
+      dossier: this.store.dossier(study.id)?.text ?? null,
+      bestDiag: bestRun?.diag ?? [],
+      relatedFindings: related,
+      mde: this.store.segment(study.id, study.segment)?.mde ?? null,
+    });
+    try {
+      const spawned = await this.ctx.bb.spawnWorker({
+        projectId: study.project_id,
+        hostId: study.host_id!,
+        baseBranch,
+        title: clip(`${study.slug} · idea #${idea.id}: ${idea.title}`, 120),
+        prompt,
+        sectionId,
+        metadata: { study: study.slug, role: "worker", idea: idea.id, spawnToken: token },
+        ...(spec.agents.worker.provider ? { providerId: spec.agents.worker.provider } : {}),
+        ...(spec.agents.worker.model ? { model: spec.agents.worker.model } : {}),
+        ...(spec.agents.worker.permission_mode ? { permissionMode: spec.agents.worker.permission_mode } : {}),
+      });
+      const current = this.store.threadRow(row.id)!;
+      this.store.updateThread(row.id, {
+        thread_id: current.thread_id ?? spawned.threadId,
+        environment_id: spawned.environmentId,
+        state: current.state === "spawning" ? "active" : current.state,
+        last_active_at: this.ctx.now(),
+      });
+      this.store.event(study.id, "worker.spawned", "plugin", { thread: spawned.threadId, idea: idea.id, base: baseBranch });
+      this.publish(study.id);
+    } catch (e) {
+      this.store.tx(() => {
+        this.store.updateThread(row.id, { state: "failed", ended_at: this.ctx.now(), end_reason: clip(errText(e), 300) });
+        this.store.setIdeaStatus(idea.id, "queued", "plugin", "spawn failed");
+        this.store.event(study.id, "worker.spawn_failed", "plugin", { idea: idea.id, error: clip(errText(e), 500) });
+      });
+      await this.systemPause(study.id, `could not spawn a worker: ${clip(errText(e), 300)}`);
+    }
+  }
+
+  private async resolveWorktree(worker: ThreadRow): Promise<void> {
+    if (!worker.thread_id) return;
+    const t = await this.ctx.bb.getThread(worker.thread_id);
+    const envId = t?.environmentId ?? worker.environment_id;
+    if (!envId) return;
+    const env = await this.ctx.bb.getEnvironment(envId);
+    const study = this.store.study(worker.study_id)!;
+    if (env?.path && env.hostId === study.host_id) this.store.updateThread(worker.id, { worktree_path: env.path, environment_id: envId });
+  }
+
+  /** Archive + stop the worker thread, release its worktree, and close the idea. */
+  private async endWorker(w: ThreadRow, state: "finished" | "abandoned", reason: string): Promise<void> {
+    const fresh = this.store.threadRow(w.id)!;
+    if (fresh.state === "finished" || fresh.state === "abandoned" || fresh.state === "failed") return;
+    this.store.tx(() => {
+      this.store.updateThread(w.id, { state, ended_at: this.ctx.now(), end_reason: reason });
+      if (state === "abandoned" && fresh.idea_id !== null) {
+        const idea = this.store.idea(fresh.idea_id);
+        if (idea?.status === "running") this.store.setIdeaStatus(fresh.idea_id, "abandoned", "plugin", reason);
+      }
+      this.store.event(w.study_id, `worker.${state}`, "plugin", { thread: fresh.thread_id, idea: fresh.idea_id, reason });
+    });
+    if (fresh.thread_id) {
+      await this.ctx.bb.archive(fresh.thread_id).catch((e) => this.ctx.bb.log("warn", `archive ${fresh.thread_id}: ${errText(e)}`));
+      await this.ctx.bb.stop(fresh.thread_id).catch(() => undefined);
+    }
+    if (fresh.environment_id) {
+      // Remove the worktree, then the worker's branch. Candidate refs keep its commits.
+      const env = await this.ctx.bb.getEnvironment(fresh.environment_id).catch(() => null);
+      await this.ctx.bb.releaseEnvironment(fresh.environment_id).catch((e) => this.ctx.bb.log("warn", `release env: ${errText(e)}`));
+      const study = this.store.study(w.study_id);
+      if (env?.branchName && study?.repo_path && env.hostId === study.host_id) {
+        await this.ctx.bb.hostRunner(env.hostId).deleteRef(study.repo_path, `refs/heads/${env.branchName}`).catch(() => undefined);
+      }
+    }
+    this.publish(w.study_id);
+    this.kick();
+  }
+
+  private onDecided(_c: CandidateRow): void {
+    this.kick();
+  }
+
+  private async sendRound(study: StudyRow, trigger: RoundTrigger): Promise<void> {
+    if (!study.study_thread_id) return;
+    const spec = this.store.spec(study);
+    const since = study.last_round_at ?? 0;
+    const verdicts = this.store.decided(study.id, 200).filter((c) => (c.decided_at ?? 0) > since);
+    const findings = this.store.findings(study.id, { limit: 50 }).filter((f) => f.created_at > since);
+    if (trigger === "human" && !verdicts.length && !findings.length && study.rounds > 0) {
+      // Nothing new to tell; still hold the round slot until the turn ends.
+      this.store.updateStudy(study.id, { round_in_flight: 1, last_round_at: study.last_round_at });
+      return;
+    }
+    const ideas = this.store.ideas(study.id);
+    const titles = new Map(ideas.map((i) => [i.id, i.title] as const));
+    const total = this.store.candidates(study.id, { stages: ["decided"] }).length;
+    const digest = strategistDigest({
+      study,
+      spec,
+      trigger,
+      round: study.rounds + 1,
+      w: this.workerTarget(study, spec),
+      verdicts,
+      findings,
+      ideas,
+      workers: this.store.threads(study.id, { role: "worker", states: ["spawning", "active"] }),
+      dossier: this.store.dossier(study.id),
+      bestDiag: safeJson<{ diag?: string[] }>(study.best_run_json)?.diag ?? [],
+      cumulative: this.cumulative(study),
+      budgetLine: this.budgetLine(study, spec),
+      ideaTitles: titles,
+    });
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, {
+        round_in_flight: 1,
+        rounds: study.rounds + 1,
+        verdicts_since_round: 0,
+        last_round_at: this.ctx.now(),
+        last_round_event_id: this.store.lastEventId(),
+        ...(trigger === "stall" ? { stall_signaled_at_verdict: total } : {}),
+      });
+      this.store.event(study.id, "strategist.round", "plugin", { round: study.rounds + 1, trigger, verdicts: verdicts.length, findings: findings.length });
+    });
+    try {
+      await this.ctx.bb.send(study.study_thread_id, digest);
+    } catch (e) {
+      this.store.updateStudy(study.id, { round_in_flight: 0 });
+      throw e;
+    }
+  }
+
+  /** Milestones reach the human through the study thread. */
+  private async notifyStudyThread(studyId: string, text: string): Promise<void> {
+    const study = this.store.study(studyId);
+    if (!study?.study_thread_id) return;
+    this.store.updateStudy(studyId, { round_in_flight: 1, last_round_at: this.ctx.now() });
+    try {
+      await this.ctx.bb.send(study.study_thread_id, text);
+    } catch (e) {
+      this.store.updateStudy(studyId, { round_in_flight: 0 });
+      this.ctx.bb.log("warn", `notify study thread: ${errText(e)}`);
+    }
+  }
+
+  async systemPause(studyId: string, reason: string): Promise<void> {
+    const study = this.store.study(studyId);
+    if (!study || study.state !== "running") return;
+    this.store.setStudyState(studyId, "paused", "plugin", { reason, system: true });
+    this.publish(studyId);
+    await this.notifyStudyThread(studyId, `[autoresearch] Study \`${study.slug}\` paused by the system: ${reason}\nThe human decides what happens next (\`bb study resume ${study.slug}\`). Reply briefly; do not try to fix the oracle yourself.`);
+  }
+
+  cumulative(study: StudyRow): number | null {
+    if (!study.base_sha || !study.best_sha || study.base_sha === study.best_sha) return null;
+    // Compound the promoted effects (each measured against the best before it).
+    const wins = this.store.candidates(study.id, { stages: ["decided"] }).filter((c) => c.verdict === "win" && c.effect !== null);
+    return wins.reduce((acc, c) => 1 - (1 - acc) * (1 - c.effect!), 0);
+  }
+
+  budgetLine(study: StudyRow, spec: StudySpec): string {
+    const b = this.store.budget(study);
+    return `${this.store.candidateCount(study.id)}/${spec.budget.max_candidates} candidates · bench ${(b.bench_seconds / 3600).toFixed(2)}/${spec.budget.max_bench_hours} h${spec.budget.deadline ? ` · deadline ${spec.budget.deadline}` : ""}`;
+  }
+
+  // ------------------------------------------------------ reconciliation
+
+  /** Run once on load, after every handler is registered. Safe to repeat. */
+  async reconcile(): Promise<{ requeued: number; workers: number; calibrations: number }> {
+    const { requeued } = this.pipeline.reconcile();
+    let calibrations = 0;
+    for (const study of this.store.studies(["calibrating"])) {
+      if (study.calibration_status === "running" && !this.calibrations.has(study.id)) {
+        this.store.event(study.id, "calibration.restarted", "plugin", { reason: "reconcile" });
+        this.startCalibrationJob(study.id);
+        calibrations += 1;
+      }
+    }
+    let workers = 0;
+    for (const study of this.store.studies()) {
+      for (const w of this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] })) {
+        workers += 1;
+        if (!w.thread_id) {
+          const found = w.spawn_token ? await this.ctx.bb.findSpawnedThread(w.spawn_token).catch(() => null) : null;
+          if (found) {
+            this.store.updateThread(w.id, { thread_id: found, state: "active", last_active_at: this.ctx.now() });
+          } else {
+            this.store.tx(() => {
+              this.store.updateThread(w.id, { state: "failed", ended_at: this.ctx.now(), end_reason: "spawn interrupted" });
+              if (w.idea_id !== null) this.store.setIdeaStatus(w.idea_id, "queued", "plugin", "spawn interrupted");
+            });
+          }
+          continue;
+        }
+        const t = await this.ctx.bb.getThread(w.thread_id).catch(() => null);
+        if (!t || t.deletedAt || t.archivedAt) {
+          await this.endWorker(w, w.state === "finishing" ? "finished" : "abandoned", "thread gone (reconcile)");
+        } else if (t.status === "idle" || t.status === "error") {
+          if (w.state === "finishing") await this.endWorker(w, "finished", "finished");
+          else if (w.last_idle_at === null || (w.last_active_at ?? 0) > w.last_idle_at) this.store.updateThread(w.id, { last_idle_at: this.ctx.now() });
+        } else {
+          this.store.updateThread(w.id, { last_active_at: this.ctx.now() });
+        }
+      }
+      if (study.round_in_flight && study.study_thread_id) {
+        const t = await this.ctx.bb.getThread(study.study_thread_id).catch(() => null);
+        if (!t || t.status === "idle" || t.status === "error") this.store.updateStudy(study.id, { round_in_flight: 0 });
+      }
+    }
+    this.store.event(null, "plugin.reconciled", "plugin", { requeued, workers, calibrations });
+    this.kick();
+    return { requeued, workers, calibrations };
+  }
+
+  private publish(studyId: string): void {
+    this.ctx.bb.publish("study-changed", { study: studyId });
+  }
+}
+
+function calibrationNotice(study: StudyRow, report: CalibrationReport): string {
+  if (!report.ok) {
+    return `[autoresearch] Calibration of \`${study.slug}\` failed; the study is back in Draft.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}\nHelp the human fix the spec or oracle, then call study_propose with the revised spec. The human re-runs \`bb study calibrate ${study.slug}\`.`;
+  }
+  return `[autoresearch] Calibration of \`${study.slug}\` is ready.\n${report.report}\nThe human approves and starts the run with \`bb study start ${study.slug}\`. Reply with a one-line summary and end your turn.`;
+}

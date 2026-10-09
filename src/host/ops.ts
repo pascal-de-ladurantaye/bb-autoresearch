@@ -1,0 +1,222 @@
+// Host-side implementations of the host contract. Pure Node: child_process,
+// fs, and git on PATH. host.ts wires these to RPC handlers; tests and the
+// in-process LocalHostRunner call them directly.
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { hostname, platform } from "node:os";
+import { join } from "node:path";
+import type {
+  ExecInput,
+  ExecResult,
+  PrepareInput,
+  PrepareResult,
+  SnapshotInput,
+  SnapshotResult,
+} from "./contract.ts";
+
+const GIT_IDENTITY: Record<string, string> = {
+  GIT_AUTHOR_NAME: "autoresearch",
+  GIT_AUTHOR_EMAIL: "autoresearch@bb.local",
+  GIT_COMMITTER_NAME: "autoresearch",
+  GIT_COMMITTER_EMAIL: "autoresearch@bb.local",
+};
+
+class Tail {
+  private chunks: Buffer[] = [];
+  private size = 0;
+  constructor(private readonly max: number) {}
+  push(chunk: Buffer): void {
+    this.chunks.push(chunk);
+    this.size += chunk.length;
+    while (this.size > this.max * 2 && this.chunks.length > 1) {
+      this.size -= this.chunks.shift()!.length;
+    }
+  }
+  toString(): string {
+    const all = Buffer.concat(this.chunks);
+    const text = all.subarray(Math.max(0, all.length - this.max)).toString("utf8");
+    return all.length > this.max ? `…${text}` : text;
+  }
+}
+
+export async function exec(input: ExecInput, signal?: AbortSignal): Promise<ExecResult> {
+  const started = Date.now();
+  const tailBytes = input.tailBytes ?? 16 * 1024;
+  return await new Promise<ExecResult>((resolve, reject) => {
+    const child = spawn("/bin/sh", ["-c", input.command], {
+      cwd: input.cwd,
+      env: { ...process.env, ...input.env },
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const out = new Tail(tailBytes);
+    const err = new Tail(tailBytes);
+    let timedOut = false;
+    const kill = () => {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, input.timeoutMs);
+    const onAbort = () => kill();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.stdout.on("data", (c: Buffer) => out.push(c));
+    child.stderr.on("data", (c: Buffer) => err.push(c));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve({
+        exitCode: code,
+        timedOut,
+        durationMs: Date.now() - started,
+        stdout: out.toString(),
+        stderr: err.toString(),
+      });
+    });
+  });
+}
+
+/** Run git with argv (no shell) and return trimmed stdout; throws on non-zero exit. */
+export async function git(cwd: string, args: string[], opts: { allowFail?: boolean; env?: Record<string, string> } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, env: { ...process.env, ...GIT_IDENTITY, ...opts.env }, stdio: ["ignore", "pipe", "pipe"] });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout.on("data", (c: Buffer) => out.push(c));
+    child.stderr.on("data", (c: Buffer) => err.push(c));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const result = { code: code ?? -1, stdout: Buffer.concat(out).toString("utf8").trim(), stderr: Buffer.concat(err).toString("utf8").trim() };
+      if (result.code !== 0 && !opts.allowFail) {
+        reject(new Error(`git ${args.join(" ")} failed (${result.code}): ${result.stderr.slice(-2000)}`));
+      } else resolve(result);
+    });
+  });
+}
+
+export async function ping(dataDir: string): Promise<{ hostname: string; platform: string; gitVersion: string; dataDir: string }> {
+  const v = await git(process.cwd(), ["--version"], { allowFail: true });
+  return { hostname: hostname(), platform: platform(), gitVersion: v.stdout, dataDir };
+}
+
+export async function resolveRef(repoPath: string, ref: string): Promise<{ sha: string | null }> {
+  const r = await git(repoPath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { allowFail: true });
+  return { sha: r.code === 0 && r.stdout ? r.stdout : null };
+}
+
+export async function updateRef(repoPath: string, ref: string, newSha: string, oldSha: string | null): Promise<{ ok: boolean; current: string | null }> {
+  const args = ["update-ref", ref, newSha, oldSha ?? "0000000000000000000000000000000000000000"];
+  const r = await git(repoPath, args, { allowFail: true });
+  const current = (await resolveRef(repoPath, ref)).sha;
+  return { ok: r.code === 0, current };
+}
+
+export async function deleteRef(repoPath: string, ref: string): Promise<{ deleted: boolean }> {
+  const r = await git(repoPath, ["update-ref", "-d", ref], { allowFail: true });
+  return { deleted: r.code === 0 };
+}
+
+export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
+  const cwd = input.worktreePath;
+  await git(cwd, ["add", "-A"]);
+  const status = await git(cwd, ["status", "--porcelain"]);
+  let committed = false;
+  if (status.stdout.length > 0) {
+    await git(cwd, ["commit", "--no-verify", "--no-gpg-sign", "-q", "-m", input.message]);
+    committed = true;
+  }
+  const sha = (await git(cwd, ["rev-parse", "HEAD"])).stdout;
+  await git(cwd, ["update-ref", input.candidateRef, sha]);
+  const names = await git(cwd, ["diff", "--name-only", "--no-renames", input.baseSha, sha]);
+  const numstat = await git(cwd, ["diff", "--numstat", "--no-renames", input.baseSha, sha]);
+  let linesAdded = 0;
+  let linesDeleted = 0;
+  for (const line of numstat.stdout.split("\n")) {
+    const [a, d] = line.split("\t");
+    if (a && a !== "-") linesAdded += Number(a) || 0;
+    if (d && d !== "-") linesDeleted += Number(d) || 0;
+  }
+  return {
+    sha,
+    committed,
+    changedPaths: names.stdout ? names.stdout.split("\n").filter(Boolean) : [],
+    linesAdded,
+    linesDeleted,
+  };
+}
+
+export async function prepareCandidate(input: PrepareInput): Promise<PrepareResult> {
+  const { repoPath } = input;
+  let tree: string;
+  if (input.forkSha === input.bestSha) {
+    tree = (await git(repoPath, ["rev-parse", `${input.candidateSha}^{tree}`])).stdout;
+  } else {
+    // Three-way: apply forkSha..candidate onto best without touching any checkout.
+    const r = await git(
+      repoPath,
+      ["merge-tree", "--write-tree", "--name-only", "--no-messages", `--merge-base=${input.forkSha}`, input.bestSha, input.candidateSha],
+      { allowFail: true },
+    );
+    const lines = r.stdout.split("\n").filter(Boolean);
+    if (r.code === 1) {
+      return { status: "conflict", paths: lines.slice(1, 200), detail: r.stderr.slice(-2000) };
+    }
+    if (r.code !== 0 || !lines[0]) throw new Error(`git merge-tree failed (${r.code}): ${r.stderr.slice(-2000)}`);
+    tree = lines[0];
+  }
+  const sha = (await git(repoPath, ["commit-tree", tree, "-p", input.bestSha, "-m", input.message])).stdout;
+  return { status: "ok", sha, tree };
+}
+
+export async function rewordCommit(repoPath: string, sha: string, message: string): Promise<{ sha: string }> {
+  const tree = (await git(repoPath, ["rev-parse", `${sha}^{tree}`])).stdout;
+  const parents = (await git(repoPath, ["rev-list", "--parents", "-n", "1", sha])).stdout.split(" ").slice(1);
+  const args = ["commit-tree", tree];
+  for (const p of parents) args.push("-p", p);
+  args.push("-m", message);
+  return { sha: (await git(repoPath, args)).stdout };
+}
+
+function checkoutRoot(dataDir: string): string {
+  return join(dataDir, "checkouts");
+}
+
+export async function checkout(dataDir: string, repoPath: string, key: string, sha: string): Promise<{ path: string }> {
+  const root = checkoutRoot(dataDir);
+  mkdirSync(root, { recursive: true });
+  const path = join(root, key);
+  if (existsSync(join(path, ".git"))) {
+    await git(path, ["checkout", "--detach", "--force", "-q", sha]);
+    await git(path, ["clean", "-fdq"]);
+  } else {
+    if (existsSync(path)) rmSync(path, { recursive: true, force: true });
+    await git(repoPath, ["worktree", "prune"], { allowFail: true });
+    await git(repoPath, ["worktree", "add", "--detach", "-f", path, sha]);
+  }
+  return { path };
+}
+
+export async function removeCheckouts(dataDir: string, repoPath: string, keyPrefix: string): Promise<{ removed: number }> {
+  const root = checkoutRoot(dataDir);
+  if (!existsSync(root)) return { removed: 0 };
+  let removed = 0;
+  for (const name of readdirSync(root)) {
+    if (!name.startsWith(keyPrefix)) continue;
+    const path = join(root, name);
+    await git(repoPath, ["worktree", "remove", "--force", path], { allowFail: true });
+    rmSync(path, { recursive: true, force: true });
+    removed += 1;
+  }
+  await git(repoPath, ["worktree", "prune"], { allowFail: true });
+  return { removed };
+}

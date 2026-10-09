@@ -1,0 +1,485 @@
+// Typed repository over the plugin database. All writes that change study
+// state also append an audit event in the same transaction.
+import type Database from "better-sqlite3";
+import type { StudySpec } from "../spec.ts";
+import type { CandidateStage, IdeaStatus, StudyState, ThreadRole, ThreadState } from "./schema.ts";
+import type { Verdict } from "../verdict.ts";
+
+export interface StudyRow {
+  id: string;
+  slug: string;
+  project_id: string;
+  state: StudyState;
+  spec_version: number;
+  best_sha: string | null;
+  budget: string;
+  created_at: number;
+  updated_at: number;
+  host_id: string | null;
+  repo_path: string | null;
+  study_thread_id: string | null;
+  section_id: string | null;
+  segment: number;
+  base_sha: string | null;
+  pause_reason: string | null;
+  calibration_status: "running" | "ready" | "failed" | null;
+  calibration_json: string | null;
+  calibration_approved_at: number | null;
+  round_in_flight: number;
+  rounds: number;
+  verdicts_since_round: number;
+  last_round_at: number | null;
+  last_round_event_id: number;
+  stall_signaled_at_verdict: number;
+  best_run_json: string | null;
+  best_run_sha: string | null;
+}
+
+export interface SpecVersionRow {
+  study_id: string;
+  version: number;
+  spec_toml: string;
+  spec_json: string;
+  oracle_hash: string;
+  created_at: number;
+  approved_at: number | null;
+}
+
+export interface SegmentRow {
+  study_id: string;
+  k: number;
+  baseline_sha: string;
+  oracle_hash: string;
+  noise_floor: number | null;
+  mde: number | null;
+  eval_seconds: number | null;
+  gate_seconds: number | null;
+  report: string | null;
+  created_at: number;
+}
+
+export interface IdeaRow {
+  id: number;
+  study_id: string;
+  title: string;
+  rationale: string;
+  theme: string;
+  source: "human" | "strategist" | "worker";
+  priority: number;
+  pinned: number;
+  status: IdeaStatus;
+  start_ref: string | null;
+  status_reason: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ThreadRow {
+  id: number;
+  thread_id: string | null;
+  spawn_token: string | null;
+  study_id: string;
+  role: ThreadRole;
+  idea_id: number | null;
+  state: ThreadState;
+  submissions: number;
+  spawned_at: number;
+  fork_sha: string | null;
+  environment_id: string | null;
+  worktree_path: string | null;
+  last_idle_at: number | null;
+  last_active_at: number | null;
+  nudged_at: number | null;
+  ended_at: number | null;
+  end_reason: string | null;
+}
+
+export interface CandidateRow {
+  id: number;
+  study_id: string;
+  n: number;
+  idea_id: number | null;
+  thread_id: string | null;
+  sha: string;
+  parent_sha: string;
+  against_sha: string | null;
+  prepared_sha: string | null;
+  promoted_sha: string | null;
+  summary: string;
+  stage: CandidateStage;
+  verdict: Verdict | null;
+  effect: number | null;
+  ci_lo: number | null;
+  ci_hi: number | null;
+  metrics_json: string | null;
+  reasons_json: string | null;
+  changed_paths_json: string | null;
+  diag_json: string | null;
+  gate_output: string | null;
+  bench_seconds: number;
+  attempts: number;
+  submitted_at: number;
+  decided_at: number | null;
+  reported_at: number | null;
+}
+
+export interface FindingRow {
+  id: number;
+  study_id: string;
+  idea_id: number | null;
+  candidate_id: number | null;
+  thread_id: string | null;
+  outcome: string;
+  learned: string;
+  revisit_if: string;
+  evidence: string;
+  created_at: number;
+}
+
+export interface EventRow {
+  id: number;
+  study_id: string | null;
+  at: number;
+  kind: string;
+  actor: string;
+  data_json: string;
+}
+
+export interface Budget {
+  bench_seconds: number;
+}
+
+export class Store {
+  constructor(
+    readonly db: Database.Database,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  tx<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  // ---- events (append-only audit) ----
+  event(studyId: string | null, kind: string, actor: string, data: Record<string, unknown> = {}): number {
+    const r = this.db
+      .prepare(`INSERT INTO events (study_id, at, kind, actor, data_json) VALUES (?, ?, ?, ?, ?)`)
+      .run(studyId, this.now(), kind, actor, JSON.stringify(data));
+    return Number(r.lastInsertRowid);
+  }
+  events(studyId: string, opts: { afterId?: number; limit?: number; kinds?: string[] } = {}): EventRow[] {
+    const kinds = opts.kinds?.length ? ` AND kind IN (${opts.kinds.map(() => "?").join(",")})` : "";
+    return this.db
+      .prepare(`SELECT * FROM events WHERE study_id = ? AND id > ?${kinds} ORDER BY id DESC LIMIT ?`)
+      .all(studyId, opts.afterId ?? 0, ...(opts.kinds ?? []), opts.limit ?? 50) as EventRow[];
+  }
+  lastEventId(): number {
+    return (this.db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM events`).get() as { id: number }).id;
+  }
+
+  // ---- studies ----
+  insertStudy(row: Pick<StudyRow, "id" | "slug" | "project_id" | "host_id" | "repo_path" | "study_thread_id">): void {
+    const t = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO studies (id, slug, project_id, state, spec_version, budget, created_at, updated_at, host_id, repo_path, study_thread_id)
+         VALUES (?, ?, ?, 'draft', 0, '{"bench_seconds":0}', ?, ?, ?, ?, ?)`,
+      )
+      .run(row.id, row.slug, row.project_id, t, t, row.host_id, row.repo_path, row.study_thread_id);
+  }
+  study(idOrSlug: string): StudyRow | undefined {
+    return this.db.prepare(`SELECT * FROM studies WHERE id = ? OR slug = ?`).get(idOrSlug, idOrSlug) as StudyRow | undefined;
+  }
+  studies(states?: StudyState[]): StudyRow[] {
+    if (!states?.length) return this.db.prepare(`SELECT * FROM studies ORDER BY created_at DESC`).all() as StudyRow[];
+    return this.db
+      .prepare(`SELECT * FROM studies WHERE state IN (${states.map(() => "?").join(",")}) ORDER BY created_at`)
+      .all(...states) as StudyRow[];
+  }
+  updateStudy(id: string, patch: Partial<Omit<StudyRow, "id" | "slug" | "created_at">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    const sets = keys.map((k) => `${k} = @${k}`).join(", ");
+    this.db.prepare(`UPDATE studies SET ${sets}, updated_at = @__now WHERE id = @__id`).run({ ...patch, __now: this.now(), __id: id });
+  }
+  setStudyState(id: string, state: StudyState, actor: string, data: Record<string, unknown> = {}): void {
+    this.tx(() => {
+      const before = this.study(id);
+      this.updateStudy(id, { state, ...(state === "paused" ? { pause_reason: (data.reason as string | undefined) ?? null } : { pause_reason: null }) });
+      this.event(id, "study.state", actor, { from: before?.state, to: state, ...data });
+    });
+  }
+  budget(study: StudyRow): Budget {
+    try {
+      return { bench_seconds: 0, ...(JSON.parse(study.budget) as Partial<Budget>) };
+    } catch {
+      return { bench_seconds: 0 };
+    }
+  }
+  addBenchSeconds(studyId: string, seconds: number): void {
+    const s = this.study(studyId);
+    if (!s) return;
+    const b = this.budget(s);
+    b.bench_seconds += seconds;
+    this.updateStudy(studyId, { budget: JSON.stringify(b) });
+  }
+
+  // ---- spec versions ----
+  addSpecVersion(studyId: string, toml: string, spec: StudySpec, oracleHash: string, actor: string): number {
+    return this.tx(() => {
+      const v = ((this.db.prepare(`SELECT COALESCE(MAX(version), 0) AS v FROM spec_versions WHERE study_id = ?`).get(studyId) as { v: number }).v) + 1;
+      this.db
+        .prepare(`INSERT INTO spec_versions (study_id, version, spec_toml, spec_json, oracle_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(studyId, v, toml, JSON.stringify(spec), oracleHash, this.now());
+      this.updateStudy(studyId, { spec_version: v, calibration_status: null, calibration_json: null, calibration_approved_at: null });
+      this.event(studyId, "spec.proposed", actor, { version: v, oracle_hash: oracleHash });
+      return v;
+    });
+  }
+  specVersion(studyId: string, version: number): SpecVersionRow | undefined {
+    return this.db.prepare(`SELECT * FROM spec_versions WHERE study_id = ? AND version = ?`).get(studyId, version) as SpecVersionRow | undefined;
+  }
+  spec(study: StudyRow): StudySpec {
+    const row = this.specVersion(study.id, study.spec_version);
+    if (!row) throw new Error(`study ${study.slug} has no spec`);
+    return JSON.parse(row.spec_json) as StudySpec;
+  }
+  approveSpec(studyId: string, version: number, actor: string): void {
+    this.tx(() => {
+      this.db.prepare(`UPDATE spec_versions SET approved_at = COALESCE(approved_at, ?) WHERE study_id = ? AND version = ?`).run(this.now(), studyId, version);
+      this.event(studyId, "spec.approved", actor, { version });
+    });
+  }
+
+  // ---- segments ----
+  upsertSegment(row: Omit<SegmentRow, "created_at">): void {
+    this.db
+      .prepare(
+        `INSERT INTO segments (study_id, k, baseline_sha, oracle_hash, noise_floor, mde, eval_seconds, gate_seconds, report, created_at)
+         VALUES (@study_id, @k, @baseline_sha, @oracle_hash, @noise_floor, @mde, @eval_seconds, @gate_seconds, @report, @created_at)
+         ON CONFLICT (study_id, k) DO UPDATE SET baseline_sha = excluded.baseline_sha, oracle_hash = excluded.oracle_hash,
+           noise_floor = excluded.noise_floor, mde = excluded.mde, eval_seconds = excluded.eval_seconds,
+           gate_seconds = excluded.gate_seconds, report = excluded.report`,
+      )
+      .run({ ...row, created_at: this.now() });
+  }
+  segment(studyId: string, k: number): SegmentRow | undefined {
+    return this.db.prepare(`SELECT * FROM segments WHERE study_id = ? AND k = ?`).get(studyId, k) as SegmentRow | undefined;
+  }
+
+  // ---- ideas ----
+  addIdea(studyId: string, idea: { title: string; rationale?: string; theme?: string; source: IdeaRow["source"]; priority?: number; pinned?: boolean; start_ref?: string | null }, actor: string): IdeaRow {
+    return this.tx(() => {
+      const t = this.now();
+      const r = this.db
+        .prepare(
+          `INSERT INTO ideas (study_id, title, rationale, theme, source, priority, pinned, status, start_ref, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
+        )
+        .run(studyId, idea.title, idea.rationale ?? "", idea.theme ?? "", idea.source, idea.priority ?? 0, idea.pinned ? 1 : 0, idea.start_ref ?? null, t, t);
+      const id = Number(r.lastInsertRowid);
+      this.event(studyId, "idea.added", actor, { idea: id, title: idea.title, source: idea.source });
+      return this.idea(id)!;
+    });
+  }
+  idea(id: number): IdeaRow | undefined {
+    return this.db.prepare(`SELECT * FROM ideas WHERE id = ?`).get(id) as IdeaRow | undefined;
+  }
+  ideas(studyId: string, statuses?: IdeaStatus[]): IdeaRow[] {
+    const where = statuses?.length ? ` AND status IN (${statuses.map(() => "?").join(",")})` : "";
+    return this.db
+      .prepare(`SELECT * FROM ideas WHERE study_id = ?${where} ORDER BY pinned DESC, priority DESC, id ASC`)
+      .all(studyId, ...(statuses ?? [])) as IdeaRow[];
+  }
+  setIdeaStatus(id: number, status: IdeaStatus, actor: string, reason: string | null = null): void {
+    const idea = this.idea(id);
+    if (!idea) return;
+    this.tx(() => {
+      this.db.prepare(`UPDATE ideas SET status = ?, status_reason = ?, updated_at = ? WHERE id = ?`).run(status, reason, this.now(), id);
+      this.event(idea.study_id, "idea.status", actor, { idea: id, from: idea.status, to: status, reason });
+    });
+  }
+  setIdeaPriority(id: number, priority: number, actor: string): void {
+    const idea = this.idea(id);
+    if (!idea) return;
+    this.db.prepare(`UPDATE ideas SET priority = ?, updated_at = ? WHERE id = ?`).run(priority, this.now(), id);
+    this.event(idea.study_id, "idea.priority", actor, { idea: id, priority });
+  }
+
+  // ---- threads ----
+  insertThread(row: { study_id: string; role: ThreadRole; thread_id?: string | null; spawn_token?: string | null; idea_id?: number | null; state: ThreadState; fork_sha?: string | null }): ThreadRow {
+    const r = this.db
+      .prepare(
+        `INSERT INTO threads (thread_id, spawn_token, study_id, role, idea_id, state, spawned_at, fork_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(row.thread_id ?? null, row.spawn_token ?? null, row.study_id, row.role, row.idea_id ?? null, row.state, this.now(), row.fork_sha ?? null);
+    return this.db.prepare(`SELECT * FROM threads WHERE id = ?`).get(Number(r.lastInsertRowid)) as ThreadRow;
+  }
+  threadById(threadId: string): ThreadRow | undefined {
+    return this.db.prepare(`SELECT * FROM threads WHERE thread_id = ?`).get(threadId) as ThreadRow | undefined;
+  }
+  threadByToken(token: string): ThreadRow | undefined {
+    return this.db.prepare(`SELECT * FROM threads WHERE spawn_token = ?`).get(token) as ThreadRow | undefined;
+  }
+  threadRow(id: number): ThreadRow | undefined {
+    return this.db.prepare(`SELECT * FROM threads WHERE id = ?`).get(id) as ThreadRow | undefined;
+  }
+  threads(studyId: string, opts: { role?: ThreadRole; states?: ThreadState[] } = {}): ThreadRow[] {
+    const parts = [`study_id = ?`];
+    const args: unknown[] = [studyId];
+    if (opts.role) {
+      parts.push(`role = ?`);
+      args.push(opts.role);
+    }
+    if (opts.states?.length) {
+      parts.push(`state IN (${opts.states.map(() => "?").join(",")})`);
+      args.push(...opts.states);
+    }
+    return this.db.prepare(`SELECT * FROM threads WHERE ${parts.join(" AND ")} ORDER BY id`).all(...args) as ThreadRow[];
+  }
+  updateThread(id: number, patch: Partial<Omit<ThreadRow, "id">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    this.db.prepare(`UPDATE threads SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+
+  // ---- candidates ----
+  nextCandidateNumber(studyId: string): number {
+    return ((this.db.prepare(`SELECT COALESCE(MAX(n), 0) AS n FROM candidates WHERE study_id = ?`).get(studyId) as { n: number }).n) + 1;
+  }
+  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json">): CandidateRow {
+    const r = this.db
+      .prepare(
+        `INSERT INTO candidates (study_id, n, idea_id, thread_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at)
+         VALUES (@study_id, @n, @idea_id, @thread_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at)`,
+      )
+      .run({ ...row, submitted_at: this.now() });
+    return this.candidate(Number(r.lastInsertRowid))!;
+  }
+  candidate(id: number): CandidateRow | undefined {
+    return this.db.prepare(`SELECT * FROM candidates WHERE id = ?`).get(id) as CandidateRow | undefined;
+  }
+  candidateByN(studyId: string, n: number): CandidateRow | undefined {
+    return this.db.prepare(`SELECT * FROM candidates WHERE study_id = ? AND n = ?`).get(studyId, n) as CandidateRow | undefined;
+  }
+  candidates(studyId: string, opts: { stages?: CandidateStage[]; threadId?: string; limit?: number; order?: "asc" | "desc" } = {}): CandidateRow[] {
+    const parts = [`study_id = ?`];
+    const args: unknown[] = [studyId];
+    if (opts.stages?.length) {
+      parts.push(`stage IN (${opts.stages.map(() => "?").join(",")})`);
+      args.push(...opts.stages);
+    }
+    if (opts.threadId) {
+      parts.push(`thread_id = ?`);
+      args.push(opts.threadId);
+    }
+    return this.db
+      .prepare(`SELECT * FROM candidates WHERE ${parts.join(" AND ")} ORDER BY id ${opts.order === "desc" ? "DESC" : "ASC"} LIMIT ?`)
+      .all(...args, opts.limit ?? 1_000_000) as CandidateRow[];
+  }
+  candidateCount(studyId: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS c FROM candidates WHERE study_id = ?`).get(studyId) as { c: number }).c;
+  }
+  updateCandidate(id: number, patch: Partial<Omit<CandidateRow, "id">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    this.db.prepare(`UPDATE candidates SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+  /** Decided candidates in decision order (most recent last). */
+  decided(studyId: string, limit = 1000): CandidateRow[] {
+    return (
+      this.db
+        .prepare(`SELECT * FROM candidates WHERE study_id = ? AND stage = 'decided' ORDER BY decided_at DESC, id DESC LIMIT ?`)
+        .all(studyId, limit) as CandidateRow[]
+    ).reverse();
+  }
+
+  // ---- samples ----
+  addSample(row: { study_id: string; candidate_id: number | null; run: string; pair: number; side: string; metric: string; value: number; host_id: string | null }): void {
+    this.db
+      .prepare(`INSERT INTO samples (study_id, candidate_id, run, pair, side, metric, value, host_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.study_id, row.candidate_id, row.run, row.pair, row.side, row.metric, row.value, row.host_id, this.now());
+  }
+  deleteSamples(candidateId: number): number {
+    return this.db.prepare(`DELETE FROM samples WHERE candidate_id = ?`).run(candidateId).changes;
+  }
+  deleteCalibrationSamples(studyId: string): void {
+    this.db.prepare(`DELETE FROM samples WHERE study_id = ? AND candidate_id IS NULL`).run(studyId);
+  }
+  sampleCount(candidateId: number): number {
+    return (this.db.prepare(`SELECT COUNT(*) AS c FROM samples WHERE candidate_id = ?`).get(candidateId) as { c: number }).c;
+  }
+
+  // ---- findings ----
+  addFinding(row: Omit<FindingRow, "id" | "created_at">, actor: string): FindingRow {
+    return this.tx(() => {
+      const r = this.db
+        .prepare(
+          `INSERT INTO findings (study_id, idea_id, candidate_id, thread_id, outcome, learned, revisit_if, evidence, created_at)
+           VALUES (@study_id, @idea_id, @candidate_id, @thread_id, @outcome, @learned, @revisit_if, @evidence, @created_at)`,
+        )
+        .run({ ...row, created_at: this.now() });
+      const id = Number(r.lastInsertRowid);
+      this.event(row.study_id, "finding.recorded", actor, { finding: id, idea: row.idea_id, outcome: row.outcome });
+      return this.db.prepare(`SELECT * FROM findings WHERE id = ?`).get(id) as FindingRow;
+    });
+  }
+  findings(studyId: string, opts: { threadId?: string; ideaId?: number; limit?: number; afterId?: number } = {}): FindingRow[] {
+    const parts = [`study_id = ?`, `id > ?`];
+    const args: unknown[] = [studyId, opts.afterId ?? 0];
+    if (opts.threadId) {
+      parts.push(`thread_id = ?`);
+      args.push(opts.threadId);
+    }
+    if (opts.ideaId !== undefined) {
+      parts.push(`idea_id = ?`);
+      args.push(opts.ideaId);
+    }
+    return this.db.prepare(`SELECT * FROM findings WHERE ${parts.join(" AND ")} ORDER BY id DESC LIMIT ?`).all(...args, opts.limit ?? 50) as FindingRow[];
+  }
+  searchFindings(studyId: string, q: { text?: string; theme?: string; verdict?: string; limit: number }): Array<FindingRow & { title: string | null; theme: string | null; verdict: string | null; n: number | null }> {
+    const parts = [`f.study_id = ?`];
+    const args: unknown[] = [studyId];
+    if (q.text) {
+      parts.push(`(f.learned LIKE ? OR f.revisit_if LIKE ? OR f.evidence LIKE ? OR i.title LIKE ? OR i.rationale LIKE ?)`);
+      const like = `%${q.text.replace(/[%_]/gu, "")}%`;
+      args.push(like, like, like, like, like);
+    }
+    if (q.theme) {
+      parts.push(`i.theme = ?`);
+      args.push(q.theme);
+    }
+    if (q.verdict) {
+      parts.push(`c.verdict = ?`);
+      args.push(q.verdict);
+    }
+    return this.db
+      .prepare(
+        `SELECT f.*, i.title AS title, i.theme AS theme, c.verdict AS verdict, c.n AS n FROM findings f
+         LEFT JOIN ideas i ON i.id = f.idea_id LEFT JOIN candidates c ON c.id = f.candidate_id
+         WHERE ${parts.join(" AND ")} ORDER BY f.id DESC LIMIT ?`,
+      )
+      .all(...args, q.limit) as Array<FindingRow & { title: string | null; theme: string | null; verdict: string | null; n: number | null }>;
+  }
+
+  // ---- dossier ----
+  dossier(studyId: string): { version: number; text: string } | null {
+    const row = this.db.prepare(`SELECT version, text FROM dossiers WHERE study_id = ? ORDER BY version DESC LIMIT 1`).get(studyId) as { version: number; text: string } | undefined;
+    return row ?? null;
+  }
+  setDossier(studyId: string, text: string, authorThreadId: string | null): number {
+    return this.tx(() => {
+      const v = (this.dossier(studyId)?.version ?? 0) + 1;
+      this.db.prepare(`INSERT INTO dossiers (study_id, version, text, author_thread_id, created_at) VALUES (?, ?, ?, ?, ?)`).run(studyId, v, text, authorThreadId, this.now());
+      this.event(studyId, "dossier.updated", authorThreadId ?? "human", { version: v, chars: text.length });
+      return v;
+    });
+  }
+
+  addHarvestProposal(studyId: string, proposal: unknown, authorThreadId: string): number {
+    const r = this.db
+      .prepare(`INSERT INTO harvest_proposals (study_id, proposal_json, author_thread_id, created_at) VALUES (?, ?, ?, ?)`)
+      .run(studyId, JSON.stringify(proposal), authorThreadId, this.now());
+    this.event(studyId, "harvest.proposed", authorThreadId, { proposal: Number(r.lastInsertRowid) });
+    return Number(r.lastInsertRowid);
+  }
+}

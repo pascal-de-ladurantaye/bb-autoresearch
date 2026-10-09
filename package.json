@@ -1,0 +1,56 @@
+{
+  "name": "bb-plugin-autoresearch",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Long-running, measured code-optimization studies: short-lived agent workers propose changes, the plugin measures every candidate and decides what to keep.",
+  "license": "MIT",
+  "keywords": [
+    "bb-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pascal-de-ladurantaye/bb-autoresearch.git"
+  },
+  "engines": {
+    "bb": ">=0.45",
+    "bbPluginSdk": ">=0.6.14"
+  },
+  "bb": {
+    "name": "Autoresearch",
+    "description": "Measured code-optimization studies: agent workers propose changes, the plugin benchmarks every candidate and keeps only statistically real wins.",
+    "branding": {
+      "icon": "FlaskConical"
+    },
+    "server": "./server.ts",
+    "host": "./host.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "smol-toml": "^1.3.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.14",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9",
+    "typescript": "^5.7.0",
+    "vitest": "4.1.11"
+  },
+  "packageManager": "pnpm@10.28.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  }
+}
