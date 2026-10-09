@@ -5,7 +5,7 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: autoresearch
 brandSublabel: BB plugin design
-pills: Draft | M0 built | M1-M3 to do
+pills: Draft | M0-M1 built | M2-M3 to do
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -97,9 +97,9 @@ flowchart LR
   ui <--> plugin
   plugin <--> db
   plugin -- spawn, verdicts --> w1 & w2 & w3
-  w1 & w2 & w3 -- submit_candidate --> plugin
+  w1 & w2 & w3 -- study_submit_candidate --> plugin
   plugin -- digest rounds --> st
-  st -- queue_ideas, dossier --> plugin
+  st -- study_queue_ideas, dossier --> plugin
   plugin -- host RPC --> ehost
   plugin -- host RPC, git bundle --> bhost
 ```
@@ -146,7 +146,7 @@ sequenceDiagram
   participant P as Plugin
   participant E as Edit host
   participant B as Bench host
-  W->>P: submit_candidate(summary)
+  W->>P: study_submit_candidate(summary)
   P->>E: snapshot commit, scope check
   E-->>P: sha, changed paths
   P->>E: rebase onto best, run gates
@@ -166,7 +166,7 @@ sequenceDiagram
   else lose or inconclusive
     P-->>W: verdict with diagnostics
   end
-  W->>P: record_finding, then refine or finish
+  W->>P: study_record_finding, then refine or study_finish
 ```
 
 1. **Snapshot.** The plugin commits the worker's worktree for it and records the SHA. It also writes the ref `refs/studies/<slug>/c/<n>`. Every submission gets a ref, whatever the verdict.
@@ -325,28 +325,28 @@ Only one round runs at a time. Each round prompt starts with a self-contained di
 - **Loop.**
   1. Understand the code.
   2. Edit, then run a fast local check.
-  3. Call `submit_candidate`, then go idle.
+  3. Call `study_submit_candidate`, then go idle.
   4. Read the verdict message, then refine or stop.
-- **Exit.** `finish` refuses until `record_finding` has been called. Once the worker finishes, the plugin archives the thread and removes the worktree. Candidate refs are kept.
+- **Exit.** `study_finish` refuses until `study_record_finding` has been called. Once the worker finishes, the plugin archives the thread and removes the worktree. Candidate refs are kept.
 - **Timeouts.** A worker idle past a deadline gets one nudge. If it's still idle after that, it's stopped and the idea is marked `abandoned`.
 
 ### Tools
 
 | Tool | Role | Purpose |
 |---|---|---|
-| `submit_candidate` | worker | Submit the worktree with a summary. Returns a ticket. The verdict arrives later as a message. |
-| `record_finding` | worker | Outcome, what was learned, when the idea would be worth revisiting, evidence. |
-| `propose_idea` | worker | Add an idea it noticed but won't pursue. The strategist triages it. |
-| `request_profile` | worker | Profile `best` or its own candidate on the bench host. This uses bench time and counts against the budget. |
-| `finish` | worker | End the assignment. |
+| `study_submit_candidate` | worker | Submit the worktree with a summary. Returns a ticket. The verdict arrives later as a message. |
+| `study_record_finding` | worker | Outcome, what was learned, when the idea would be worth revisiting, evidence. |
+| `study_propose_idea` | worker | Add an idea it noticed but won't pursue. The strategist triages it. |
+| `study_request_profile` | worker | Profile `best` or its own candidate on the bench host. This uses bench time and counts against the budget. |
+| `study_finish` | worker | End the assignment. |
 | `study_propose` | creator | Submit a spec and oracle for validation and approval. |
-| `queue_ideas` | strategist | Add or reorder ideas, each with a rationale, theme, and optional starting ref. |
-| `retire_idea` | strategist | Close a direction, with a reason. |
-| `update_dossier` | strategist | Replace the dossier. |
-| `search_findings` | strategist | Search findings and candidates by text, theme, or verdict. |
-| `propose_harvest` | strategist | Propose how to group promotions into changesets. |
+| `study_queue_ideas` | strategist | Add or reorder ideas, each with a rationale, theme, and optional starting ref. |
+| `study_retire_idea` | strategist | Close a direction, with a reason. |
+| `study_update_dossier` | strategist | Replace the dossier. |
+| `study_search_findings` | strategist | Search findings and candidates by text, theme, or verdict. |
+| `study_propose_harvest` | strategist | Propose how to group promotions into changesets. |
 
-No agent has a keep, discard, or promote tool. Concurrency, budget, the oracle, and pausing are human controls.
+Every agent tool carries the `study_` prefix so it can't collide with another plugin's tools. No agent has a keep, discard, or promote tool. Concurrency, budget, the oracle, and pausing are human controls.
 
 The tool set depends on the role. `bb.agents.configure` selects tools from the thread's metadata, and then the plugin checks the role again against its own `threads` table on every call. Thread metadata can be written by the thread's own agent, so it can't be the only check.
 
@@ -496,7 +496,7 @@ The main assumption: short-lived workers with good briefs, judged by the plugin,
 
 - [x] Spec import, approval, and A/A calibration on the local host
 - [x] Pipeline: snapshot, scope check, gate, paired measurement against `best`, verdict, promotion
-- [x] Worker spawn, brief, verdict message, `record_finding`, `finish`, archive
+- [x] Worker spawn, brief, verdict message, `study_record_finding`, `study_finish`, archive
 - [x] Strategist rounds in the study thread from plugin-built digests
 - [x] `bb study show` and `bb study ideas add`
 - [ ] Head-to-head on a reference benchmark against a serial single-agent loop
@@ -505,11 +505,12 @@ The main assumption: short-lived workers with good briefs, judged by the plugin,
 
 ### M1: parallel
 
-- [ ] `W > 1` workers, bench queue, backpressure, adaptive `W`
-- [ ] Rebase on submit, `conflict` verdict handled by the worker
-- [ ] Sequential testing and confirmation runs
-- [ ] Diversity and no-repeat rules
-- [ ] Study page v1: Overview, Ideas, Candidates
+- [x] `W > 1` workers, bench queue, backpressure, adaptive `W`
+- [x] Rebase on submit, `conflict` verdict handled by the worker
+- [x] Sequential testing and confirmation runs
+- [x] Diversity and no-repeat rules
+- [x] Study page v1: Overview, Ideas, Candidates
+- [ ] Exit criterion on a real workload (the toy smoke tests are too short to show it; see the M1 notes)
 
 **Exit:** bench busy more than 80% of Running time. Time to target clearly below M0 at similar tokens per win.
 
@@ -580,7 +581,7 @@ What M0 built, and every place it differs from the design above. Checked against
 
 ### Pipeline and statistics
 
-- **Snapshot and scope run inside `submit_candidate`.** Both are fast, so the tool call does them. A scope rejection comes back as the tool result instead of a later message. Everything after that (rebase, gate, measure, verdict, promotion) is asynchronous, and the verdict arrives through `threads.send({ mode: "auto" })`.
+- **Snapshot and scope run inside `study_submit_candidate`.** Both are fast, so the tool call does them. A scope rejection comes back as the tool result instead of a later message. Everything after that (rebase, gate, measure, verdict, promotion) is asynchronous, and the verdict arrives through `threads.send({ mode: "auto" })`.
 - **Stages are persisted.** Candidates move through `submitted → gating → queued → measuring → confirming → promoting → decided`, and `reported_at` records delivery. Each stage reruns safely. A host error is retried on later passes. After three failures the study pauses (system pause, human notified) and the candidate stays parked until `resume`.
 - **Flaky gates.** A failed gate command runs once more. A pass on the retry is recorded as a `gate.flaky` event.
 - **MDE definition.** Calibration runs `calibration_pairs` A/A pairs. The MDE is `max(min_effect, q)`, where `q` is the `confidence` quantile of |median| over bootstrap resamples of `n_max` centered A/A differences: the effect A/A noise alone can fake at `n_max` pairs. A win needs the CI lower bound above the MDE, so the report also gives "detectable", which is MDE plus that half-width. Calibration fails, and the study returns to Draft, when the MDE is above `max_mde` or the A/A CI excludes zero (the two checkouts aren't equivalent).
@@ -595,17 +596,17 @@ What M0 built, and every place it differs from the design above. Checked against
 - **Role gating.** `bb.agents.configure` is synchronous, and so is better-sqlite3, so `configure` checks both the metadata and the `threads` table. Worker metadata selects worker tools only when it matches a live worker row (by thread id, or by `spawnToken` while the spawn call is still in flight). Strategists are known only by their row. A thread with no row gets `study_propose` and the two skills. Every tool call checks the role against the table again. Forged metadata gets no tools.
 - **`threads` has a surrogate id and a `spawn_token`.** The thread id isn't known until `threads.spawn` returns, and `configure` (or a fast first tool call) can run before that. The token in the worker's metadata ties the thread to its row. Reconciliation uses it to adopt or fail spawns that were interrupted.
 - **Strategist tools need a fresh session.** Tool sets apply when a provider session starts. The study thread is created as an ordinary thread, so `bb study start` stops its runtime (when idle) and the first strategist round opens a new session that has the strategist tools. The smoke test confirmed this.
-- **Human-message trigger.** BB has no "a human sent a message" event. A `thread.active` on the study thread that the plugin didn't cause counts as the human trigger. If there are new verdicts or findings, the digest is sent with `mode: "auto"`, which steers it into the human's turn. Plugin-sent notifications (calibration results, system pauses) count as rounds so they don't look like human messages.
+- **Human-message trigger.** BB has no "a human sent a message" event. A `thread.active` on the study thread that the plugin didn't cause counts as the human trigger. If there are new verdicts or findings, the digest is sent with `mode: "auto"`, which steers it into the human's turn. Plugin-sent notifications (calibration results, system pauses) count as rounds so they don't look like human messages. *(M1: notifications no longer start turns; see Notices below.)*
 - **Round triggers** are K verdicts (`agents.strategist_every`), queue low (fewer ready ideas than W, only after something changed, so an unproductive round doesn't loop), stall (`agents.stall_after` verdicts without a win, once per window), the human, and a first round at start.
 - **Idle handling.** Idle time starts at `thread.idle` and doesn't count while a verdict is pending. One nudge comes after `idle_nudge_minutes`. A worker still idle at `idle_abandon_minutes` is stopped and archived, and its idea is marked `abandoned`. A new submission clears the nudge.
 - **Rate limits.** `turn.failed` with category `rate-limit` is retried at the window reset plus 15 s, up to 3 times.
 - **Permission mode.** `[agents].worker.permission_mode` is passed to the spawn call. When it's absent, the project default applies. A hidden worker that asks for approval stalls until the idle timeout.
-- **`request_profile`** runs the optional `oracle.profile` command inside the tool call, holding the bench lock, and adds the time to the bench budget.
-- **`propose_harvest`** only records the proposal (M3).
+- **`study_request_profile`** runs the optional `oracle.profile` command inside the tool call, holding the bench lock, and adds the time to the bench budget.
+- **`study_propose_harvest`** only records the proposal (M3).
 
 ### Human surface
 
-- **No frontend.** The Study page, Studies nav panel, and header badges are deferred (M1/M3). The CLI is the M0 surface.
+- **No frontend.** The Study page, Studies nav panel, and header badges are deferred (M1/M3). The CLI is the M0 surface. *(M1: the Studies panel, study page v1, and the header badge exist; see M1 below.)*
 - **Approval is in the CLI.** `bb study calibrate` approves the current spec version and calibrates. `bb study start` approves the calibration. Also built: `list`, `show`, `pause`, `resume`, `ideas add`, `ideas list`, `workers`, and `archive`. `harvest` prints a placeholder. Human controls are refused when they come from a study's own worker or strategist thread. The strategist may run `ideas add`.
 - **Pause** stops new spawns. In-flight candidates finish and running workers keep their submission. Holding worker messages with the experimental `message.dispatch` hook isn't used.
 
@@ -616,8 +617,126 @@ What M0 built, and every place it differs from the design above. Checked against
 
 ### Spec additions
 
-`scope.max_files` and `scope.max_lines`; `oracle.profile`, `oracle.timeout_minutes`, and `oracle.protocol.{warmup, n_min, n_max, confidence, min_effect, max_mde, tolerance, confirm, confirm_runs, calibration_pairs, bootstrap}`; `guardrail.direction`; `agents.{strategist,worker}.permission_mode`, `agents.strategist_every`, `agents.stall_after`, and `agents.idle_nudge_minutes`/`idle_abandon_minutes`. Unknown keys are rejected. `oracle.bench_hosts` must be empty or `["local"]` until M2. `oracle.holdout` is accepted but not evaluated yet. `budget.max_workers > 1` is accepted, but M0 runs W = 1 (`EngineConfig.workerCeiling`).
+`scope.max_files` and `scope.max_lines`; `oracle.profile`, `oracle.timeout_minutes`, and `oracle.protocol.{warmup, n_min, n_max, confidence, min_effect, max_mde, tolerance, confirm, confirm_runs, calibration_pairs, bootstrap}`; `guardrail.direction`; `agents.{strategist,worker}.permission_mode`, `agents.strategist_every`, `agents.stall_after`, and `agents.idle_nudge_minutes`/`idle_abandon_minutes`. Unknown keys are rejected. `oracle.bench_hosts` must be empty or `["local"]` until M2. `oracle.holdout` is accepted but not evaluated yet. `budget.max_workers > 1` is accepted, but M0 runs W = 1 (`EngineConfig.workerCeiling`). *(M1: W > 1 runs; `workerCeiling` is now only an emergency cap, default 64.)*
 
 ### Not in M0
 
 The serial-loop head-to-head; W > 1, backpressure, and adaptive W (the `targetWorkers` formula exists but is capped at 1); drift checks; holdout; oracle segments after start (re-calibrating before the first candidate keeps segment 1); remote bench hosts and git bundles; harvest and ablation; token budgets; and the UI.
+
+## Implementation notes: M1
+
+What M1 added, and every place it differs from the design or from M0. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+### Concurrency
+
+- **Pipeline jobs.** The M0 pump ran stages one after another. M1's `Pipeline.launch()` starts one job per candidate with work and re-runs whenever a job ends. There are three kinds of job:
+  - gates run in parallel, at most the study's effective `max_workers` at once, each in its own checkout slot (`<slug>-gate-<k>`), and never take the bench lock;
+  - measurement runs as one job per bench lock key (the bench host for `noisy` and `expensive`, host plus study for `deterministic`), oldest `queued_at` first across studies;
+  - verdict reports retry every 30 s when delivery fails.
+- **A rebased candidate keeps its place in the queue.** A candidate sent back to gating because best moved keeps its original `queued_at`.
+- **Submissions are serialized per study.** This keeps candidate numbers dense and unique. Promotions are serialized per study by a mutex, and promotion still compare-and-swaps `studies/<slug>/best`.
+- **Retries back off.** Host errors are retried after `retryDelayMs × attempts` (15 s by default) instead of immediately. If best fails to build or measure, the candidate is parked (attempts set to the limit) until the human resumes. Before this, a paused study could retry a broken oracle in a loop.
+- **Bench intervals.** Every span the bench lock is held (measurement, profile, calibration) is a row in `bench_intervals`. Utilization, the overlap audit, and the Bench numbers on the page come from it. Reconciliation closes intervals left open by a crash.
+
+### Scheduling
+
+- **Adaptive W.** `W = min(max_workers, ceil(T_think / T_eval) + 1)`:
+  - `T_think` is the mean time from a worker's spawn, or from the delivery of its previous verdict, to each submission, over the last 20 submissions.
+  - `T_eval` is the mean bench seconds of the last 20 measured candidates. Until one exists, it's the calibration estimate.
+  - With no submissions yet, `W = max_workers`.
+  - Each change of W is a `scheduler.target` event, and the value is stored on the study.
+  - The human can override `max_workers` with `bb study concurrency <slug> <n|auto>` or the page's concurrency control.
+  - Lowering W during provider rate limits isn't built.
+- **Backpressure.** The bench queue depth counts candidates in `gating`, `queued`, `measuring`, or `confirming`. No worker spawns while that depth is at least W.
+- **Budget reservation.** Each live worker reserves one submission against `max_candidates`, so the study never spawns a worker that has no budget left to submit. A submission past the budget is refused.
+- **Spawning fills slots.** One control-loop pass spawns up to `W - live` workers. A kick during a pass schedules another pass (M0 dropped it).
+- **(a) Finishing race.** Finishing workers count as live, so a new worker never starts while the previous one is still wrapping up. A worker whose turn doesn't end within `finishingTimeoutMs` (3 min) of `study_finish` is stopped and archived.
+- **Diversity.** At most `ceil(W / 2)` workers run one theme at a time. This is also checked at W = 1, where it makes no difference.
+- **No repeats.** Ideas now have `variation_of` and `lineage`, where the lineage is the root idea of a chain of variations.
+  - A non-human idea whose normalized title matches a lost idea is skipped, unless it's an explicit variation.
+  - `study_queue_ideas` returns "Skipped: … repeats lost idea #N; queue it with variation_of=N" for such ideas instead of queueing them.
+  - An idea with `start_ref = "c/N"` is automatically a variation of candidate N's idea. The ref must name an existing candidate.
+  - Human ideas are exempt, because the human steers.
+  - Lost and abandoned ideas never go back to `queued`.
+- **Human idea controls.** The Ideas board can add ideas (with theme, rationale, and start ref), reorder them (written as priorities 100, 99, …), pin or unpin them, and veto them. A veto retires the idea with the reason "vetoed by the human".
+
+### Rebase, conflict, and promotion
+
+- **Rebase on submit** is the M0 `git merge-tree` preparation at gate time onto the current best. If best moved while a candidate was queued, the measure step sends it back to be prepared and gated again. This is recorded as `candidate.rebased` with the old and new best.
+- **Fork point.** The snapshot now computes the fork point as `merge-base(HEAD, best)`. A worker that rebased by hand after a `conflict` is diffed, scope-checked, and prepared against the new best, not its original fork. The worker's `fork_sha` moves with it.
+- **Conflict counting (decision).** A `conflict` is refunded: it doesn't count against `max_submissions_per_worker`, up to `CONFLICT_REFUNDS = 2` per worker. After that, conflicts count. The verdict says which case applies and tells the worker to `git rebase studies/<slug>/best`, resolve, and resubmit. In both smoke-test conflicts, the worker read the verdict, saw that its idea was already in best, recorded a `no_effect` finding, and finished. That's a legitimate resolution.
+- **Best moves mid-measurement (decision).** A candidate is measured against the best at the start of its measurement, and `against_sha` records which one.
+  - If the result is a **win** and best has moved by the time the measurement ends, the candidate is prepared, gated, and measured again against the new best before it can be promoted.
+  - **Non-wins stand** against the best they were measured on. Re-measuring likely losers would cost bench time for nothing.
+  - A compare-and-swap failure at promotion also sends the candidate back to be measured again (`best branch moved … during promotion`). M0 threw an error here.
+  - With one bench host per study this can't happen in M1. It's built for M2's multiple bench hosts, and tests simulate it.
+- **Confirmation.** Confirmation runs in the same bench session against the same best.
+
+### Notifications (fix b)
+
+- **No push without a turn.** The SDK can't post a message into a thread without starting or steering a turn: `threads.send` modes are `start`, `steer`, `auto`, and the queue variants.
+- **Notices instead.** Milestones (calibration ready or failed, system pauses including budget exhaustion) are rows in `notices`:
+  - shown on the study page and in `bb study show`, and counted on the Studies list;
+  - the study thread is marked unread with `threads.markUnread`;
+  - the text rides along in the next strategist round under "Notices for the human".
+- **Before Running.** There are no rounds yet, so undelivered notices are steered into the human's own next turn in the study thread. This is how the creating agent hears about calibration results.
+- **Best moved.** Workers are told without new turns:
+  - a worker mid-turn, with no candidate pending, gets the notice steered into that turn;
+  - any other worker gets it prepended to the next plugin message it receives (verdict or submission ticket).
+  - `worker.notified` records which path was taken.
+
+### Other fixes
+
+- **(c) Bench time.** Budget lines and reports format durations as s, min, or h, so short runs no longer show 0.00 h.
+- **(d) Tool prefix.** Every agent tool is prefixed: `study_submit_candidate`, `study_record_finding`, `study_propose_idea`, `study_request_profile`, `study_finish`, `study_queue_ideas`, `study_retire_idea`, `study_update_dossier`, `study_search_findings`, `study_propose_harvest`, and `study_propose`.
+- **Worktree cleanup.** A worker that never submitted had no environment id recorded, because the spawn response can omit it while the worktree is provisioning. Its worktree was left for core's retirement. `endWorker` now looks the environment up from the thread before archiving.
+- **Spec warning.** The "max_workers > 1 runs W = 1" warning is gone.
+
+### Human surface
+
+- **Studies nav panel** (`navPanel`, path `studies`). It lists studies with state, best vs. base, budget spent, workers, queue, and new notices. A study page lives at `studies/<slug>[/<tab>[/<n>]]`.
+  - **Overview:** the trajectory chart (SVG; every measured candidate is a dot at its position relative to base, and best is a step line); best vs. base with an approximate CI (the promoted candidates' CI bounds, compounded); state and pause reason; budget; W, think and eval times; bench utilization; controls (pause, resume, concurrency, open study thread); live workers with their phase and queue position; the bench queue; notices; and recent events.
+  - **Ideas:** the board (queued, running, won, lost, abandoned or vetoed) with add, reorder, pin, and veto.
+  - **Candidates:** a table filterable by verdict, stage, and text. A row opens the verdict and reasons, the summary, samples per pair, gate output, diagnostics, and a diff summary. The diff comes from the new `diffSummary` host op, rendered per file with `experimental_Diff`. There's a link to the worker thread.
+  - The Findings, Oracle, Bench, and Harvest tabs are still M3.
+- **Thread header badge** (`experimental_threadHeaderAction`). On the study thread it reads `run N · best −x% ±y · W workers · queue Q`, prefixed with the state when not running. On a worker thread it reads `<slug> · idea #N · submission k/max · <phase>`, where the phase is working, gating, queued Nth, measuring, or confirming. Clicking it opens the study page. Other threads render nothing.
+- **Data plane.** The page reads everything through `bb.rpc`: `studies.list`, `study.overview`, `study.ideas`, `study.candidates`, `study.candidate`, and `thread.badge`. It writes through `study.pause`, `study.resume`, `study.concurrency`, `ideas.add`, `ideas.update`, `ideas.reorder`, and `ideas.veto`. It refetches on the `study-changed` realtime signal (debounced), on reconnect, and on a 5 s poll. The plugin publishes that signal at every stage change.
+- **Branding.** The plugin ships its flask glyph (`assets/flask.svg`), registered as the app icon `autoresearch-flask`.
+- **Security gap.** RPC writes refuse other plugins as callers (`experimental_caller.kind === "plugin"`). The RPC context doesn't say which thread called, though, so an agent could still call them through `bb plugin rpc call`. They're bounded human controls (pause, resume, concurrency, the idea board), not verdicts or promotion. Closing this gap needs caller-thread identity from BB.
+- **CLI.** New: `bb study concurrency`, and `ideas add --start-ref --variation-of`. `show` adds a Scheduler line (W, queue, think, eval), a Bench line (utilization and overlaps), and notices.
+
+### Data model
+
+M1's migrations are append-only:
+
+- `candidates`: `queued_at`, `lines_added`, `lines_deleted`, `rebases`;
+- `threads`: `conflict_refunds`, `pending_notice`, `finishing_at`;
+- `ideas`: `variation_of`, `lineage`;
+- `studies`: `max_workers_override`, `target_workers`, `running_since`, `running_seconds`;
+- new tables `bench_intervals` and `notices`.
+
+New events: `measure.started` and `measure.finished`, `candidate.rebased`, `scheduler.target`, `worker.notified`, `study.concurrency`, `notice.added`, and `idea.pinned`.
+
+### Smoke test (BB 0.45, local host, toy repo under /tmp)
+
+Three studies ran on one toy Python pipeline with a `noisy` metric. All had `max_workers = 3`, `max_candidates = 6`, and 2 submissions per worker, and all used the default agent provider.
+
+| Study | Shape | Peak concurrent workers | Mean think | Mean eval | W | Bench busy / Running | Since first submission | Overlapping measurements | Rebases / conflicts |
+|---|---|---|---|---|---|---|---|---|---|
+| `toy-m1` | eval ≈ think, and eval collapses as wins land | 3 | 22 s | 18 s | 3 → 2 | 53% | 67% | 0 of 9 | 3 / 0 |
+| `toy-m1b` | untimed setup keeps eval expensive | 3 | 17 s | 36 s | 3 → 2 | 74% (81% mid-run) | 85% | 0 of 9 | 3 / 1 |
+| `toy-m1c` | think > eval | 3 | 18 s | 5 s | 3 | 21% | 28% | 0 of 7 | 1 / 1 |
+
+- **No overlaps.** Measurements never overlapped (`bench_intervals` self-join). Every sample's timestamp fell inside its own candidate's measurement interval.
+- **No notification turns.** No notification started a turn: the study threads went unread, and the notices arrived in the next round.
+- **Live in the app.** The study page and the badge rendered in the BB app (checked with in-app browser screenshots).
+- **What the numbers say.** Utilization follows the formula. When eval takes longer than think, the bench saturates (85% in steady state). When think takes longer than eval, W wants `ceil(18/5) + 1 = 5`, the cap of 3 starves the bench, and utilization drops to 21%. Short studies also pay for the first think period while the bench sits idle. Meeting the > 80% exit criterion on a real workload needs `max_workers` at least `T_think / T_eval + 1`, and a study long enough to amortize the start. That claim isn't proven yet.
+- **Agents were fast.** Workers on this toy thought for only 17–22 s and mostly finished after one submission.
+
+### Not in M1
+
+- **Exit criterion and head-to-head.** The M1 exit criterion on a real benchmark, and the M0-vs-M1 time-to-target comparison.
+- **Rate limits.** Lowering W while provider rate limits are tight.
+- **Mixed providers.** Mixing providers across workers (open question 6).
+- **Tabs.** The Findings, Oracle, Bench, and Harvest tabs.
+- **Remote bench hosts.** Remote bench hosts and everything else in M2 (the `HostRunner` seam and per-key bench queues are ready for them).

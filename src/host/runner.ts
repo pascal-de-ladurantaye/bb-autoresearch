@@ -6,6 +6,7 @@
 //   host RPC is unavailable on a machine).
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type {
+  DiffSummary,
   ExecInput,
   ExecResult,
   HostContract,
@@ -28,6 +29,7 @@ export interface HostRunner {
   rewordCommit(repoPath: string, sha: string, message: string): Promise<string>;
   checkout(repoPath: string, key: string, sha: string): Promise<string>;
   removeCheckouts(repoPath: string, keyPrefix: string): Promise<number>;
+  diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number): Promise<DiffSummary>;
 }
 
 const GIT_TIMEOUT = 5 * 60_000;
@@ -68,6 +70,9 @@ export class BbHostRunner implements HostRunner {
   async removeCheckouts(repoPath: string, keyPrefix: string) {
     return (await this.client.call("removeCheckouts", { repoPath, keyPrefix }, this.opts())).removed;
   }
+  async diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number) {
+    return await this.client.call("diffSummary", { repoPath, from, to, maxPatchBytes }, this.opts(60_000));
+  }
 }
 
 export class LocalHostRunner implements HostRunner {
@@ -101,5 +106,8 @@ export class LocalHostRunner implements HostRunner {
   }
   async removeCheckouts(repoPath: string, keyPrefix: string) {
     return (await ops.removeCheckouts(this.dataDir, repoPath, keyPrefix)).removed;
+  }
+  diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number) {
+    return ops.diffSummary(repoPath, from, to, maxPatchBytes);
   }
 }

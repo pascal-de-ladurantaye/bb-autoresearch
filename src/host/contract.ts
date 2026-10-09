@@ -38,11 +38,19 @@ export const snapshotInput = z
     message: z.string().min(1).max(4096),
     candidateRef: ref,
     baseSha: sha,
+    /**
+     * Current best. When given, the fork point is merge-base(HEAD, bestSha)
+     * instead of `baseSha`, so a worker that rebased onto a newer best is
+     * diffed (and scope-checked) against that best, not its original fork.
+     */
+    bestSha: sha.optional(),
   })
   .strict();
 export const snapshotOutput = z
   .object({
     sha,
+    /** The commit the changed paths are measured from (see `bestSha`). */
+    forkSha: sha.optional(),
     committed: z.boolean(),
     changedPaths: z.array(z.string()),
     linesAdded: z.number().int(),
@@ -67,6 +75,16 @@ export const prepareOutput = z.discriminatedUnion("status", [
 ]);
 export type PrepareInput = z.infer<typeof prepareInput>;
 export type PrepareResult = z.infer<typeof prepareOutput>;
+
+export const diffSummaryOutput = z
+  .object({
+    files: z.array(z.object({ path: z.string(), added: z.number().int(), deleted: z.number().int() }).strict()),
+    /** Unified patch, clipped to `maxPatchBytes`. */
+    patch: z.string(),
+    truncated: z.boolean(),
+  })
+  .strict();
+export type DiffSummary = z.infer<typeof diffSummaryOutput>;
 
 export const hostContract = defineRpcContract({
   ping: {
@@ -106,6 +124,11 @@ export const hostContract = defineRpcContract({
   checkout: {
     input: z.object({ repoPath: absPath, key: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,120}$/u), sha }).strict(),
     output: z.object({ path: absPath }).strict(),
+  },
+  /** Per-file line counts and a clipped patch for `from..to` (the study page's diff view). */
+  diffSummary: {
+    input: z.object({ repoPath: absPath, from: sha, to: sha, maxPatchBytes: z.number().int().min(0).max(1024 * 1024) }).strict(),
+    output: diffSummaryOutput,
   },
   /** Remove plugin-owned checkouts whose key starts with `keyPrefix`. */
   removeCheckouts: {

@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import type { Ctx } from "./context.ts";
 import type { StudyRow } from "./db/store.ts";
 import { strategyFor, BenchError, type CalibrationOutcome } from "./noise.ts";
-import type { Pipeline } from "./pipeline.ts";
+import { withBench, type Pipeline } from "./pipeline.ts";
 import { clip } from "./prompts.ts";
 import { bestBranch, oracleHash, segmentRef } from "./spec.ts";
 
@@ -85,7 +85,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   const strategy = strategyFor(spec.oracle.noise);
   let outcome: CalibrationOutcome;
   try {
-    outcome = await ctx.benchLock.run(strategy.benchLock ? study.host_id! : `${study.host_id!}:${study.slug}`, async () => {
+    outcome = await withBench(ctx, study, "calibration", null, async () => {
       const a = await runner.checkout(repo, `${study.slug}-best`, baseSha);
       const b = await runner.checkout(repo, `${study.slug}-cand`, baseSha);
       if (spec.oracle.build) {

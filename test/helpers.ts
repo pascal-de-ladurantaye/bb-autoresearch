@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { HostMutex, type Ctx } from "../src/context.ts";
 import { MIGRATIONS } from "../src/db/schema.ts";
 import { Store } from "../src/db/store.ts";
-import type { ExecInput, ExecResult, PrepareInput, PrepareResult, SnapshotInput, SnapshotResult } from "../src/host/contract.ts";
+import type { DiffSummary, ExecInput, ExecResult, PrepareInput, PrepareResult, SnapshotInput, SnapshotResult } from "../src/host/contract.ts";
 import type { HostRunner } from "../src/host/runner.ts";
 import type { BbPort, EnvironmentInfo, SpawnWorkerArgs, ThreadInfo } from "../src/ports.ts";
 import { seededRng } from "../src/stats.ts";
@@ -36,6 +36,8 @@ export class FakeHost implements HostRunner {
   calls: string[] = [];
   /** Changed paths reported by the next snapshot of a worktree. */
   nextSnapshot: Partial<SnapshotResult> & { tree?: string } = {};
+  /** Per-worktree override of nextSnapshot (concurrent submissions). */
+  nextSnapshotFor = new Map<string, Partial<SnapshotResult> & { tree?: string }>();
   /** Metric value by tree id. */
   metric = new Map<string, number>();
   noise: () => number = () => 0;
@@ -43,6 +45,12 @@ export class FakeHost implements HostRunner {
   conflicts = new Set<string>();
   worktreeHead = new Map<string, string>();
   failNext: { method: string; error: string } | null = null;
+  /** Real-time delay per exec kind, to make concurrency observable. */
+  delays: { gate: number; measure: number } = { gate: 0, measure: 0 };
+  active = { gate: 0, measure: 0 };
+  maxActive = { gate: 0, measure: 0 };
+  /** Called before every measure run (tests mutate state mid-measurement). */
+  onMeasure: ((cwd: string) => void | Promise<void>) | null = null;
 
   commit(tree: string, parent: string | null, message = "c"): string {
     const sha = fakeSha();
@@ -60,8 +68,36 @@ export class FakeHost implements HostRunner {
       throw new Error(e);
     }
   }
+  private async timed<T>(kind: "gate" | "measure", fn: () => T | Promise<T>): Promise<T> {
+    this.active[kind] += 1;
+    this.maxActive[kind] = Math.max(this.maxActive[kind], this.active[kind]);
+    try {
+      if (this.delays[kind] > 0) await new Promise((r) => setTimeout(r, this.delays[kind]));
+      return await fn();
+    } finally {
+      this.active[kind] -= 1;
+    }
+  }
+  isAncestor(ancestor: string, sha: string): boolean {
+    let cur: string | null = sha;
+    while (cur) {
+      if (cur === ancestor) return true;
+      cur = this.commits.get(cur)?.parent ?? null;
+    }
+    return false;
+  }
   async exec(input: ExecInput): Promise<ExecResult> {
     this.maybeFail("exec");
+    if (input.command.startsWith("gate")) return await this.timed("gate", () => this.execNow(input));
+    if (input.command.startsWith("measure")) {
+      return await this.timed("measure", async () => {
+        if (this.onMeasure) await this.onMeasure(input.cwd);
+        return this.execNow(input);
+      });
+    }
+    return this.execNow(input);
+  }
+  private execNow(input: ExecInput): ExecResult {
     const sha = this.checkouts.get(input.cwd);
     const tree = sha ? this.treeOf(sha) : "";
     if (input.command.startsWith("git ls-tree")) return { exitCode: 0, timedOut: false, durationMs: 1, stdout: "100644 blob abc\tbench/run.sh\n", stderr: "" };
@@ -97,14 +133,17 @@ export class FakeHost implements HostRunner {
   }
   async snapshot(input: SnapshotInput): Promise<SnapshotResult> {
     this.maybeFail("snapshot");
-    const tree = this.nextSnapshot.tree ?? fakeSha();
+    const next = this.nextSnapshotFor.get(input.worktreePath) ?? this.nextSnapshot;
+    this.nextSnapshotFor.delete(input.worktreePath);
+    const tree = next.tree ?? fakeSha();
     const parent = this.worktreeHead.get(input.worktreePath) ?? input.baseSha;
     const sha = this.commit(tree, parent, input.message);
     this.worktreeHead.set(input.worktreePath, sha);
     this.refs.set(input.candidateRef, sha);
-    const r = { sha, committed: true, changedPaths: ["src/a.ts"], linesAdded: 3, linesDeleted: 1, ...this.nextSnapshot };
+    const forkSha = input.bestSha && this.isAncestor(input.bestSha, sha) ? input.bestSha : input.baseSha;
+    const r = { sha, forkSha, committed: true, changedPaths: ["src/a.ts"], linesAdded: 3, linesDeleted: 1, ...next };
     delete (r as { tree?: string }).tree;
-    this.nextSnapshot = {};
+    if (next === this.nextSnapshot) this.nextSnapshot = {};
     return r;
   }
   async prepareCandidate(input: PrepareInput): Promise<PrepareResult> {
@@ -125,6 +164,10 @@ export class FakeHost implements HostRunner {
     this.checkouts.set(path, sha);
     return path;
   }
+  async diffSummary(_repo: string, from: string, to: string, _max: number): Promise<DiffSummary> {
+    this.maybeFail("diffSummary");
+    return { files: [{ path: "src/a.ts", added: 3, deleted: 1 }], patch: `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-${from.slice(0, 6)}\n+${to.slice(0, 6)}\n`, truncated: false };
+  }
   async removeCheckouts(_repo: string, prefix: string) {
     let n = 0;
     for (const k of [...this.checkouts.keys()]) if (k.startsWith(`/co/${prefix}`)) {
@@ -143,11 +186,15 @@ export class FakePort implements BbPort {
   threads = new Map<string, FakeThread>();
   envs = new Map<string, EnvironmentInfo>();
   sent: Array<{ threadId: string; text: string }> = [];
+  steered: Array<{ threadId: string; text: string }> = [];
+  unread: string[] = [];
   spawned: SpawnWorkerArgs[] = [];
   stopped: string[] = [];
   released: string[] = [];
   logs: string[] = [];
   spawnError: string | null = null;
+  /** Like core when the worktree is still provisioning: spawn returns no environment id. */
+  spawnWithoutEnvironment = false;
   private n = 0;
   constructor(
     readonly host: HostRunner,
@@ -173,10 +220,17 @@ export class FakePort implements BbPort {
     this.spawned.push(args);
     this.threads.set(id, { id, status: "active", archivedAt: null, deletedAt: null, environmentId: env, metadata: { ...args.metadata } });
     this.envs.set(env, { id: env, hostId: this.hostId, path: `/wt/${id}`, branchName: `bb/${id}` });
-    return { threadId: id, environmentId: env };
+    return { threadId: id, environmentId: this.spawnWithoutEnvironment ? null : env };
   }
   async send(threadId: string, text: string) {
     this.sent.push({ threadId, text });
+  }
+  async steer(threadId: string, text: string) {
+    if (this.threads.get(threadId)?.status !== "active") throw new Error("no turn is running");
+    this.steered.push({ threadId, text });
+  }
+  async markUnread(threadId: string) {
+    this.unread.push(threadId);
   }
   async getThread(threadId: string) {
     const t = this.threads.get(threadId);
@@ -221,7 +275,7 @@ export class FakePort implements BbPort {
 export function makeCtx(host: HostRunner = new FakeHost(), clock = new Clock()): { ctx: Ctx; store: Store; port: FakePort; clock: Clock } {
   const store = new Store(makeDb(), clock.now);
   const port = new FakePort(host);
-  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 1, tickMs: 1000 } };
+  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000 } };
   return { ctx, store, port, clock };
 }
 

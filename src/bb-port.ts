@@ -44,6 +44,12 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
     async send(threadId, text) {
       await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
     },
+    async steer(threadId, text) {
+      await bb.sdk.threads.send({ threadId, mode: "steer", input: [{ type: "text", text, mentions: [] }] });
+    },
+    async markUnread(threadId) {
+      await bb.sdk.threads.markUnread({ threadId });
+    },
     async getThread(threadId): Promise<ThreadInfo | null> {
       try {
         const t = await bb.sdk.threads.get({ threadId });

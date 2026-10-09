@@ -1,7 +1,7 @@
 // bb-plugin-autoresearch — server entry. Wiring only; behavior lives in src/.
 //
 // Order matters for reconciliation: register every handler (tools, CLI,
-// events) first, then reconcile running studies from the background service
+// events, rpc) first, then reconcile running studies from the background service
 // once the load commits (host RPC and bb.sdk are available there).
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { createBbPort } from "./src/bb-port.ts";
@@ -14,6 +14,7 @@ import { hostContract, hostSignals } from "./src/host/contract.ts";
 import { errText } from "./src/pipeline.ts";
 import type { BbPort } from "./src/ports.ts";
 import { seededRng } from "./src/stats.ts";
+import { registerRpc } from "./src/rpc.ts";
 import { registerTools } from "./src/tools.ts";
 
 export interface PluginDeps {
@@ -43,6 +44,7 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     const engine = new Engine(ctx);
 
     registerTools(bb, engine);
+    registerRpc(bb, engine);
     bb.cli.register(studyCli(engine));
 
     const safe = (name: string, fn: () => void | Promise<void>) => {

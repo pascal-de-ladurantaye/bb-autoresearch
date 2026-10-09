@@ -39,8 +39,10 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     expect(host.refs.get("refs/heads/studies/toy-size/best")).toBe(base);
     expect(host.refs.get("refs/studies/toy-size/segment/1")).toBe(base);
     expect(store.segment(s.id, 1)).toMatchObject({ baseline_sha: base, mde: 0 });
-    expect(port.sent.at(-1)!.text).toContain("Calibration of `toy-size` is ready");
-    engine.onThreadIdle("thr_study"); // the study thread answered the calibration notice
+    // Notices don't start a turn: recorded, study thread marked unread.
+    expect(port.sent).toHaveLength(0);
+    expect(store.notices(s.id)[0]!.text).toContain("Calibration of `toy-size` is ready");
+    expect(port.unread).toContain("thr_study");
     engine.addIdea(SLUG, { title: "Shrink the output" }, "human");
     await engine.start(SLUG, "human");
     await engine.settle();
@@ -54,12 +56,16 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     expect(spawn.baseBranch).toBe("studies/toy-size/best");
     expect(spawn.metadata).toMatchObject({ study: SLUG, role: "worker", idea: 1 });
     expect(spawn.prompt).toContain("Shrink the output");
-    expect(spawn.prompt).toContain("submit_candidate");
+    expect(spawn.prompt).toContain("study_submit_candidate");
     const worker = store.threadById("thr_w1")!;
     expect(worker).toMatchObject({ role: "worker", state: "active", fork_sha: base });
     expect(store.idea(1)!.status).toBe("running");
     const round = port.sent.find((m) => m.threadId === "thr_study" && m.text.includes("Strategist round 1"));
     expect(round?.text).toContain("trigger: study started");
+    // The calibration notice rides along in the first round.
+    expect(round?.text).toContain("Notices for the human");
+    expect(round?.text).toContain("Calibration of `toy-size` is ready");
+    expect(store.notices(store.study(SLUG)!.id, { undelivered: true })).toHaveLength(0);
     // W=1: a second idea doesn't spawn a second worker.
     engine.addIdea(SLUG, { title: "Another" }, "human");
     await engine.settle();
@@ -166,7 +172,9 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     await engine.settle();
     const c = store.candidateByN(store.study(SLUG)!.id, 1)!;
     expect(c.verdict).toBe("conflict");
-    expect(port.sent.at(-1)!.text).toContain("Rebase your worktree");
+    expect(port.sent.at(-1)!.text).toContain("git rebase studies/toy-size/best");
+    expect(port.sent.at(-1)!.text).toContain("does not count against your submission limit");
+    expect(store.threadById("thr_w1")).toMatchObject({ submissions: 0, conflict_refunds: 1 });
   });
 
   it("host errors are retried, then the study pauses and the human is told", async () => {
@@ -183,8 +191,8 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     const s = store.study(SLUG)!;
     expect(s.state).toBe("paused");
     expect(s.pause_reason).toContain("host offline");
-    expect(port.sent.at(-1)).toMatchObject({ threadId: "thr_study" });
-    expect(port.sent.at(-1)!.text).toContain("paused by the system");
+    expect(store.notices(s.id)[0]!.text).toContain("paused by the system");
+    expect(port.sent.filter((m) => m.threadId === "thr_study" && m.text.includes("paused by the system"))).toHaveLength(0);
     // Resume after the host is back: the same candidate completes.
     host.prepareCandidate = realPrepare;
     engine.resume(SLUG, "human");
@@ -253,7 +261,8 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     const s = store.study(SLUG)!;
     expect(s.state).toBe("draft");
     expect(s.calibration_status).toBe("failed");
-    expect(port.sent.at(-1)!.text).toContain("gate is red on the baseline");
+    expect(store.notices(s.id)[0]!.text).toContain("gate is red on the baseline");
+    expect(port.sent).toHaveLength(0);
     await expect(engine.start(SLUG, "human")).rejects.toThrow(/calibration/u);
   });
 });

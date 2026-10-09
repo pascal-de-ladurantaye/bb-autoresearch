@@ -33,6 +33,10 @@ export interface StudyRow {
   stall_signaled_at_verdict: number;
   best_run_json: string | null;
   best_run_sha: string | null;
+  max_workers_override: number | null;
+  target_workers: number | null;
+  running_since: number | null;
+  running_seconds: number;
 }
 
 export interface SpecVersionRow {
@@ -72,6 +76,8 @@ export interface IdeaRow {
   status_reason: string | null;
   created_at: number;
   updated_at: number;
+  variation_of: number | null;
+  lineage: number | null;
 }
 
 export interface ThreadRow {
@@ -92,6 +98,9 @@ export interface ThreadRow {
   nudged_at: number | null;
   ended_at: number | null;
   end_reason: string | null;
+  conflict_refunds: number;
+  pending_notice: string | null;
+  finishing_at: number | null;
 }
 
 export interface CandidateRow {
@@ -121,6 +130,10 @@ export interface CandidateRow {
   submitted_at: number;
   decided_at: number | null;
   reported_at: number | null;
+  queued_at: number | null;
+  lines_added: number;
+  lines_deleted: number;
+  rebases: number;
 }
 
 export interface FindingRow {
@@ -143,6 +156,26 @@ export interface EventRow {
   kind: string;
   actor: string;
   data_json: string;
+}
+
+export interface BenchIntervalRow {
+  id: number;
+  study_id: string;
+  host_id: string;
+  lock_key: string;
+  kind: "measure" | "profile" | "calibration";
+  candidate_id: number | null;
+  started_at: number;
+  ended_at: number | null;
+}
+
+export interface NoticeRow {
+  id: number;
+  study_id: string;
+  at: number;
+  kind: string;
+  text: string;
+  delivered_round: number | null;
 }
 
 export interface Budget {
@@ -204,7 +237,14 @@ export class Store {
   setStudyState(id: string, state: StudyState, actor: string, data: Record<string, unknown> = {}): void {
     this.tx(() => {
       const before = this.study(id);
-      this.updateStudy(id, { state, ...(state === "paused" ? { pause_reason: (data.reason as string | undefined) ?? null } : { pause_reason: null }) });
+      const now = this.now();
+      const running: Partial<StudyRow> = {};
+      if (state === "running" && before?.state !== "running") running.running_since = now;
+      if (state !== "running" && before?.state === "running") {
+        running.running_seconds = before.running_seconds + (before.running_since === null ? 0 : (now - before.running_since) / 1000);
+        running.running_since = null;
+      }
+      this.updateStudy(id, { state, ...running, ...(state === "paused" ? { pause_reason: (data.reason as string | undefined) ?? null } : { pause_reason: null }) });
       this.event(id, "study.state", actor, { from: before?.state, to: state, ...data });
     });
   }
@@ -267,19 +307,28 @@ export class Store {
   }
 
   // ---- ideas ----
-  addIdea(studyId: string, idea: { title: string; rationale?: string; theme?: string; source: IdeaRow["source"]; priority?: number; pinned?: boolean; start_ref?: string | null }, actor: string): IdeaRow {
+  addIdea(studyId: string, idea: { title: string; rationale?: string; theme?: string; source: IdeaRow["source"]; priority?: number; pinned?: boolean; start_ref?: string | null; variation_of?: number | null }, actor: string): IdeaRow {
     return this.tx(() => {
       const t = this.now();
+      const parent = idea.variation_of ? this.idea(idea.variation_of) : undefined;
       const r = this.db
         .prepare(
-          `INSERT INTO ideas (study_id, title, rationale, theme, source, priority, pinned, status, start_ref, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
+          `INSERT INTO ideas (study_id, title, rationale, theme, source, priority, pinned, status, start_ref, created_at, updated_at, variation_of)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
         )
-        .run(studyId, idea.title, idea.rationale ?? "", idea.theme ?? "", idea.source, idea.priority ?? 0, idea.pinned ? 1 : 0, idea.start_ref ?? null, t, t);
+        .run(studyId, idea.title, idea.rationale ?? "", idea.theme ?? "", idea.source, idea.priority ?? 0, idea.pinned ? 1 : 0, idea.start_ref ?? null, t, t, parent?.id ?? null);
       const id = Number(r.lastInsertRowid);
-      this.event(studyId, "idea.added", actor, { idea: id, title: idea.title, source: idea.source });
+      // A lineage is the root idea of a chain of explicit variations.
+      this.db.prepare(`UPDATE ideas SET lineage = ? WHERE id = ?`).run(parent ? (parent.lineage ?? parent.id) : id, id);
+      this.event(studyId, "idea.added", actor, { idea: id, title: idea.title, source: idea.source, variation_of: parent?.id ?? null });
       return this.idea(id)!;
     });
+  }
+  setIdeaPinned(id: number, pinned: boolean, actor: string): void {
+    const idea = this.idea(id);
+    if (!idea) return;
+    this.db.prepare(`UPDATE ideas SET pinned = ?, updated_at = ? WHERE id = ?`).run(pinned ? 1 : 0, this.now(), id);
+    this.event(idea.study_id, "idea.pinned", actor, { idea: id, pinned });
   }
   idea(id: number): IdeaRow | undefined {
     return this.db.prepare(`SELECT * FROM ideas WHERE id = ?`).get(id) as IdeaRow | undefined;
@@ -346,13 +395,13 @@ export class Store {
   nextCandidateNumber(studyId: string): number {
     return ((this.db.prepare(`SELECT COALESCE(MAX(n), 0) AS n FROM candidates WHERE study_id = ?`).get(studyId) as { n: number }).n) + 1;
   }
-  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json">): CandidateRow {
+  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json"> & Partial<Pick<CandidateRow, "lines_added" | "lines_deleted">>): CandidateRow {
     const r = this.db
       .prepare(
-        `INSERT INTO candidates (study_id, n, idea_id, thread_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at)
-         VALUES (@study_id, @n, @idea_id, @thread_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at)`,
+        `INSERT INTO candidates (study_id, n, idea_id, thread_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at, lines_added, lines_deleted)
+         VALUES (@study_id, @n, @idea_id, @thread_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at, @lines_added, @lines_deleted)`,
       )
-      .run({ ...row, submitted_at: this.now() });
+      .run({ lines_added: 0, lines_deleted: 0, ...row, submitted_at: this.now() });
     return this.candidate(Number(r.lastInsertRowid))!;
   }
   candidate(id: number): CandidateRow | undefined {
@@ -393,7 +442,42 @@ export class Store {
     ).reverse();
   }
 
+  // ---- bench intervals ----
+  openBenchInterval(row: Omit<BenchIntervalRow, "id" | "started_at" | "ended_at">): number {
+    const r = this.db
+      .prepare(`INSERT INTO bench_intervals (study_id, host_id, lock_key, kind, candidate_id, started_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(row.study_id, row.host_id, row.lock_key, row.kind, row.candidate_id, this.now());
+    return Number(r.lastInsertRowid);
+  }
+  closeBenchInterval(id: number): void {
+    this.db.prepare(`UPDATE bench_intervals SET ended_at = ? WHERE id = ? AND ended_at IS NULL`).run(this.now(), id);
+  }
+  benchIntervals(studyId: string, opts: { since?: number } = {}): BenchIntervalRow[] {
+    return this.db.prepare(`SELECT * FROM bench_intervals WHERE study_id = ? AND COALESCE(ended_at, ?) >= ? ORDER BY started_at, id`).all(studyId, this.now(), opts.since ?? 0) as BenchIntervalRow[];
+  }
+  /** Close intervals left open by a crash (reconcile). */
+  closeOpenBenchIntervals(): number {
+    return this.db.prepare(`UPDATE bench_intervals SET ended_at = started_at WHERE ended_at IS NULL`).run().changes;
+  }
+
+  // ---- notices ----
+  addNotice(studyId: string, kind: string, text: string): number {
+    const r = this.db.prepare(`INSERT INTO notices (study_id, at, kind, text) VALUES (?, ?, ?, ?)`).run(studyId, this.now(), kind, text);
+    return Number(r.lastInsertRowid);
+  }
+  notices(studyId: string, opts: { undelivered?: boolean; limit?: number } = {}): NoticeRow[] {
+    const where = opts.undelivered ? ` AND delivered_round IS NULL` : "";
+    return this.db.prepare(`SELECT * FROM notices WHERE study_id = ?${where} ORDER BY id DESC LIMIT ?`).all(studyId, opts.limit ?? 50) as NoticeRow[];
+  }
+  markNoticesDelivered(ids: number[], round: number): void {
+    const stmt = this.db.prepare(`UPDATE notices SET delivered_round = ? WHERE id = ?`);
+    for (const id of ids) stmt.run(round, id);
+  }
+
   // ---- samples ----
+  samples(candidateId: number): Array<{ run: string; pair: number; side: string; metric: string; value: number; at: number; host_id: string | null }> {
+    return this.db.prepare(`SELECT run, pair, side, metric, value, at, host_id FROM samples WHERE candidate_id = ? ORDER BY id`).all(candidateId) as Array<{ run: string; pair: number; side: string; metric: string; value: number; at: number; host_id: string | null }>;
+  }
   addSample(row: { study_id: string; candidate_id: number | null; run: string; pair: number; side: string; metric: string; value: number; host_id: string | null }): void {
     this.db
       .prepare(`INSERT INTO samples (study_id, candidate_id, run, pair, side, metric, value, host_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)

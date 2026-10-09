@@ -3,7 +3,8 @@
 import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type PluginCliRegistration } from "@get-bb/plugin-sdk";
 import { EngineError, type Engine } from "./engine.ts";
 import { errText } from "./pipeline.ts";
-import { ciText, clip, safeJson } from "./prompts.ts";
+import { ciText, clip, formatDuration, safeJson } from "./prompts.ts";
+import { utilization } from "./views.ts";
 import { formatPct } from "./spec.ts";
 import type { CalibrationReport } from "./calibration.ts";
 
@@ -95,6 +96,21 @@ export function studyCli(engine: Engine): PluginCliRegistration {
         positionals: slugArg,
         run: (input, ctx) => wrap(() => out(engine.resume(input.positionals.slug, guardHuman(engine, ctx)))),
       }),
+      concurrency: cliCommand({
+        summary: "Set a study's max concurrent workers (overrides budget.max_workers; `auto` returns to the spec)",
+        positionals: [
+          { name: "slug", description: "Study slug", required: true },
+          { name: "workers", description: "1-64, or auto", required: true },
+        ] as const,
+        run: (input, ctx) =>
+          wrap(() => {
+            const actor = guardHuman(engine, ctx);
+            const v = input.positionals.workers.trim();
+            const n = v === "auto" ? null : Number(v);
+            if (n !== null && !Number.isInteger(n)) throw new EngineError("workers must be an integer from 1 to 64, or auto");
+            return out(engine.setConcurrency(input.positionals.slug, n, actor));
+          }),
+      }),
       archive: cliCommand({
         summary: "Stop a study for good: stop workers, archive their threads, remove bench checkouts (refs are kept)",
         positionals: slugArg,
@@ -121,6 +137,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           rationale: { type: "string", description: "Why it might help (max 2000 chars)" },
           theme: { type: "string", description: "Theme used for diversity (max 60 chars)" },
           priority: { type: "integer", min: -100, max: 100, default: 0, description: "Higher runs first (-100..100)" },
+          "start-ref": { type: "string", description: 'Start from a candidate, e.g. "c/12"' },
+          "variation-of": { type: "integer", min: 1, max: 1_000_000_000, description: "Id of the idea this varies" },
           "no-pin": { type: "boolean", description: "Don't pin (human ideas are pinned by default)" },
         },
         run: (input, ctx) =>
@@ -128,7 +146,15 @@ export function studyCli(engine: Engine): PluginCliRegistration {
             const actor = guardHuman(engine, ctx, true);
             const idea = engine.addIdea(
               input.positionals.slug,
-              { title: input.positionals.title, rationale: input.options.rationale, theme: input.options.theme, priority: input.options.priority, pinned: !input.options["no-pin"] },
+              {
+                title: input.positionals.title,
+                rationale: input.options.rationale,
+                theme: input.options.theme,
+                priority: input.options.priority,
+                pinned: !input.options["no-pin"],
+                startRef: input.options["start-ref"] ?? null,
+                variationOf: input.options["variation-of"] ?? null,
+              },
               actor,
               actor === "human" || store.threadById(actor)?.role !== "strategist" ? "human" : "strategist",
             );
@@ -158,13 +184,27 @@ export function studyCli(engine: Engine): PluginCliRegistration {
   });
 }
 
+function schedulerLine(engine: Engine, s: ReturnType<Engine["study"]>): string {
+  const t = engine.ctx.store.study(s.id)!;
+  const tEval = engine.pipeline.recentEvalSeconds(t);
+  const tThink = engine.thinkSeconds(t);
+  return `Scheduler: W ${t.target_workers ?? "?"} of max ${engine.maxWorkers(t)}${t.max_workers_override !== null ? " (human override)" : ""} · bench queue ${engine.benchDepth(t.id)} · think ≈ ${tThink === null ? "?" : formatDuration(tThink)} · eval ≈ ${tEval === null ? "?" : formatDuration(tEval)}`;
+}
+
+function utilizationLine(engine: Engine, s: ReturnType<Engine["study"]>): string {
+  const u = utilization(engine, s);
+  const pct = (x: number | null) => (x === null ? "n/a" : `${(x * 100).toFixed(1)}%`);
+  return `Bench: busy ${formatDuration(u.busySeconds)} of ${formatDuration(u.runningSeconds)} running (${pct(u.ratio)}; ${pct(u.steadyRatio)} since the first submission) · overlapping measurements ${u.overlaps}`;
+}
+
 function calibrationText(engine: Engine, slug: string): string {
   const s = engine.study(slug);
   const report = safeJson<CalibrationReport>(s.calibration_json);
   if (s.calibration_status === "running") return "Calibration: running.";
   if (!report) return `Calibration: ${s.calibration_status ?? "not run"}.`;
   if (!report.ok) return `Calibration FAILED (study back in draft):\n${report.problems.map((p) => `- ${clip(p, 600)}`).join("\n")}`;
-  return `Calibration ready (baseline ${report.baselineSha.slice(0, 10)}, oracle ${report.oracleHash}):\n${report.report}\nApprove and start with \`bb study start ${slug}\`.`;
+  const next = s.calibration_approved_at === null ? `\nApprove and start with \`bb study start ${slug}\`.` : "";
+  return `Calibration ${s.calibration_approved_at === null ? "ready" : "approved"} (baseline ${report.baselineSha.slice(0, 10)}, oracle ${report.oracleHash}):\n${report.report}${next}`;
 }
 
 export function showStudy(engine: Engine, slug: string, eventCount: number): string {
@@ -180,6 +220,8 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
     `Repo: ${s.repo_path} (host ${s.host_id}) · study thread ${s.study_thread_id ?? "none"}`,
     `Best: ${s.best_sha?.slice(0, 10) ?? "not set"} (branch studies/${s.slug}/best) · base ${s.base_sha?.slice(0, 10) ?? "?"} · best vs base ${formatPct(engine.cumulative(s))}`,
     `Budget: ${engine.budgetLine(s, spec)} · strategist rounds ${s.rounds}${s.round_in_flight ? " (one in flight)" : ""}`,
+    schedulerLine(engine, s),
+    utilizationLine(engine, s),
     calibrationText(engine, slug),
     "",
   ];
@@ -199,6 +241,11 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
   const workers = store.threads(s.id, { role: "worker", states: ["spawning", "active", "finishing"] });
   lines.push(`Workers: ${workers.length} live`);
   for (const w of workers) lines.push(`  ${w.thread_id ?? "(spawning)"} idea #${w.idea_id} ${w.state} · ${w.submissions} submission(s)`);
+  const notices = store.notices(s.id, { limit: 5 });
+  if (notices.length) {
+    lines.push("Notices:");
+    for (const n of notices) lines.push(`  ${new Date(n.at).toISOString().slice(5, 16)} [${n.kind}]${n.delivered_round === null ? " (new)" : ""} ${clip(n.text.replace(/\s+/gu, " "), 200)}`);
+  }
   const findings = store.findings(s.id, { limit: 5 });
   if (findings.length) {
     lines.push("Recent findings:");

@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { hostname, platform } from "node:os";
 import { join } from "node:path";
 import type {
+  DiffSummary,
   ExecInput,
   ExecResult,
   PrepareInput,
@@ -137,8 +138,13 @@ export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
   }
   const sha = (await git(cwd, ["rev-parse", "HEAD"])).stdout;
   await git(cwd, ["update-ref", input.candidateRef, sha]);
-  const names = await git(cwd, ["diff", "--name-only", "--no-renames", input.baseSha, sha]);
-  const numstat = await git(cwd, ["diff", "--numstat", "--no-renames", input.baseSha, sha]);
+  let forkSha = input.baseSha;
+  if (input.bestSha) {
+    const mb = await git(cwd, ["merge-base", sha, input.bestSha], { allowFail: true });
+    if (mb.code === 0 && mb.stdout) forkSha = mb.stdout;
+  }
+  const names = await git(cwd, ["diff", "--name-only", "--no-renames", forkSha, sha]);
+  const numstat = await git(cwd, ["diff", "--numstat", "--no-renames", forkSha, sha]);
   let linesAdded = 0;
   let linesDeleted = 0;
   for (const line of numstat.stdout.split("\n")) {
@@ -148,6 +154,7 @@ export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
   }
   return {
     sha,
+    forkSha,
     committed,
     changedPaths: names.stdout ? names.stdout.split("\n").filter(Boolean) : [],
     linesAdded,
@@ -185,6 +192,20 @@ export async function rewordCommit(repoPath: string, sha: string, message: strin
   for (const p of parents) args.push("-p", p);
   args.push("-m", message);
   return { sha: (await git(repoPath, args)).stdout };
+}
+
+export async function diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number): Promise<DiffSummary> {
+  const numstat = await git(repoPath, ["diff", "--numstat", "--no-renames", from, to]);
+  const files: DiffSummary["files"] = [];
+  for (const line of numstat.stdout.split("\n")) {
+    const [a, d, ...rest] = line.split("\t");
+    if (!rest.length) continue;
+    files.push({ path: rest.join("\t"), added: a === "-" ? 0 : Number(a) || 0, deleted: d === "-" ? 0 : Number(d) || 0 });
+  }
+  if (maxPatchBytes === 0) return { files: files.slice(0, 500), patch: "", truncated: false };
+  const patch = await git(repoPath, ["diff", "--no-renames", "--no-color", from, to]);
+  const truncated = Buffer.byteLength(patch.stdout) > maxPatchBytes;
+  return { files: files.slice(0, 500), patch: truncated ? patch.stdout.slice(0, maxPatchBytes) : patch.stdout, truncated };
 }
 
 function checkoutRoot(dataDir: string): string {

@@ -14,6 +14,14 @@ function quoted(text: string, max = 600): string {
   return clip(text.replace(/\s+/gu, " ").trim(), max);
 }
 
+/** Seconds as "42 s", "3.5 min", or "2.25 h". */
+export function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "n/a";
+  if (seconds < 120) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} s`;
+  if (seconds < 7200) return `${(seconds / 60).toFixed(1)} min`;
+  return `${(seconds / 3600).toFixed(2)} h`;
+}
+
 export function ciText(c: Pick<CandidateRow, "effect" | "ci_lo" | "ci_hi">): string {
   if (c.effect === null) return "";
   const ci = c.ci_lo !== null && c.ci_hi !== null && c.ci_lo !== c.ci_hi ? ` [${formatPct(c.ci_lo)}, ${formatPct(c.ci_hi)}]` : "";
@@ -74,14 +82,16 @@ export function workerBrief(b: BriefInput): string {
     "## Loop",
     "1. Understand the relevant code. Stay inside the editable scope.",
     "2. Make the change, then run a fast local check (build or a focused test). Do not run long benchmarks.",
-    "3. Call `submit_candidate` with a one-paragraph summary. The plugin commits your worktree for you. Then END YOUR TURN; the verdict arrives later as a message.",
+    "3. Call `study_submit_candidate` with a one-paragraph summary. The plugin commits your worktree for you, rebases it onto the current best, runs the gates, and queues it for the bench. Then END YOUR TURN; the verdict arrives later as a message.",
     "4. Read the verdict. Refine and resubmit, or stop.",
-    `5. Before you stop: call \`record_finding\` (what you learned, why it won or lost, when it is worth revisiting), then \`finish\`. \`finish\` refuses until a finding is recorded.`,
+    `5. Before you stop: call \`study_record_finding\` (what you learned, why it won or lost, when it is worth revisiting), then \`study_finish\`. \`study_finish\` refuses until a finding is recorded.`,
+    "",
+    `Other workers run in parallel on other ideas. When one of them wins, \`studies/${b.study.slug}/best\` moves: your next submission is rebased onto it automatically. Only a CONFLICT verdict needs you to rebase by hand.`,
     "",
     "## Limits",
     `- At most ${spec.agents.max_submissions_per_worker} submissions. One submission in flight at a time.`,
     `- If you go idle without a pending verdict for ${spec.agents.idle_nudge_minutes} min you get one nudge; after ${spec.agents.idle_abandon_minutes} min you are stopped and the idea is marked abandoned.`,
-    "- Ideas you notice but won't pursue: `propose_idea`.",
+    "- Ideas you notice but won't pursue: `study_propose_idea`.",
     "- Do not edit protected paths, the benchmark, or the tests to make numbers look better: those submissions are rejected.",
   );
   return lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
@@ -108,17 +118,22 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
   }
   if (c.gate_output) lines.push("Gate output (tail):", "```", clip(c.gate_output, 2500), "```");
   if (diag.length) lines.push("Diagnostics:", "```", clip(diag.join("\n"), 1500), "```");
-  if (c.verdict === "conflict") lines.push("Best moved and your change no longer applies. Rebase your worktree onto the study's best branch, resolve, and resubmit.");
+  if (c.verdict === "conflict") {
+    const branch = `studies/${opts.spec.study.slug}/best`;
+    lines.push(
+      `Best moved while your candidate waited and your change no longer applies. In your worktree run \`git rebase ${branch}\` (the branch is local; no fetch needed), resolve the conflicts, run your fast local check, and resubmit.`,
+    );
+  }
   lines.push(
     opts.submissionsLeft > 0
-      ? `You have ${opts.submissionsLeft} submission(s) left. Refine and call submit_candidate, or call record_finding then finish.`
-      : "No submissions left: call record_finding, then finish.",
+      ? `You have ${opts.submissionsLeft} submission(s) left. Refine and call study_submit_candidate, or call study_record_finding then study_finish.`
+      : "No submissions left: call study_record_finding, then study_finish.",
   );
   return lines.join("\n");
 }
 
 export function nudgeMessage(minutes: number): string {
-  return `[autoresearch] You have been idle for ${minutes.toFixed(0)} minutes with no submission pending. Either submit_candidate, or record_finding and finish. If you stay idle you will be stopped and the idea marked abandoned.`;
+  return `[autoresearch] You have been idle for ${minutes.toFixed(0)} minutes with no submission pending. Either study_submit_candidate, or study_record_finding and study_finish. If you stay idle you will be stopped and the idea marked abandoned.`;
 }
 
 export interface DigestInput {
@@ -136,6 +151,7 @@ export interface DigestInput {
   cumulative: number | null;
   budgetLine: string;
   ideaTitles: Map<number, string>;
+  notices: Array<{ at: number; kind: string; text: string }>;
 }
 
 const TRIGGER_TEXT: Record<RoundTrigger, string> = {
@@ -159,6 +175,11 @@ export function strategistDigest(d: DigestInput): string {
     `Budget: ${d.budgetLine}`,
     "",
   ];
+  if (d.notices.length) {
+    lines.push(`## Notices for the human (${d.notices.length})`, "Relay these to the human in one or two lines; do not act on them yourself.");
+    for (const n of d.notices.slice(0, 10)) lines.push(`- ${new Date(n.at).toISOString().slice(0, 16).replace("T", " ")} [${n.kind}] ${quoted(n.text, 500)}`);
+    lines.push("");
+  }
   if (d.trigger === "stall") {
     lines.push(`**Stall:** no win in the last ${d.spec.agents.stall_after} verdicts. Propose structurally different directions, not variations of what lost.`, "");
   }
@@ -175,16 +196,19 @@ export function strategistDigest(d: DigestInput): string {
   }
   lines.push("", `## Idea board · ${[...counts].map(([k, v]) => `${k} ${v}`).join(" · ") || "empty"}`);
   for (const i of running) lines.push(`- running #${i.id} ${quoted(i.title, 100)}${i.theme ? ` [${quoted(i.theme, 30)}]` : ""}`);
-  for (const i of queued.slice(0, 15)) lines.push(`- queued #${i.id} p=${i.priority}${i.pinned ? " (pinned)" : ""} ${quoted(i.title, 100)}${i.theme ? ` [${quoted(i.theme, 30)}]` : ""}`);
+  for (const i of queued.slice(0, 15)) lines.push(`- queued #${i.id} p=${i.priority}${i.pinned ? " (pinned)" : ""}${i.variation_of ? ` (variation of #${i.variation_of})` : ""} ${quoted(i.title, 100)}${i.theme ? ` [${quoted(i.theme, 30)}]` : ""}`);
+  const lost = d.ideas.filter((i) => i.status === "lost").slice(-10);
+  for (const i of lost) lines.push(`- lost #${i.id} ${quoted(i.title, 100)}${i.theme ? ` [${quoted(i.theme, 30)}]` : ""}`);
   if (queued.length > 15) lines.push(`- … ${queued.length - 15} more queued`);
   if (d.bestDiag.length) lines.push("", "## Best diagnostics", "```", clip(d.bestDiag.join("\n"), 1200), "```");
-  lines.push("", `## Dossier${d.dossier ? ` (v${d.dossier.version})` : ""}`, d.dossier ? clip(d.dossier.text, 1500) : "empty: write one with update_dossier once you have read the code.");
+  lines.push("", `## Dossier${d.dossier ? ` (v${d.dossier.version})` : ""}`, d.dossier ? clip(d.dossier.text, 1500) : "empty: write one with study_update_dossier once you have read the code.");
   lines.push(
     "",
     "## This round",
-    `- Keep at least ${d.w + 2} ready ideas, diverse across themes: \`queue_ideas\` (title, rationale, theme, priority).`,
-    "- Retire dead directions with `retire_idea`; record what is known in `update_dossier`.",
-    "- `search_findings` searches all findings and verdicts.",
+    `- Keep at least ${d.w + 2} ready ideas, diverse across themes (at most ${Math.ceil(d.w / 2)} workers run one theme at once): \`study_queue_ideas\` (title, rationale, theme, priority, optional start_ref and variation_of).`,
+    "- Lost ideas are not assigned again. To retry one differently, queue a new idea with `variation_of` set to the lost idea's id.",
+    "- Retire dead directions with `study_retire_idea`; record what is known in `study_update_dossier`.",
+    "- `study_search_findings` searches all findings and verdicts.",
     "- You do not edit code, run benchmarks, or decide verdicts. Concurrency, budget, oracle and pausing are human controls.",
     "- Keep your reply short, then end your turn.",
   );

@@ -73,7 +73,7 @@ tolerance = "0%"                 # deterministic: required improvement
 confirm = true                   # noisy: re-measure wins before promotion
 
 [budget]
-max_workers = 1                  # M0 runs one worker at a time
+max_workers = 3                  # W adapts up to this: min(max, ceil(think/eval)+1)
 max_candidates = 50
 max_bench_hours = 8
 deadline = "2026-12-31"          # optional
@@ -93,6 +93,8 @@ Then tell the human, in two or three lines:
 
 1. Review: `bb study show <slug>`
 2. Approve and calibrate: `bb study calibrate <slug>` (gates on base, then A/A noise measurement; prints the detectable effect and cost per evaluation)
-3. Start: `bb study start <slug>`. Seed ideas any time with `bb study ideas add <slug> "<idea>"`.
+3. Start: `bb study start <slug>`. Seed ideas any time with `bb study ideas add <slug> "<idea>"` or on the **Studies** page in the sidebar, which also shows calibration results, the trajectory, and every candidate.
+
+The plugin doesn't start turns in this thread to report calibration: the result is a notice on the Studies page, and it reaches you with the human's next message here.
 
 Never run those commands yourself: approval, calibration, starting, and pausing are the human's decisions.

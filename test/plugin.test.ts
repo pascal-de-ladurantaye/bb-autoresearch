@@ -60,10 +60,10 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
   it("forged worker metadata selects no tools, and tool calls re-check the threads table", async () => {
     const forged = await config("thr_evil", { study: "toy-size", role: "worker", idea: 1, spawnToken: "nope" });
     expect(forged.tools).toEqual([]);
-    const r = await harness.behavior.callAgentTool("submit_candidate", { summary: "sneaky submission here" }, { threadId: "thr_evil" });
+    const r = await harness.behavior.callAgentTool("study_submit_candidate", { summary: "sneaky submission here" }, { threadId: "thr_evil" });
     expect(isError(r)).toBe(true);
     expect(text(r)).toContain("only available to autoresearch worker threads");
-    const q = await harness.behavior.callAgentTool("queue_ideas", { ideas: [{ title: "an idea", rationale: "because reasons", theme: "x" }] }, { threadId: "thr_evil" });
+    const q = await harness.behavior.callAgentTool("study_queue_ideas", { ideas: [{ title: "an idea", rationale: "because reasons", theme: "x" }] }, { threadId: "thr_evil" });
     expect(isError(q)).toBe(true);
   });
 
@@ -81,12 +81,12 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     expect(worker.tools).toEqual([...WORKER_TOOLS].sort());
     expect(worker.skills).toEqual([]);
     // A worker cannot use strategist or creator tools even if it asks.
-    expect(isError(await harness.behavior.callAgentTool("update_dossier", { text: "x".repeat(30) }, { threadId: "thr_w1" }))).toBe(true);
+    expect(isError(await harness.behavior.callAgentTool("study_update_dossier", { text: "x".repeat(30) }, { threadId: "thr_w1" }))).toBe(true);
     expect(text(await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec() }, { threadId: "thr_w1", projectId: "proj_1" }))).toContain("not available to worker threads");
     // Another thread copying the worker's metadata is refused.
     expect((await config("thr_copycat", meta)).tools).toEqual([]);
     // Strategist tools work for the study thread.
-    const queued = await harness.behavior.callAgentTool("queue_ideas", { ideas: [{ title: "Try a trie", rationale: "fewer comparisons", theme: "algo" }] }, { threadId: "thr_study" });
+    const queued = await harness.behavior.callAgentTool("study_queue_ideas", { ideas: [{ title: "Try a trie", rationale: "fewer comparisons", theme: "algo" }] }, { threadId: "thr_study" });
     expect(text(queued)).toContain("Queued 1 idea(s)");
   });
 
@@ -94,14 +94,14 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     await proposeAndRun();
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    const ticket = await harness.behavior.callAgentTool("submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    const ticket = await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
     expect(text(ticket)).toContain("Submitted as c/1");
     for (let i = 0; i < 20 && !port.sent.some((m) => m.threadId === "thr_w1"); i++) await new Promise((r) => setTimeout(r, 5));
     expect(port.sent.find((m) => m.threadId === "thr_w1")?.text).toContain("WIN");
-    const early = await harness.behavior.callAgentTool("finish", {}, { threadId: "thr_w1" });
+    const early = await harness.behavior.callAgentTool("study_finish", {}, { threadId: "thr_w1" });
     expect(isError(early)).toBe(true);
-    await harness.behavior.callAgentTool("record_finding", { outcome: "improved", learned: "Whitespace was 20% of output." }, { threadId: "thr_w1" });
-    expect(text(await harness.behavior.callAgentTool("finish", {}, { threadId: "thr_w1" }))).toContain("Assignment finished");
+    await harness.behavior.callAgentTool("study_record_finding", { outcome: "improved", learned: "Whitespace was 20% of output." }, { threadId: "thr_w1" });
+    expect(text(await harness.behavior.callAgentTool("study_finish", {}, { threadId: "thr_w1" }))).toContain("Assignment finished");
     const show = await harness.behavior.runCli(["show", "toy-size"]);
     expect(show.stdout).toContain("c/1 idea #1 decided win +20.00%");
     expect(show.stdout).toContain("best vs base +20.00%");

@@ -5,9 +5,9 @@ import { randomUUID } from "node:crypto";
 import { recordCalibration, runCalibration, type CalibrationReport } from "./calibration.ts";
 import type { Ctx } from "./context.ts";
 import type { CandidateRow, IdeaRow, StudyRow, ThreadRow } from "./db/store.ts";
-import { errText, Pipeline } from "./pipeline.ts";
-import { clip, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
-import { budgetExhausted, idleAction, pickIdea, roundTrigger, targetWorkers, type RoundTrigger } from "./scheduler.ts";
+import { BENCH_BOUND_STAGES, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
+import { clip, formatDuration, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
+import { budgetExhausted, idleAction, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
 
 export type Role = "worker" | "strategist" | "creator";
@@ -24,12 +24,15 @@ const LIVE_WORKER_STATES = ["spawning", "active", "finishing"] as const;
 export class Engine {
   readonly pipeline: Pipeline;
   private currentTick: Promise<void> | null = null;
+  private tickAgain = false;
   private calibrations = new Map<string, Promise<void>>();
 
   constructor(readonly ctx: Ctx) {
     this.pipeline = new Pipeline(ctx, {
       onDecided: (c) => this.onDecided(c),
       systemPause: (study, reason) => this.systemPause(study.id, reason),
+      maxWorkers: (study) => this.maxWorkers(study),
+      bestMoved: (study, winner, promoted) => void this.notifyBestMoved(study, winner, promoted).catch((e) => this.ctx.bb.log("warn", `best-moved notice: ${errText(e)}`)),
     });
   }
 
@@ -159,7 +162,7 @@ export class Engine {
         const report = await runCalibration(this.ctx, this.pipeline, studyId);
         const study = this.store.study(studyId)!;
         await recordCalibration(this.ctx, study, report);
-        await this.notifyStudyThread(studyId, calibrationNotice(this.store.study(studyId)!, report));
+        await this.notify(studyId, report.ok ? "calibration.ready" : "calibration.failed", calibrationNotice(this.store.study(studyId)!, report));
       } catch (e) {
         this.ctx.bb.log("error", `calibration failed: ${errText(e)}`);
         this.store.tx(() => {
@@ -201,7 +204,29 @@ export class Engine {
       if (t && t.status === "idle") await this.ctx.bb.stop(study.study_thread_id).catch(() => undefined);
     }
     this.kick();
-    return `${slug} is running. Workers spawn one at a time (M0: W=1); the study thread gets strategist rounds.`;
+    const spec = this.store.spec(study);
+    return `${slug} is running with up to ${this.maxWorkers(this.store.study(study.id)!)} worker(s) (max_workers ${spec.budget.max_workers}; W adapts to think and eval times). The study thread gets strategist rounds.`;
+  }
+
+  /** Human control: override max_workers (null returns to the spec's value). */
+  setConcurrency(slug: string, maxWorkers: number | null, actor: string): string {
+    const study = this.study(slug);
+    if (study.state === "archived") throw new EngineError(`${slug} is archived`);
+    if (maxWorkers !== null && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 64)) throw new EngineError("concurrency must be an integer from 1 to 64");
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, { max_workers_override: maxWorkers });
+      this.store.event(study.id, "study.concurrency", actor, { max_workers: maxWorkers });
+    });
+    this.publish(study.id);
+    this.kick();
+    const spec = this.store.spec(study);
+    return maxWorkers === null ? `${slug}: max workers back to the spec's ${spec.budget.max_workers}.` : `${slug}: max workers set to ${maxWorkers}. Running workers above the limit finish their current idea.`;
+  }
+
+  /** Effective max_workers: the human override, else the spec. */
+  maxWorkers(study: StudyRow): number {
+    const spec = this.store.spec(study);
+    return Math.min(this.ctx.config.workerCeiling, study.max_workers_override ?? spec.budget.max_workers);
   }
 
   pause(slug: string, actor: string, reason = "paused by human"): string {
@@ -244,12 +269,71 @@ export class Engine {
     return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
   }
 
-  addIdea(slug: string, idea: { title: string; rationale?: string; theme?: string; priority?: number; pinned?: boolean; startRef?: string | null }, actor: string, source: IdeaRow["source"] = "human"): IdeaRow {
+  addIdea(slug: string, idea: { title: string; rationale?: string; theme?: string; priority?: number; pinned?: boolean; startRef?: string | null; variationOf?: number | null }, actor: string, source: IdeaRow["source"] = "human"): IdeaRow {
     const study = this.study(slug);
     if (study.state === "archived") throw new EngineError(`${slug} is archived`);
-    const row = this.store.addIdea(study.id, { title: clip(idea.title.trim(), 200), rationale: clip(idea.rationale ?? "", 2000), theme: clip(idea.theme ?? "", 60), source, priority: idea.priority ?? 0, pinned: idea.pinned ?? source === "human", start_ref: idea.startRef ?? null }, actor);
+    const title = idea.title.trim();
+    if (title.length < 3) throw new EngineError("idea title is too short");
+    const startRef = this.normalizeStartRef(study, idea.startRef ?? null);
+    const variationOf = this.resolveVariation(study, idea.variationOf ?? null, startRef);
+    const row = this.store.addIdea(study.id, { title: clip(title, 200), rationale: clip(idea.rationale ?? "", 2000), theme: clip(idea.theme ?? "", 60), source, priority: idea.priority ?? 0, pinned: idea.pinned ?? source === "human", start_ref: startRef, variation_of: variationOf }, actor);
+    this.publish(study.id);
     this.kick();
     return row;
+  }
+
+  /** `c/12` or `refs/studies/<slug>/c/12` → `c/12`, checked against the study's candidates. */
+  private normalizeStartRef(study: StudyRow, ref: string | null): string | null {
+    if (!ref) return null;
+    const m = /^(?:refs\/studies\/[a-z0-9-]+\/)?c\/(\d+)$/u.exec(ref.trim());
+    if (!m) throw new EngineError(`start_ref ${JSON.stringify(ref)}: use a candidate like "c/12"`);
+    if (!this.store.candidateByN(study.id, Number(m[1]))) throw new EngineError(`start_ref c/${m[1]}: no such candidate`);
+    return `c/${m[1]}`;
+  }
+
+  /** Explicit variation, or implicitly the idea of the candidate an idea starts from. */
+  private resolveVariation(study: StudyRow, variationOf: number | null, startRef: string | null): number | null {
+    if (variationOf !== null) {
+      const parent = this.store.idea(variationOf);
+      if (!parent || parent.study_id !== study.id) throw new EngineError(`variation_of #${variationOf}: no such idea`);
+      return parent.id;
+    }
+    if (startRef) return this.store.candidateByN(study.id, Number(startRef.slice(2)))?.idea_id ?? null;
+    return null;
+  }
+
+  private lostTitles(studyId: string): Set<string> {
+    return new Set(this.store.ideas(studyId, ["lost"]).map((i) => titleKey(i.title)));
+  }
+
+  /** Human control on the Ideas board: priority and pin. */
+  updateIdea(slug: string, id: number, patch: { priority?: number; pinned?: boolean }, actor: string): IdeaRow {
+    const study = this.study(slug);
+    const idea = this.store.idea(id);
+    if (!idea || idea.study_id !== study.id) throw new EngineError(`idea #${id} not found`);
+    if (patch.priority !== undefined) this.store.setIdeaPriority(id, Math.max(-100, Math.min(100, patch.priority)), actor);
+    if (patch.pinned !== undefined) this.store.setIdeaPinned(id, patch.pinned, actor);
+    this.publish(study.id);
+    this.kick();
+    return this.store.idea(id)!;
+  }
+
+  /** Human control: put queued ideas in this order (first runs first). */
+  reorderIdeas(slug: string, ids: number[], actor: string): void {
+    const study = this.study(slug);
+    const valid = ids.filter((id) => this.store.idea(id)?.study_id === study.id).slice(0, 200);
+    this.store.tx(() => valid.forEach((id, i) => this.store.setIdeaPriority(id, Math.max(-100, 100 - i), actor)));
+    this.publish(study.id);
+  }
+
+  /** Human veto: a queued idea is retired and never assigned. */
+  vetoIdea(slug: string, id: number, reason: string, actor: string): void {
+    const study = this.study(slug);
+    const idea = this.store.idea(id);
+    if (!idea || idea.study_id !== study.id) throw new EngineError(`idea #${id} not found`);
+    if (idea.status !== "queued") throw new EngineError(`idea #${id} is ${idea.status}; only queued ideas can be vetoed`);
+    this.store.setIdeaStatus(id, "retired", actor, clip(`vetoed by the human${reason ? `: ${reason}` : ""}`, 500));
+    this.publish(study.id);
   }
 
   // -------------------------------------------------------- worker tools
@@ -287,7 +371,7 @@ export class Engine {
         },
         threadId,
       );
-      return `Finding #${f.id} recorded. Call finish when you are done, or keep refining.`;
+      return `Finding #${f.id} recorded. Call study_finish when you are done, or keep refining.`;
     });
   }
 
@@ -300,12 +384,12 @@ export class Engine {
   async finish(threadId: string): Promise<string> {
     const { study, row } = await this.requireRole(threadId, "worker");
     if (!this.store.findings(study!.id, { threadId, limit: 1 }).length) {
-      throw new EngineError("finish refuses until you call record_finding: what you learned, why it won or lost, when it is worth revisiting.");
+      throw new EngineError("study_finish refuses until you call study_record_finding: what you learned, why it won or lost, when it is worth revisiting.");
     }
     const pending = this.store.candidates(study!.id, { threadId }).find((c) => c.stage !== "decided");
     if (pending) throw new EngineError(`c/${pending.n} is still being evaluated. End your turn and wait for its verdict before finishing.`);
     this.store.tx(() => {
-      this.store.updateThread(row!.id, { state: "finishing", end_reason: "finished" });
+      this.store.updateThread(row!.id, { state: "finishing", end_reason: "finished", finishing_at: this.ctx.now() });
       if (row!.idea_id !== null) {
         const won = this.store.candidates(study!.id, { threadId }).some((c) => c.verdict === "win");
         this.store.setIdeaStatus(row!.idea_id, won ? "won" : "lost", threadId);
@@ -327,7 +411,7 @@ export class Engine {
     }
     const runner = this.ctx.bb.hostRunner(study!.host_id!);
     const started = this.ctx.now();
-    const out = await this.ctx.benchLock.run(study!.host_id!, async () => {
+    const out = await withBench(this.ctx, study!, "profile", null, async () => {
       const dir = await runner.checkout(study!.repo_path!, `${study!.slug}-profile`, sha);
       if (spec.oracle.build) await runner.exec({ cwd: dir, command: spec.oracle.build, timeoutMs: spec.oracle.timeout_minutes * 60_000 });
       return await runner.exec({ cwd: dir, command: spec.oracle.profile!, timeoutMs: spec.oracle.timeout_minutes * 60_000, tailBytes: 8000 });
@@ -335,24 +419,36 @@ export class Engine {
     const seconds = (this.ctx.now() - started) / 1000;
     this.store.addBenchSeconds(study!.id, seconds);
     this.store.event(study!.id, "profile.ran", threadId, { target, sha, seconds });
-    return clip(`Profile of ${target} ${sha.slice(0, 10)} (exit ${out.exitCode}, ${seconds.toFixed(1)} s of bench time):\n${out.stdout}\n${out.stderr}`.trim(), 8000);
+    return clip(`Profile of ${target} ${sha.slice(0, 10)} (exit ${out.exitCode}, ${formatDuration(seconds)} of bench time):\n${out.stdout}\n${out.stderr}`.trim(), 8000);
   }
 
   // ---------------------------------------------------- strategist tools
 
-  async queueIdeas(threadId: string, args: { ideas: Array<{ title: string; rationale: string; theme: string; priority?: number; start_ref?: string }>; reorder?: Array<{ id: number; priority: number }> }): Promise<string> {
+  async queueIdeas(threadId: string, args: { ideas: Array<{ title: string; rationale: string; theme: string; priority?: number; start_ref?: string; variation_of?: number }>; reorder?: Array<{ id: number; priority: number }> }): Promise<string> {
     const { study } = await this.requireRole(threadId, "strategist");
     const added: number[] = [];
+    const skipped: string[] = [];
+    const lost = this.lostTitles(study!.id);
     for (const i of args.ideas) {
-      if (i.start_ref && !/^(c\/\d+|refs\/studies\/[a-z0-9-]+\/c\/\d+)$/u.test(i.start_ref)) throw new EngineError(`start_ref ${JSON.stringify(i.start_ref)}: use a candidate like "c/12"`);
-      added.push(this.store.addIdea(study!.id, { title: clip(i.title, 200), rationale: clip(i.rationale, 2000), theme: clip(i.theme, 60), source: "strategist", priority: i.priority ?? 0, start_ref: i.start_ref ?? null }, threadId).id);
+      const startRef = this.normalizeStartRef(study!, i.start_ref ?? null);
+      const variationOf = this.resolveVariation(study!, i.variation_of ?? null, startRef);
+      if (repeatsLostIdea({ title: i.title, source: "strategist", variation_of: variationOf }, lost)) {
+        const prior = this.store.ideas(study!.id, ["lost"]).find((x) => titleKey(x.title) === titleKey(i.title));
+        skipped.push(`"${clip(i.title, 80)}" repeats lost idea #${prior?.id ?? "?"}; queue it with variation_of=${prior?.id ?? "<id>"} and say what is different`);
+        continue;
+      }
+      added.push(this.store.addIdea(study!.id, { title: clip(i.title, 200), rationale: clip(i.rationale, 2000), theme: clip(i.theme, 60), source: "strategist", priority: i.priority ?? 0, start_ref: startRef, variation_of: variationOf }, threadId).id);
     }
     for (const r of args.reorder ?? []) {
       const idea = this.store.idea(r.id);
       if (idea && idea.study_id === study!.id) this.store.setIdeaPriority(r.id, r.priority, threadId);
     }
+    this.publish(study!.id);
     this.kick();
-    return `Queued ${added.length} idea(s)${added.length ? ` (#${added.join(", #")})` : ""}${args.reorder?.length ? `, reprioritized ${args.reorder.length}` : ""}. Ready ideas: ${this.store.ideas(study!.id, ["queued"]).length}.`;
+    return [
+      `Queued ${added.length} idea(s)${added.length ? ` (#${added.join(", #")})` : ""}${args.reorder?.length ? `, reprioritized ${args.reorder.length}` : ""}. Ready ideas: ${this.store.ideas(study!.id, ["queued"]).length}.`,
+      ...skipped.map((x) => `Skipped: ${x}.`),
+    ].join("\n");
   }
 
   async retireIdea(threadId: string, id: number, reason: string): Promise<string> {
@@ -361,6 +457,7 @@ export class Engine {
     if (!idea || idea.study_id !== study!.id) throw new EngineError(`idea #${id} not found`);
     if (idea.status !== "queued") throw new EngineError(`idea #${id} is ${idea.status}; only queued ideas can be retired`);
     this.store.setIdeaStatus(id, "retired", threadId, clip(reason, 500));
+    this.publish(study!.id);
     return `Idea #${id} retired.`;
   }
 
@@ -415,10 +512,23 @@ export class Engine {
       return;
     }
     const study = this.store.study(row.study_id);
+    if (study && !study.round_in_flight && ["draft", "calibrating"].includes(study.state)) {
+      // Before Running there are no rounds: pending notices (calibration results) ride the human's own turn.
+      void this.steerNotices(study, threadId).catch((e) => this.ctx.bb.log("warn", `notices: ${errText(e)}`));
+      return;
+    }
     if (!study || study.round_in_flight || !["running", "paused"].includes(study.state)) return;
     // A turn we didn't start: the human sent a message. Treat it as a round
     // and steer the current digest into it if anything changed.
     void this.sendRound(study, "human").catch((e) => this.ctx.bb.log("warn", `human round: ${errText(e)}`));
+  }
+
+  private async steerNotices(study: StudyRow, threadId: string): Promise<void> {
+    const notices = this.store.notices(study.id, { undelivered: true, limit: 10 }).reverse();
+    if (!notices.length) return;
+    this.store.markNoticesDelivered(notices.map((n) => n.id), 0);
+    const text = [`[autoresearch] Notices for study \`${study.slug}\` (for the human; relay briefly):`, ...notices.map((n) => `- [${n.kind}] ${clip(n.text, 1500)}`)].join("\n");
+    await this.ctx.bb.steer(threadId, text).catch(() => this.ctx.bb.send(threadId, text));
   }
 
   onThreadFailed(threadId: string): void {
@@ -454,23 +564,29 @@ export class Engine {
     void this.tick().catch((e) => this.ctx.bb.log("error", `tick: ${errText(e)}`));
   }
 
-  /** One control-loop pass over running studies. Concurrent callers share one pass. */
+  /** One control-loop pass over running studies. Concurrent callers share one pass; a kick during a pass runs another. */
   tick(): Promise<void> {
-    if (this.currentTick) return this.currentTick;
+    if (this.currentTick) {
+      this.tickAgain = true;
+      return this.currentTick;
+    }
     this.currentTick = (async () => {
       await Promise.resolve(); // let the assignment land before any synchronous finally
       try {
-        for (const study of this.store.studies(["running", "paused"])) {
-          try {
-            await this.tickStudy(study.id);
-          } catch (e) {
-            this.ctx.bb.log("warn", `study ${study.slug}: ${errText(e)}`);
+        do {
+          this.tickAgain = false;
+          for (const study of this.store.studies(["running", "paused"])) {
+            try {
+              await this.tickStudy(study.id);
+            } catch (e) {
+              this.ctx.bb.log("warn", `study ${study.slug}: ${errText(e)}`);
+            }
           }
-        }
+        } while (this.tickAgain);
       } finally {
         this.currentTick = null;
       }
-      await this.pipeline.pump();
+      this.pipeline.kick();
     })();
     return this.currentTick;
   }
@@ -483,18 +599,43 @@ export class Engine {
     }
   }
 
-  private workerTarget(study: StudyRow, spec: StudySpec): number {
-    const seg = this.store.segment(study.id, study.segment);
-    const decided = this.store.candidates(study.id, { stages: ["decided"], order: "desc", limit: 20 }).filter((c) => c.bench_seconds > 0);
-    const tEval = decided.length ? decided.reduce((a, c) => a + c.bench_seconds, 0) / decided.length : (seg?.eval_seconds ?? null);
-    const workers = this.store.threads(study.id, { role: "worker" }).slice(-20);
-    const thinks: number[] = [];
+  /** Recent think samples: from spawn (or the previous verdict) to each submission. */
+  private thinkSamples(study: StudyRow): ThinkSample[] {
+    const workers = this.store.threads(study.id, { role: "worker" }).slice(-30);
+    const out: ThinkSample[] = [];
     for (const w of workers) {
-      const first = w.thread_id ? this.store.candidates(study.id, { threadId: w.thread_id, limit: 1 })[0] : undefined;
-      if (first) thinks.push((first.submitted_at - w.spawned_at) / 1000);
+      if (!w.thread_id) continue;
+      let startedAt = w.spawned_at;
+      for (const c of this.store.candidates(study.id, { threadId: w.thread_id })) {
+        out.push({ startedAt, submittedAt: c.submitted_at });
+        startedAt = c.reported_at ?? c.decided_at ?? c.submitted_at;
+      }
     }
-    const tThink = thinks.length ? thinks.reduce((a, b) => a + b, 0) / thinks.length : null;
-    return targetWorkers({ maxWorkers: spec.budget.max_workers, tThink, tEval, ceiling: this.ctx.config.workerCeiling });
+    return out.sort((a, b) => a.submittedAt - b.submittedAt).slice(-20);
+  }
+
+  /** Mean seconds from spawn (or the previous verdict) to a submission; null until learned. */
+  thinkSeconds(study: StudyRow): number | null {
+    return meanThinkSeconds(this.thinkSamples(study));
+  }
+
+  /** Adaptive W, learned from think and eval times; records changes as events. */
+  workerTarget(study: StudyRow): { w: number; tThink: number | null; tEval: number | null } {
+    const tEval = this.pipeline.recentEvalSeconds(study);
+    const tThink = this.thinkSeconds(study);
+    const w = targetWorkers({ maxWorkers: this.maxWorkers(study), tThink, tEval, ceiling: this.ctx.config.workerCeiling });
+    if (study.target_workers !== w) {
+      this.store.tx(() => {
+        this.store.updateStudy(study.id, { target_workers: w });
+        this.store.event(study.id, "scheduler.target", "plugin", { w, t_think: tThink, t_eval: tEval, max_workers: this.maxWorkers(study) });
+      });
+    }
+    return { w, tThink, tEval };
+  }
+
+  /** Candidates gating, queued, or on the bench: the backpressure signal. */
+  benchDepth(studyId: string): number {
+    return this.store.candidates(studyId, { stages: [...BENCH_BOUND_STAGES] }).length;
   }
 
   private async tickStudy(studyId: string): Promise<void> {
@@ -503,10 +644,11 @@ export class Engine {
     const now = this.ctx.now();
     const workers = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] });
 
-    // Finishing workers whose turn already ended (missed idle event).
+    // Finishing workers whose turn already ended (missed idle event), or that never end their turn.
     for (const w of workers.filter((x) => x.state === "finishing" && x.thread_id)) {
       const t = await this.ctx.bb.getThread(w.thread_id!).catch(() => null);
-      if (!t || t.status === "idle" || t.status === "error" || t.archivedAt) await this.endWorker(w, "finished", "finished");
+      const overdue = w.finishing_at !== null && now - w.finishing_at > this.ctx.config.finishingTimeoutMs;
+      if (!t || t.status === "idle" || t.status === "error" || t.archivedAt || overdue) await this.endWorker(w, "finished", overdue ? "finished (turn did not end; stopped)" : "finished");
     }
 
     // Idle nudge, then abandon.
@@ -529,25 +671,32 @@ export class Engine {
       }
     }
 
-    if (study.state !== "running") return;
-    const w = this.workerTarget(study, spec);
-    const live = this.store.threads(study.id, { role: "worker", states: ["spawning", "active"] });
-    const inFlight = this.store.candidates(study.id, { stages: ["submitted", "gating", "queued", "measuring", "confirming", "promoting"] });
-    const exhausted = budgetExhausted({
-      candidates: this.store.candidateCount(study.id),
-      maxCandidates: spec.budget.max_candidates,
-      benchSeconds: this.store.budget(study).bench_seconds,
-      maxBenchHours: spec.budget.max_bench_hours,
-      deadline: spec.budget.deadline,
-      now,
-    });
-    if (exhausted) {
-      if (!live.length && !inFlight.length) await this.systemPause(study.id, `budget exhausted: ${exhausted}. Harvest arrives in M3; review results with \`bb study show ${study.slug}\`.`);
-    } else if (live.length < w && inFlight.length < w) {
-      const queued = this.store.ideas(study.id, ["queued"]);
-      const running = this.store.ideas(study.id, ["running"]);
-      const idea = pickIdea(queued, running, w);
-      if (idea) await this.spawnWorker(study, spec, idea);
+    const { w } = this.workerTarget(this.store.study(study.id)!);
+    if (study.state === "running") {
+      const exhausted = budgetExhausted({
+        candidates: this.store.candidateCount(study.id),
+        maxCandidates: spec.budget.max_candidates,
+        benchSeconds: this.store.budget(study).bench_seconds,
+        maxBenchHours: spec.budget.max_bench_hours,
+        deadline: spec.budget.deadline,
+        now,
+      });
+      // Finishing workers still count: a new worker never starts while the previous one is wrapping up.
+      const live = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length;
+      if (exhausted) {
+        const inFlight = this.store.candidates(study.id, { stages: [...IN_FLIGHT_STAGES] });
+        if (!live && !inFlight.length) await this.systemPause(study.id, `budget exhausted: ${exhausted}. Harvest arrives in M3; review results with \`bb study show ${study.slug}\`.`);
+      } else {
+        let slots = spawnSlots({ live, w, benchDepth: this.benchDepth(study.id), candidates: this.store.candidateCount(study.id), maxCandidates: spec.budget.max_candidates });
+        const lostTitles = this.lostTitles(study.id);
+        while (slots-- > 0) {
+          const fresh = this.store.study(study.id)!;
+          if (fresh.state !== "running") break;
+          const idea = pickIdea(this.store.ideas(study.id, ["queued"]), this.store.ideas(study.id, ["running"]), w, { lostTitles });
+          if (!idea) break;
+          if (!(await this.spawnWorker(fresh, spec, idea))) break;
+        }
+      }
     }
 
     // Strategist rounds.
@@ -572,7 +721,8 @@ export class Engine {
     if (trigger && fresh.study_thread_id) await this.sendRound(fresh, trigger);
   }
 
-  private async spawnWorker(study: StudyRow, spec: StudySpec, idea: IdeaRow): Promise<void> {
+  /** Spawn one worker for `idea`; false when the spawn failed (the study is paused). */
+  private async spawnWorker(study: StudyRow, spec: StudySpec, idea: IdeaRow): Promise<boolean> {
     const runner = this.ctx.bb.hostRunner(study.host_id!);
     let baseBranch = bestBranch(study.slug);
     let forkSha = study.best_sha!;
@@ -627,8 +777,9 @@ export class Engine {
         state: current.state === "spawning" ? "active" : current.state,
         last_active_at: this.ctx.now(),
       });
-      this.store.event(study.id, "worker.spawned", "plugin", { thread: spawned.threadId, idea: idea.id, base: baseBranch });
+      this.store.event(study.id, "worker.spawned", "plugin", { thread: spawned.threadId, idea: idea.id, base: baseBranch, theme: idea.theme });
       this.publish(study.id);
+      return true;
     } catch (e) {
       this.store.tx(() => {
         this.store.updateThread(row.id, { state: "failed", ended_at: this.ctx.now(), end_reason: clip(errText(e), 300) });
@@ -636,6 +787,7 @@ export class Engine {
         this.store.event(study.id, "worker.spawn_failed", "plugin", { idea: idea.id, error: clip(errText(e), 500) });
       });
       await this.systemPause(study.id, `could not spawn a worker: ${clip(errText(e), 300)}`);
+      return false;
     }
   }
 
@@ -661,14 +813,18 @@ export class Engine {
       }
       this.store.event(w.study_id, `worker.${state}`, "plugin", { thread: fresh.thread_id, idea: fresh.idea_id, reason });
     });
+    // The spawn response can omit the environment (it provisions asynchronously),
+    // and only a submission resolves it otherwise: look it up before archiving.
+    let environmentId = fresh.environment_id;
+    if (!environmentId && fresh.thread_id) environmentId = (await this.ctx.bb.getThread(fresh.thread_id).catch(() => null))?.environmentId ?? null;
     if (fresh.thread_id) {
       await this.ctx.bb.archive(fresh.thread_id).catch((e) => this.ctx.bb.log("warn", `archive ${fresh.thread_id}: ${errText(e)}`));
       await this.ctx.bb.stop(fresh.thread_id).catch(() => undefined);
     }
-    if (fresh.environment_id) {
+    if (environmentId) {
       // Remove the worktree, then the worker's branch. Candidate refs keep its commits.
-      const env = await this.ctx.bb.getEnvironment(fresh.environment_id).catch(() => null);
-      await this.ctx.bb.releaseEnvironment(fresh.environment_id).catch((e) => this.ctx.bb.log("warn", `release env: ${errText(e)}`));
+      const env = await this.ctx.bb.getEnvironment(environmentId).catch(() => null);
+      await this.ctx.bb.releaseEnvironment(environmentId).catch((e) => this.ctx.bb.log("warn", `release env: ${errText(e)}`));
       const study = this.store.study(w.study_id);
       if (env?.branchName && study?.repo_path && env.hostId === study.host_id) {
         await this.ctx.bb.hostRunner(env.hostId).deleteRef(study.repo_path, `refs/heads/${env.branchName}`).catch(() => undefined);
@@ -682,13 +838,47 @@ export class Engine {
     this.kick();
   }
 
+  /**
+   * Best moved: tell the other live workers without starting turns. A worker
+   * mid-turn gets the notice steered into that turn; one that is idle or
+   * waiting gets it prepended to the next plugin message it receives (verdict
+   * or submission ticket). Their next submission is rebased automatically.
+   */
+  private async notifyBestMoved(study: StudyRow, winner: CandidateRow, promoted: string): Promise<void> {
+    const text = `[autoresearch] FYI: best moved to ${promoted.slice(0, 10)} (c/${winner.n}, ${formatPct(winner.effect)}). Your next submission is rebased onto it automatically; only a CONFLICT verdict needs you to \`git rebase studies/${study.slug}/best\`.`;
+    for (const w of this.store.threads(study.id, { role: "worker", states: ["active"] })) {
+      if (!w.thread_id || w.thread_id === winner.thread_id) continue;
+      const pending = this.store.candidates(study.id, { threadId: w.thread_id }).some((c) => c.stage !== "decided");
+      let via: "steer" | "deferred" = "deferred";
+      if (!pending) {
+        const t = await this.ctx.bb.getThread(w.thread_id).catch(() => null);
+        if (t?.status === "active") {
+          try {
+            await this.ctx.bb.steer(w.thread_id, text);
+            via = "steer";
+          } catch {
+            via = "deferred";
+          }
+        }
+      }
+      if (via === "deferred") {
+        const cur = this.store.threadRow(w.id)!;
+        // Only the latest best matters; replace an older notice.
+        this.store.updateThread(w.id, { pending_notice: text });
+        void cur;
+      }
+      this.store.event(study.id, "worker.notified", "plugin", { thread: w.thread_id, via, best: promoted });
+    }
+  }
+
   private async sendRound(study: StudyRow, trigger: RoundTrigger): Promise<void> {
     if (!study.study_thread_id) return;
     const spec = this.store.spec(study);
     const since = study.last_round_at ?? 0;
     const verdicts = this.store.decided(study.id, 200).filter((c) => (c.decided_at ?? 0) > since);
     const findings = this.store.findings(study.id, { limit: 50 }).filter((f) => f.created_at > since);
-    if (trigger === "human" && !verdicts.length && !findings.length && study.rounds > 0) {
+    const notices = this.store.notices(study.id, { undelivered: true, limit: 20 }).reverse();
+    if (trigger === "human" && !verdicts.length && !findings.length && !notices.length && study.rounds > 0) {
       // Nothing new to tell; still hold the round slot until the turn ends.
       this.store.updateStudy(study.id, { round_in_flight: 1, last_round_at: study.last_round_at });
       return;
@@ -701,7 +891,7 @@ export class Engine {
       spec,
       trigger,
       round: study.rounds + 1,
-      w: this.workerTarget(study, spec),
+      w: this.workerTarget(study).w,
       verdicts,
       findings,
       ideas,
@@ -711,6 +901,7 @@ export class Engine {
       cumulative: this.cumulative(study),
       budgetLine: this.budgetLine(study, spec),
       ideaTitles: titles,
+      notices,
     });
     this.store.tx(() => {
       this.store.updateStudy(study.id, {
@@ -721,7 +912,8 @@ export class Engine {
         last_round_event_id: this.store.lastEventId(),
         ...(trigger === "stall" ? { stall_signaled_at_verdict: total } : {}),
       });
-      this.store.event(study.id, "strategist.round", "plugin", { round: study.rounds + 1, trigger, verdicts: verdicts.length, findings: findings.length });
+      this.store.markNoticesDelivered(notices.map((n) => n.id), study.rounds + 1);
+      this.store.event(study.id, "strategist.round", "plugin", { round: study.rounds + 1, trigger, verdicts: verdicts.length, findings: findings.length, notices: notices.length });
     });
     try {
       await this.ctx.bb.send(study.study_thread_id, digest);
@@ -731,17 +923,20 @@ export class Engine {
     }
   }
 
-  /** Milestones reach the human through the study thread. */
-  private async notifyStudyThread(studyId: string, text: string): Promise<void> {
+  /**
+   * Milestones for the human, without starting an agent turn: recorded as a
+   * notice (study page, header badge, `bb study show`), the study thread is
+   * marked unread, and the notice rides along in the next strategist round.
+   */
+  async notify(studyId: string, kind: string, text: string): Promise<void> {
     const study = this.store.study(studyId);
-    if (!study?.study_thread_id) return;
-    this.store.updateStudy(studyId, { round_in_flight: 1, last_round_at: this.ctx.now() });
-    try {
-      await this.ctx.bb.send(study.study_thread_id, text);
-    } catch (e) {
-      this.store.updateStudy(studyId, { round_in_flight: 0 });
-      this.ctx.bb.log("warn", `notify study thread: ${errText(e)}`);
-    }
+    if (!study) return;
+    this.store.tx(() => {
+      const id = this.store.addNotice(studyId, kind, clip(text, 4000));
+      this.store.event(studyId, "notice.added", "plugin", { notice: id, kind });
+    });
+    this.publish(studyId);
+    if (study.study_thread_id) await this.ctx.bb.markUnread(study.study_thread_id).catch((e) => this.ctx.bb.log("warn", `mark unread: ${errText(e)}`));
   }
 
   async systemPause(studyId: string, reason: string): Promise<void> {
@@ -749,7 +944,7 @@ export class Engine {
     if (!study || study.state !== "running") return;
     this.store.setStudyState(studyId, "paused", "plugin", { reason, system: true });
     this.publish(studyId);
-    await this.notifyStudyThread(studyId, `[autoresearch] Study \`${study.slug}\` paused by the system: ${reason}\nThe human decides what happens next (\`bb study resume ${study.slug}\`). Reply briefly; do not try to fix the oracle yourself.`);
+    await this.notify(studyId, "study.paused", `Study \`${study.slug}\` paused by the system: ${reason}. The human decides what happens next (\`bb study resume ${study.slug}\`).`);
   }
 
   cumulative(study: StudyRow): number | null {
@@ -761,7 +956,7 @@ export class Engine {
 
   budgetLine(study: StudyRow, spec: StudySpec): string {
     const b = this.store.budget(study);
-    return `${this.store.candidateCount(study.id)}/${spec.budget.max_candidates} candidates · bench ${(b.bench_seconds / 3600).toFixed(2)}/${spec.budget.max_bench_hours} h${spec.budget.deadline ? ` · deadline ${spec.budget.deadline}` : ""}`;
+    return `${this.store.candidateCount(study.id)}/${spec.budget.max_candidates} candidates · bench ${formatDuration(b.bench_seconds)} of ${spec.budget.max_bench_hours} h${spec.budget.deadline ? ` · deadline ${spec.budget.deadline}` : ""}`;
   }
 
   // ------------------------------------------------------ reconciliation
@@ -820,7 +1015,7 @@ export class Engine {
 
 function calibrationNotice(study: StudyRow, report: CalibrationReport): string {
   if (!report.ok) {
-    return `[autoresearch] Calibration of \`${study.slug}\` failed; the study is back in Draft.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}\nHelp the human fix the spec or oracle, then call study_propose with the revised spec. The human re-runs \`bb study calibrate ${study.slug}\`.`;
+    return `Calibration of \`${study.slug}\` failed; the study is back in Draft.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}\nFix the spec or oracle (ask the study thread's agent to call study_propose with a revised spec), then re-run \`bb study calibrate ${study.slug}\`.`;
   }
-  return `[autoresearch] Calibration of \`${study.slug}\` is ready.\n${report.report}\nThe human approves and starts the run with \`bb study start ${study.slug}\`. Reply with a one-line summary and end your turn.`;
+  return `Calibration of \`${study.slug}\` is ready. ${report.report}\nApprove and start the run with \`bb study start ${study.slug}\`.`;
 }

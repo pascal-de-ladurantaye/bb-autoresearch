@@ -17,6 +17,7 @@ export default experimental_defineHostEntry({
     prepareCandidate: async (input) => await ops.prepareCandidate(input),
     rewordCommit: async ({ repoPath, sha, message }) => await ops.rewordCommit(repoPath, sha, message),
     checkout: async ({ repoPath, key, sha }, ctx) => await ops.checkout(ctx.experimental_paths.dataDir, repoPath, key, sha),
+    diffSummary: async ({ repoPath, from, to, maxPatchBytes }) => await ops.diffSummary(repoPath, from, to, maxPatchBytes),
     removeCheckouts: async ({ repoPath, keyPrefix }, ctx) =>
       await ops.removeCheckouts(ctx.experimental_paths.dataDir, repoPath, keyPrefix),
   },

@@ -37,6 +37,10 @@ export interface BbPort {
   spawnWorker(args: SpawnWorkerArgs): Promise<{ threadId: string; environmentId: string | null }>;
   /** Start a turn on an idle thread or queue/steer a running one (`mode: "auto"`). */
   send(threadId: string, text: string): Promise<void>;
+  /** Steer text into a turn that is running now. Never starts a turn; throws if none is running. */
+  steer(threadId: string, text: string): Promise<void>;
+  /** Flag a thread for the human without starting a turn. */
+  markUnread(threadId: string): Promise<void>;
   getThread(threadId: string): Promise<ThreadInfo | null>;
   getEnvironment(environmentId: string): Promise<EnvironmentInfo | null>;
   setMetadata(threadId: string, set: Record<string, string | number | boolean | null>): Promise<void>;

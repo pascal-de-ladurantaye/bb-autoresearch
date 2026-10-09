@@ -188,7 +188,6 @@ export function validateSemantics(spec: StudySpec): SpecResult {
     errors.push('oracle.bench_hosts: only "local" (or empty) is supported until remote bench hosts land (M2)');
   }
   if (spec.oracle.holdout) warnings.push("oracle.holdout is recorded but not evaluated until M2");
-  if (spec.budget.max_workers > 1) warnings.push("budget.max_workers > 1: M0 runs one worker at a time (W=1)");
   if (spec.oracle.noise === "noisy" && spec.oracle.gate.length === 0) {
     warnings.push("oracle.gate is empty: candidates are measured without a correctness check");
   }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { IdeaRow } from "../src/db/store.ts";
-import { budgetExhausted, idleAction, pickIdea, roundTrigger, targetWorkers } from "../src/scheduler.ts";
+import { budgetExhausted, idleAction, meanThinkSeconds, pickIdea, roundTrigger, spawnSlots, targetWorkers } from "../src/scheduler.ts";
 
 function idea(id: number, p: Partial<IdeaRow> = {}): IdeaRow {
-  return { id, study_id: "s", title: `idea ${id}`, rationale: "", theme: "", source: "strategist", priority: 0, pinned: 0, status: "queued", start_ref: null, status_reason: null, created_at: 0, updated_at: 0, ...p };
+  return { id, study_id: "s", title: `idea ${id}`, rationale: "", theme: "", source: "strategist", priority: 0, pinned: 0, status: "queued", start_ref: null, status_reason: null, created_at: 0, updated_at: 0, variation_of: null, lineage: id, ...p };
 }
 
 describe("targetWorkers", () => {
@@ -26,6 +26,51 @@ describe("pickIdea", () => {
     const q = [idea(1, { theme: "alloc", priority: 9 }), idea(2, { theme: "simd" })];
     const running = [idea(9, { theme: "alloc", status: "running" }), idea(10, { theme: "alloc", status: "running" })];
     expect(pickIdea(q, running, 4)?.id).toBe(2);
+  });
+});
+
+describe("pickIdea: diversity and no repeats", () => {
+  it("caps each theme at ceil(W/2) running workers", () => {
+    const q = [idea(1, { theme: "alloc", priority: 9 }), idea(2, { theme: "alloc", priority: 8 }), idea(3, { theme: "simd" })];
+    expect(pickIdea(q, [idea(9, { theme: "alloc", status: "running" })], 3)?.id).toBe(1); // ceil(3/2) = 2
+    expect(pickIdea(q, [idea(9, { theme: "alloc", status: "running" }), idea(10, { theme: "alloc", status: "running" })], 3)?.id).toBe(3);
+    expect(pickIdea(q.slice(0, 2), [idea(9, { theme: "alloc", status: "running" }), idea(10, { theme: "alloc", status: "running" })], 3)).toBeNull();
+  });
+  it("skips repeats of lost ideas unless they are variations or come from the human", () => {
+    const lostTitles = new Set(["inline the hot loop"]);
+    const repeat = idea(1, { title: "Inline the HOT loop!", priority: 9 });
+    const variation = idea(2, { title: "Inline the hot loop", variation_of: 7, priority: 5 });
+    const human = idea(3, { title: "inline the hot loop", source: "human", priority: 1 });
+    expect(pickIdea([repeat], [], 2, { lostTitles })).toBeNull();
+    expect(pickIdea([repeat, variation], [], 2, { lostTitles })?.id).toBe(2);
+    expect(pickIdea([repeat, human], [], 2, { lostTitles })?.id).toBe(3);
+  });
+  it("pinned ideas go first even at low priority", () => {
+    expect(pickIdea([idea(1, { priority: 50 }), idea(2, { pinned: 1, priority: -5 })], [], 3)?.id).toBe(2);
+  });
+});
+
+describe("spawnSlots: backpressure and budget", () => {
+  const base = { live: 0, w: 3, benchDepth: 0, candidates: 0, maxCandidates: 10 };
+  it("fills up to W", () => {
+    expect(spawnSlots(base)).toBe(3);
+    expect(spawnSlots({ ...base, live: 2 })).toBe(1);
+    expect(spawnSlots({ ...base, live: 3 })).toBe(0);
+  });
+  it("spawns nothing while the bench queue is at least W deep", () => {
+    expect(spawnSlots({ ...base, live: 1, benchDepth: 3 })).toBe(0);
+    expect(spawnSlots({ ...base, live: 1, benchDepth: 2 })).toBe(2);
+  });
+  it("reserves one submission per live worker against max_candidates", () => {
+    expect(spawnSlots({ ...base, live: 1, candidates: 8 })).toBe(1);
+    expect(spawnSlots({ ...base, live: 2, candidates: 8 })).toBe(0);
+  });
+});
+
+describe("meanThinkSeconds", () => {
+  it("averages spawn-or-verdict to submission", () => {
+    expect(meanThinkSeconds([])).toBeNull();
+    expect(meanThinkSeconds([{ startedAt: 0, submittedAt: 30_000 }, { startedAt: 40_000, submittedAt: 130_000 }])).toBe(60);
   });
 });
 

@@ -188,4 +188,40 @@ export const MIGRATIONS: string[] = [
     author_thread_id TEXT,
     created_at INTEGER NOT NULL
   )`,
+  // ---- M1 ----
+  `ALTER TABLE candidates ADD COLUMN queued_at INTEGER`,
+  `ALTER TABLE candidates ADD COLUMN lines_added INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE candidates ADD COLUMN lines_deleted INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE candidates ADD COLUMN rebases INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE threads ADD COLUMN conflict_refunds INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE threads ADD COLUMN pending_notice TEXT`,
+  `ALTER TABLE threads ADD COLUMN finishing_at INTEGER`,
+  `ALTER TABLE ideas ADD COLUMN variation_of INTEGER`,
+  `ALTER TABLE ideas ADD COLUMN lineage INTEGER`,
+  `ALTER TABLE studies ADD COLUMN max_workers_override INTEGER`,
+  `ALTER TABLE studies ADD COLUMN target_workers INTEGER`,
+  `ALTER TABLE studies ADD COLUMN running_since INTEGER`,
+  `ALTER TABLE studies ADD COLUMN running_seconds REAL NOT NULL DEFAULT 0`,
+  /** Every span the bench lock was held: measurement, profile, calibration. */
+  `CREATE TABLE bench_intervals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    lock_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    candidate_id INTEGER,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER
+  )`,
+  `CREATE INDEX bench_intervals_study ON bench_intervals (study_id, started_at)`,
+  /** Human-facing milestones, batched into the next strategist round instead of starting a turn. */
+  `CREATE TABLE notices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    delivered_round INTEGER
+  )`,
+  `CREATE INDEX notices_study ON notices (study_id, id)`,
 ];

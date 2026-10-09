@@ -62,7 +62,7 @@ describe("parseSpec", () => {
     expect(r.spec.agents).toMatchObject({ max_submissions_per_worker: 3, strategist_every: 5, stall_after: 10 });
     expect(r.spec.agents.worker.provider).toBe("codex");
     expect(r.warnings.some((w) => w.includes("holdout"))).toBe(true);
-    expect(r.warnings.some((w) => w.includes("W=1"))).toBe(true);
+    expect(r.warnings.some((w) => w.includes("W=1"))).toBe(false);
   });
 
   it("accepts a single gate string and percentage tolerances", () => {

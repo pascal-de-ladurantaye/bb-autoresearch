@@ -1,5 +1,6 @@
-// Scheduling policy as pure functions over plain data, so M1 can change W
-// and the diversity rules without touching the engine.
+// Scheduling policy as pure functions over plain data: how many workers,
+// when to spawn (backpressure), which idea next (diversity, no repeats),
+// budgets, strategist triggers, and idle handling.
 import type { CandidateRow, IdeaRow, ThreadRow } from "./db/store.ts";
 
 export interface WorkerTargetInput {
@@ -8,11 +9,11 @@ export interface WorkerTargetInput {
   tThink: number | null;
   /** Mean bench seconds per evaluation; null until learned. */
   tEval: number | null;
-  /** Hard ceiling for this milestone (M0: 1). */
+  /** Hard ceiling (EngineConfig.workerCeiling). */
   ceiling: number;
 }
 
-/** W = min(max_workers, ceil(T_think / T_eval) + 1), capped by the milestone ceiling. */
+/** W = min(max_workers, ceil(T_think / T_eval) + 1), capped by the configured ceiling. */
 export function targetWorkers(input: WorkerTargetInput): number {
   let w = input.maxWorkers;
   if (input.tThink !== null && input.tEval !== null && input.tEval > 0) {
@@ -21,18 +22,72 @@ export function targetWorkers(input: WorkerTargetInput): number {
   return Math.max(1, Math.min(w, input.ceiling));
 }
 
+export interface ThinkSample {
+  /** When the worker could start on this submission: its spawn, or the delivery of its previous verdict. */
+  startedAt: number;
+  submittedAt: number;
+}
+
+/** Mean think seconds over recent submissions; null until there is one. */
+export function meanThinkSeconds(samples: readonly ThinkSample[]): number | null {
+  const s = samples.map((x) => (x.submittedAt - x.startedAt) / 1000).filter((v) => Number.isFinite(v) && v >= 0);
+  return s.length ? s.reduce((a, b) => a + b, 0) / s.length : null;
+}
+
+export interface SpawnInput {
+  /** Live workers, including ones still spawning or finishing. */
+  live: number;
+  w: number;
+  /** Candidates gating, queued, or on the bench. */
+  benchDepth: number;
+  candidates: number;
+  maxCandidates: number;
+}
+
 /**
- * Next idea to assign: pinned first, then priority, then age; at most
- * ceil(W/2) running workers per theme; ideas whose lineage already lost are
- * skipped unless re-queued as a variation (a new idea row).
+ * How many workers may start now. Backpressure: none while the bench queue
+ * is at least W deep. Budget: each live worker reserves one submission, so
+ * new workers only start while the candidate budget can still take one more.
  */
-export function pickIdea(queued: readonly IdeaRow[], running: readonly IdeaRow[], w: number): IdeaRow | null {
+export function spawnSlots(i: SpawnInput): number {
+  if (i.benchDepth >= i.w) return 0;
+  const free = i.w - i.live;
+  const room = i.maxCandidates - i.candidates - i.live;
+  return Math.max(0, Math.min(free, room));
+}
+
+/** Title key for the no-repeat rule. */
+export function titleKey(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/gu, " ").trim();
+}
+
+export interface PickOptions {
+  /** Title keys of ideas that already lost. */
+  lostTitles?: ReadonlySet<string>;
+}
+
+/** Why an idea can't be assigned under the no-repeat rule (null when it can). */
+export function repeatsLostIdea(idea: Pick<IdeaRow, "title" | "source" | "variation_of">, lostTitles: ReadonlySet<string>): boolean {
+  return idea.source !== "human" && idea.variation_of === null && lostTitles.has(titleKey(idea.title));
+}
+
+/**
+ * Next idea to assign: pinned first, then priority, then age.
+ * - Diversity: at most ceil(W/2) running workers per theme.
+ * - No repeats: a non-human idea whose title repeats a lost idea is skipped
+ *   unless it is an explicit variation (`variation_of`). Lost ideas themselves
+ *   never return to the queue.
+ */
+export function pickIdea(queued: readonly IdeaRow[], running: readonly IdeaRow[], w: number, opts: PickOptions = {}): IdeaRow | null {
   const perTheme = Math.ceil(w / 2);
   const counts = new Map<string, number>();
   for (const r of running) if (r.theme) counts.set(r.theme, (counts.get(r.theme) ?? 0) + 1);
+  const lost = opts.lostTitles ?? new Set<string>();
   const sorted = [...queued].sort((a, b) => b.pinned - a.pinned || b.priority - a.priority || a.id - b.id);
   for (const idea of sorted) {
-    if (idea.theme && (counts.get(idea.theme) ?? 0) >= perTheme && w > 1) continue;
+    if (idea.status !== "queued") continue;
+    if (idea.theme && (counts.get(idea.theme) ?? 0) >= perTheme) continue;
+    if (repeatsLostIdea(idea, lost)) continue;
     return idea;
   }
   return null;
@@ -49,7 +104,7 @@ export interface BudgetState {
 
 export function budgetExhausted(b: BudgetState): string | null {
   if (b.candidates >= b.maxCandidates) return `max_candidates reached (${b.candidates}/${b.maxCandidates})`;
-  if (b.benchSeconds >= b.maxBenchHours * 3600) return `max_bench_hours reached (${(b.benchSeconds / 3600).toFixed(2)}h)`;
+  if (b.benchSeconds >= b.maxBenchHours * 3600) return `max_bench_hours reached (${(b.benchSeconds / 3600).toFixed(3)} h)`;
   if (b.deadline) {
     const end = Date.parse(b.deadline.length === 10 ? `${b.deadline}T23:59:59` : b.deadline);
     if (Number.isFinite(end) && b.now > end) return `deadline ${b.deadline} passed`;
