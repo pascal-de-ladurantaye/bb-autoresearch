@@ -391,7 +391,8 @@ export interface FakeThread extends ThreadInfo {
 export class FakePort implements BbPort {
   threads = new Map<string, FakeThread>();
   envs = new Map<string, EnvironmentInfo>();
-  sent: Array<{ threadId: string; text: string }> = [];
+  /** Sent messages; `text` is the whole message, `summary` the human-visible part, `agentOnly` the agent-only block. */
+  sent: Array<{ threadId: string; text: string; summary: string; agentOnly: string | null }> = [];
   steered: Array<{ threadId: string; text: string }> = [];
   unread: string[] = [];
   spawned: SpawnWorkerArgs[] = [];
@@ -446,8 +447,9 @@ export class FakePort implements BbPort {
     this.envs.set(env, { id: env, hostId: this.hostId, path: `/wt/${id}`, branchName: `bb/${id}` });
     return { threadId: id, environmentId: this.spawnWithoutEnvironment ? null : env };
   }
-  async send(threadId: string, text: string) {
-    this.sent.push({ threadId, text });
+  async send(threadId: string, text: string | { summary: string; detail: string }) {
+    if (typeof text === "string") this.sent.push({ threadId, text, summary: text, agentOnly: null });
+    else this.sent.push({ threadId, text: `${text.summary}\n\n${text.detail}`, summary: text.summary, agentOnly: text.detail });
   }
   async steer(threadId: string, text: string) {
     if (this.threads.get(threadId)?.status !== "active") throw new Error("no turn is running");

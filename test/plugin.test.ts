@@ -105,8 +105,8 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     await harness.behavior.callAgentTool("study_record_finding", { outcome: "improved", learned: "Whitespace was 20% of output." }, { threadId: "thr_w1" });
     expect(text(await harness.behavior.callAgentTool("study_finish", {}, { threadId: "thr_w1" }))).toContain("Assignment finished");
     const show = await harness.behavior.runCli(["show", "toy-size"]);
-    expect(show.stdout).toContain("c/1 idea #1 decided win +20.00%");
-    expect(show.stdout).toContain("best vs base +20.00%");
+    expect(show.stdout).toContain("c/1 win +20.0% · idea #1");
+    expect(show.stdout).toMatch(/Best vs base:\s+20\.0% lower size · 1,000 → 800 bytes/u);
   });
 
   it("CLI: list/show, human controls refused from study threads, bounded output", async () => {
@@ -122,6 +122,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     const unknown = await harness.behavior.runCli(["show", "nope"]);
     expect(unknown.exitCode).not.toBe(0);
     expect(unknown.stderr).toContain("no study named");
+    expect(unknown.stderr).toContain("Run `bb study list`");
     expect((await harness.behavior.runCli(["show", "toy-size"])).stdout.length).toBeLessThan(60_100);
   });
 

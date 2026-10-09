@@ -28,8 +28,8 @@ export interface PlannedChangeset {
 export type GroupingResult = { ok: true; changesets: PlannedChangeset[]; notes: string[] } | { ok: false; errors: string[] };
 
 /** One changeset per promotion, in best order. */
-export function fallbackGrouping(promotions: readonly Promotion[]): PlannedChangeset[] {
-  return promotions.map((p) => ({ title: p.title, rationale: p.n !== null ? `Promotion c/${p.n} on its own (no grouping proposed).` : "Commit on best without a candidate trailer.", promotions: [p] }));
+export function fallbackGrouping(promotions: readonly Promotion[], reason = "no grouping proposed"): PlannedChangeset[] {
+  return promotions.map((p) => ({ title: p.title, rationale: p.n !== null ? `Promotion c/${p.n} as its own changeset (${reason}).` : "Commit on best without a candidate trailer.", promotions: [p] }));
 }
 
 /**

@@ -191,8 +191,9 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     const s = store.study(SLUG)!;
     expect(s.state).toBe("paused");
     expect(s.pause_reason).toContain("host offline");
-    expect(store.notices(s.id)[0]!.text).toContain("paused by the system");
-    expect(port.sent.filter((m) => m.threadId === "thr_study" && m.text.includes("paused by the system"))).toHaveLength(0);
+    expect(store.notices(s.id)[0]!.text).toContain("paused itself");
+    expect(store.notices(s.id)[0]!.text).toContain("Next: resume");
+    expect(port.sent.filter((m) => m.threadId === "thr_study" && m.text.includes("paused itself"))).toHaveLength(0);
     // Resume after the host is back: the same candidate completes.
     host.prepareCandidate = realPrepare;
     engine.resume(SLUG, "human");

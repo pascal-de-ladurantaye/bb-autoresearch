@@ -12,6 +12,7 @@ import { checkHealth } from "./health.ts";
 import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
 import { studyReport } from "./report.ts";
 import { BENCH_BOUND_STAGES, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
+import { ciText, compound, improvementText, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
 import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
@@ -176,12 +177,12 @@ export class Engine {
       const changed = oracleHash(active) !== oracleHash(spec);
       const version = this.store.addSpecVersion(study.id, toml, spec, oracleHash(spec), threadId, { bench: resolved.hosts, pending: true });
       this.publish(study.id);
-      await this.notify(study.id, "spec.proposed", `Spec v${version} for \`${study.slug}\` was proposed and waits for approval (${changed ? "the oracle changed: approving starts a new segment with recalibration, `bb study calibrate`" : "oracle unchanged: `bb study approve` applies it"}).`);
+      await this.notify(study.id, "spec.proposed", `Spec v${version} of \`${study.slug}\` waits for your approval (${changed ? "the oracle changed: approving recalibrates and starts a new segment" : "oracle unchanged: approving applies it as is"}). Next: review and approve it on the Oracle tab, or \`${changed ? "bb study calibrate" : "bb study approve"} ${study.slug}\`.`);
       return [
         `Spec v${version} recorded for \`${spec.study.slug}\`; the study keeps running on spec v${study.spec_version} until the human approves it.`,
         changed
-          ? `The oracle changed (${oracleHash(active)} → ${oracleHash(spec)}). Approval (\`bb study calibrate ${spec.study.slug}\`) moves the study to Calibrating: in-flight measurements are cancelled, best is calibrated under the new oracle, and a new segment starts once the human runs \`bb study start\`.`
-          : `The oracle is unchanged, so no recalibration is needed: \`bb study approve ${spec.study.slug}\` applies it.`,
+          ? `The oracle changed (${oracleHash(active)} → ${oracleHash(spec)}). The human approves it on the Studies page (Oracle tab) or with \`bb study calibrate ${spec.study.slug}\`: in-flight measurements are cancelled, best is calibrated under the new oracle, and a new segment starts once the human approves that calibration.`
+          : `The oracle is unchanged, so no recalibration is needed: the human applies it on the Studies page (Oracle tab) or with \`bb study approve ${spec.study.slug}\`.`,
         ...warnings.map((w) => `Warning: ${w}`),
       ].join("\n");
     }
@@ -192,9 +193,9 @@ export class Engine {
       `Study \`${spec.study.slug}\` drafted with spec v${version} (oracle ${oracleHash(spec)}), repo ${study.repo_path} on this machine. Bench: ${benchText}.`,
       ...warnings.map((w) => `Warning: ${w}`),
       "",
-      "Next steps are the human's: review with `bb study show " + spec.study.slug + "`, then approve and calibrate with `bb study calibrate " + spec.study.slug + "`.",
-      "Calibration runs the gates on the base commit and repeated A/A measurements on every bench host to find the noise floor. Then `bb study start` begins the run.",
-      "Seed ideas now with `bb study ideas add` (human) or wait for your first strategist round.",
+      "Next steps are the human's, on the Studies page (sidebar → Studies → " + spec.study.slug + "): the Overview shows \"Needs you: Approve spec v" + version + " and calibrate\".",
+      "Calibration runs the gates on the base commit and repeated A/A measurements on every bench host to find the noise floor; then the human reviews it and starts the study from the same page.",
+      "CLI equivalents: `bb study calibrate " + spec.study.slug + "`, then `bb study start " + spec.study.slug + "`. Ideas can be seeded on the Ideas tab or with `bb study ideas add`.",
     ].join("\n");
   }
 
@@ -310,7 +311,7 @@ export class Engine {
     void this.notify(
       study.id,
       "calibration.failed",
-      `Recalibration of \`${study.slug}\` under spec v${study.spec_version} failed, so the study is back on spec v${prev} (segment ${study.segment}) and paused.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}\nResume with \`bb study resume ${study.slug}\`, or propose a fixed spec.`,
+      `Recalibration of \`${study.slug}\` under spec v${study.spec_version} failed: the study is back on spec v${prev} (segment ${study.segment}) and paused. Next: resume on the Overview (\`bb study resume ${study.slug}\`), or ask the study thread for a fixed spec.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}`,
     );
   }
 
@@ -475,11 +476,102 @@ export class Engine {
     if (h) await this.harvester.wait(h.id, timeoutMs);
   }
 
-  /** Publish a ready harvest as DRAFT PRs on GitHub. Only behind an explicit `--publish`; refuses without a GitHub remote. */
-  async publishHarvest(slug: string, actor: string, confirmed: boolean): Promise<string> {
+  /**
+   * Exactly what publishing the ready harvest would do: which branches go to
+   * which remote, which draft PRs open on which base, which changesets are
+   * skipped, and whether the preflight (GitHub remote, gh) passes. Reads
+   * only; the confirmation dialog and `--publish` show it.
+   */
+  async publishPlan(slug: string, harvestId?: number) {
+    const study = this.study(slug);
+    const h = this.store.latestHarvest(study.id);
+    if (!h || (harvestId !== undefined && h.id !== harvestId)) throw new EngineError(`${slug} has no such harvest${harvestId !== undefined ? ` (h${harvestId})` : ""}; reload the Harvest tab`);
+    const spec = this.store.spec(study);
+    const runner = this.ctx.bb.hostRunner(study.host_id!);
+    const publisher = new GithubPublisher(runner, study.repo_path!, spec.harvest.remote, true);
+    let remoteUrl: string | null = null;
+    let problem: string | null = null;
+    if (h.state !== "ready") problem = `harvest h${h.id} is ${h.state}, not ready`;
+    else if (h.publish_state === "published") problem = `harvest h${h.id} was already published`;
+    else {
+      try {
+        remoteUrl = (await publisher.preflight()).remoteUrl;
+      } catch (e) {
+        problem = e instanceof PublishRefused ? e.message : errText(e);
+      }
+    }
+    const drafts = this.publishDrafts(study, spec, h);
+    return {
+      harvestId: h.id,
+      remote: spec.harvest.remote,
+      remoteUrl,
+      ok: problem === null,
+      problem,
+      prs: drafts.map((d) => ({ k: d.draft.k, title: d.draft.title, branch: d.draft.branch, base: d.draft.baseBranch, stacked: d.draft.stacked, push: d.skip === null, skip: d.skip })),
+    };
+  }
+
+  /** The PR drafts of a harvest in publish order, with the reason a changeset is skipped (no branch, dropped by the human, or stacked on a skipped one). */
+  private publishDrafts(study: StudyRow, spec: StudySpec, h: HarvestRow): Array<{ draft: PrDraft; skip: string | null }> {
+    const changesets = this.store.changesets(h.id);
+    const skipped = new Set<string>();
+    return changesets.map((c) => {
+      const base = c.pr_base && c.pr_base !== "base" ? changesets.find((x) => `#${x.k}` === c.pr_base) : undefined;
+      const draft: PrDraft = { changesetId: c.id, k: c.k, branch: c.branch ?? `studies/${study.slug}/harvest/h${h.id}/${c.k}`, baseBranch: base?.branch ?? spec.study.base, title: c.pr_title ?? c.title, body: c.pr_body ?? "", sha: c.branch ? c.standalone_sha : null, stacked: Boolean(base) };
+      const skip = !draft.sha ? "did not apply on its PR base: no branch" : c.human_choice === "drop" ? "dropped by you" : draft.stacked && skipped.has(draft.baseBranch) ? `its base ${draft.baseBranch} is not published` : null;
+      if (skip) skipped.add(draft.branch);
+      return { draft, skip };
+    });
+  }
+
+  /** Human control: keep or drop a changeset when publishing (only one nothing else builds on). */
+  setChangesetChoice(slug: string, harvestId: number, k: number, choice: "keep" | "drop" | null, actor: string): string {
+    const study = this.study(slug);
+    const h = this.store.latestHarvest(study.id);
+    if (!h || h.id !== harvestId) throw new EngineError(`harvest h${harvestId} is not ${slug}'s latest harvest; reload the Harvest tab`);
+    if (h.publish_state === "published") throw new EngineError(`harvest h${h.id} was already published`);
+    const all = this.store.changesets(h.id);
+    const c = all.find((x) => x.k === k);
+    if (!c) throw new EngineError(`harvest h${h.id} has no changeset #${k}`);
+    const dependents = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(c.id));
+    if (choice === "drop" && dependents.length) throw new EngineError(`#${k} can't be dropped: ${dependents.map((d) => `#${d.k}`).join(", ")} build${dependents.length === 1 ? "s" : ""} on it`);
+    this.store.updateChangeset(c.id, { human_choice: choice });
+    this.store.event(study.id, "harvest.choice", actor, { harvest: h.id, changeset: k, choice });
+    this.publish(study.id);
+    return choice === "drop" ? `#${k} will be skipped when publishing.` : choice === "keep" ? `#${k} will be published.` : `#${k}: choice cleared.`;
+  }
+
+  /** The human looked at the notices: they no longer count as new. */
+  markNoticesSeen(slug: string): void {
+    const study = this.study(slug);
+    this.store.updateStudy(study.id, { notices_seen_at: this.ctx.now() });
+    this.publish(study.id);
+  }
+
+  /**
+   * The in-app approval of a spec, routed by state. `version` is the version
+   * the human reviewed; a different one refuses (the page was stale).
+   * Draft: approve and calibrate. Pending, oracle unchanged: apply. Pending,
+   * oracle changed: approve and recalibrate (new segment).
+   */
+  async approveSpecVersion(slug: string, version: number, actor: string): Promise<{ text: string; kind: "calibrate" | "approve" }> {
+    const study = this.study(slug);
+    const expected = study.pending_spec_version ?? (study.state === "draft" ? study.spec_version : null);
+    if (expected === null) throw new EngineError(`${slug} has no spec waiting for approval`);
+    if (expected !== version) throw new EngineError(`spec v${version} is not the one waiting (v${expected} is); reload and review v${expected}`);
+    if (study.pending_spec_version !== null) {
+      const next = this.store.specOfVersion(study.id, study.pending_spec_version);
+      if (oracleHash(next) === oracleHash(this.store.spec(study))) return { text: this.approve(slug, actor), kind: "approve" };
+    }
+    return { text: await this.calibrate(slug, actor), kind: "calibrate" };
+  }
+
+  /** Publish a ready harvest as DRAFT PRs on GitHub. Only behind an explicit confirmation (`--publish`, or the page's dialog); refuses without a GitHub remote. */
+  async publishHarvest(slug: string, actor: string, confirmed: boolean, harvestId?: number): Promise<string> {
     const study = this.study(slug);
     const h = this.store.latestHarvest(study.id);
     if (!h || h.state !== "ready") throw new EngineError(`${slug} has no ready harvest to publish; run \`bb study harvest ${slug}\` (a dry run) first and review it`);
+    if (harvestId !== undefined && h.id !== harvestId) throw new EngineError(`harvest h${harvestId} is not the latest (h${h.id} is); review h${h.id} first`);
     if (h.publish_state === "published") throw new EngineError(`harvest h${h.id} was already published`);
     const spec = this.store.spec(study);
     const runner = this.ctx.bb.hostRunner(study.host_id!);
@@ -487,24 +579,32 @@ export class Engine {
     try {
       await publisher.preflight();
     } catch (e) {
-      if (e instanceof PublishRefused) throw new EngineError(`publish refused: ${e.message}`);
+      if (e instanceof PublishRefused) {
+        // Keep the refusal on the harvest so the page shows it (and what to fix).
+        this.store.updateHarvest(h.id, { publish_state: "failed", error: clip(`publish refused: ${e.message}`, 500) });
+        this.store.event(study.id, "harvest.publish_refused", actor, { harvest: h.id, reason: clip(e.message, 300) });
+        this.publish(study.id);
+        throw new EngineError(`publish refused: ${e.message}`);
+      }
       throw e;
     }
     const changesets = this.store.changesets(h.id);
-    const drafts: PrDraft[] = changesets.map((c) => {
-      const base = c.pr_base && c.pr_base !== "base" ? changesets.find((x) => `#${x.k}` === c.pr_base) : undefined;
-      return { changesetId: c.id, k: c.k, branch: c.branch ?? `studies/${study.slug}/harvest/h${h.id}/${c.k}`, baseBranch: base?.branch ?? spec.study.base, title: c.pr_title ?? c.title, body: c.pr_body ?? "", sha: c.branch ? c.standalone_sha : null, stacked: Boolean(base) };
-    });
-    this.store.updateHarvest(h.id, { publisher: "github", publish_state: "publishing" });
-    this.store.event(study.id, "harvest.publishing", actor, { harvest: h.id, prs: drafts.length });
+    // A dropped changeset goes in without a sha, so the publisher skips it (and anything stacked on it).
+    const all: PrDraft[] = this.publishDrafts(study, spec, h).map(({ draft }) => ({ ...draft, sha: changesets.find((c) => c.id === draft.changesetId)?.human_choice === "drop" ? null : draft.sha }));
+    this.store.updateHarvest(h.id, { publisher: "github", publish_state: "publishing", error: null });
+    this.store.event(study.id, "harvest.publishing", actor, { harvest: h.id, prs: all.length });
     try {
-      const out = await publisher.publish({ key: `${study.slug}-harvest-h${h.id}`, drafts, report: studyReport(this.ctx, study, spec, h) });
+      const out = await publisher.publish({ key: `${study.slug}-harvest-h${h.id}`, drafts: all, report: studyReport(this.ctx, study, spec, h) });
+      // A dropped changeset has no sha in its draft, so the publisher skips it; say why.
+      for (const p of out.prs) if (changesets.find((c) => c.id === p.changesetId)?.human_choice === "drop") Object.assign(p, { status: "skipped", detail: "dropped by you" });
       for (const p of out.prs) {
         this.store.updateChangeset(p.changesetId, { pr_url: p.url, pr_status: p.status === "opened" ? "opened" : p.status === "pushed" ? "pushed" : p.status === "failed" ? "failed" : this.store.changeset(p.changesetId)!.pr_status });
       }
       const opened = out.prs.filter((p) => p.status === "opened");
       this.store.updateHarvest(h.id, { publish_state: opened.length === out.prs.filter((p) => p.status !== "skipped").length ? "published" : "failed", publish_json: JSON.stringify(out) });
       this.store.event(study.id, "harvest.published", actor, { harvest: h.id, opened: opened.length, prs: out.prs.length });
+      const failed = out.prs.filter((p) => p.status === "failed" || p.status === "pushed");
+      await this.notify(study.id, "harvest.published", `Harvest h${h.id} of \`${study.slug}\`: ${opened.length} draft PR(s) opened${failed.length ? `, ${failed.length} failed` : ""}.${failed.length ? " Next: see each PR's error on the Harvest tab." : ""}\n${out.prs.map((p) => `- #${p.k} ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 160)})` : ""}`).join("\n")}`);
       this.publish(study.id);
       return [`Harvest h${h.id}: ${opened.length} draft PR(s) opened.`, ...out.prs.map((p) => `#${p.k} ${p.branch} → ${p.baseBranch}: ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 200)})` : ""}`)].join("\n");
     } catch (e) {
@@ -911,14 +1011,14 @@ export class Engine {
     this.store.updateStudy(study.id, { rate_limited_until: Math.max(study.rate_limited_until ?? 0, sendAt) });
     if (row.rate_limit_retries >= max || event.attemptNumber > max) {
       this.store.event(study.id, "turn.rate_limit_gave_up", "plugin", { thread: event.threadId, attempt: event.attemptNumber, retries: row.rate_limit_retries });
-      await this.notify(study.id, "rate_limit", `A ${row.role === "worker" ? "worker" : "study thread"} turn of \`${study.slug}\` stayed rate limited after ${row.rate_limit_retries} retries; it is left idle (${row.role === "worker" ? "the idle timeout abandons it" : "send it a message to retry"}). New workers wait until ${new Date(sendAt).toISOString().slice(11, 16)} UTC.`);
+      await this.notify(study.id, "rate_limit", `\`${study.slug}\`: a ${row.role === "worker" ? "worker" : "study thread"} turn stayed rate limited after ${row.rate_limit_retries} retries and is left idle. Next: ${row.role === "worker" ? "nothing (the idle timeout abandons it)" : "send the study thread a message to retry"}. New workers wait until ${new Date(sendAt).toISOString().slice(11, 16)} UTC.`);
       return;
     }
     await this.ctx.bb.retryTurn(event.threadId, event.requestId, sendAt);
     this.store.updateThread(row.id, { rate_limit_retries: row.rate_limit_retries + 1 });
     this.store.event(study.id, "turn.retry", "plugin", { thread: event.threadId, attempt: event.attemptNumber, sendAt, reset });
     if (!wasBlocked) {
-      await this.notify(study.id, "rate_limit", `Provider rate limit on \`${study.slug}\`: the ${row.role === "worker" ? "worker" : "study thread"} turn is retried at ${new Date(sendAt).toISOString().slice(11, 16)} UTC, and no new worker starts until then.`, { quiet: true });
+      await this.notify(study.id, "rate_limit", `\`${study.slug}\` hit a provider rate limit: the ${row.role === "worker" ? "worker" : "study thread"} turn is retried at ${new Date(sendAt).toISOString().slice(11, 16)} UTC and no new worker starts until then. Nothing to do.`, { quiet: true });
     }
     this.publish(study.id);
   }
@@ -1035,7 +1135,7 @@ export class Engine {
     const after = this.usageState(this.store.study(study.id)!);
     if (after.tight && !before.tight) {
       this.store.event(study.id, "usage.tight", "plugin", { max_percent: after.maxPercent });
-      await this.notify(study.id, "usage.tight", `Provider usage for \`${study.slug}\` is at ${after.maxPercent?.toFixed(0)}% of a window (limit ${spec.agents.usage_tight_percent}%): the scheduler halves W until it eases.`, { quiet: true });
+      await this.notify(study.id, "usage.tight", `\`${study.slug}\`: provider usage is at ${after.maxPercent?.toFixed(0)}% of a window (limit ${spec.agents.usage_tight_percent}%), so the study runs half as many workers until it eases. Nothing to do.`, { quiet: true });
     }
   }
 
@@ -1076,7 +1176,7 @@ export class Engine {
     const names: Record<string, string> = { candidates: "candidates", bench: "bench hours", tokens: "tokens", deadline: "time to the deadline" };
     for (const c of crossed) {
       this.store.event(study.id, "budget.threshold", "plugin", { dim: c.dim, pct: c.pct, share: c.share });
-      await this.notify(study.id, "budget.threshold", `\`${study.slug}\` has used ${(c.share * 100).toFixed(0)}% of its ${names[c.dim]} budget (${this.budgetLine(study, spec)}). At 100% it pauses and proposes a harvest.`);
+      await this.notify(study.id, "budget.threshold", `\`${study.slug}\` has used ${(c.share * 100).toFixed(0)}% of its ${names[c.dim]} budget (${this.budgetLine(study, spec)}). At 100% it pauses and proposes a harvest. Nothing to do yet; raise the budget with a spec change if you want more.`);
     }
   }
 
@@ -1182,7 +1282,7 @@ export class Engine {
       rounds: fresh.rounds,
     });
     if (trigger === "stall") {
-      await this.notify(study.id, "stall", `\`${study.slug}\` has had no win in the last ${spec.agents.stall_after} verdicts; the strategist is asked for structurally different directions. Consider steering the idea board, or harvesting what was found.`, { quiet: true });
+      await this.notify(study.id, "stall", `\`${study.slug}\` stalled: no win in the last ${spec.agents.stall_after} verdicts, so the strategist is asked for different directions. Next (optional): steer on the Ideas tab, or harvest what was found.`, { quiet: true });
     }
     if (trigger && fresh.study_thread_id) await this.sendRound(this.store.study(study.id)!, trigger);
   }
@@ -1316,8 +1416,13 @@ export class Engine {
   private async notifyBestMoved(study: StudyRow, winner: CandidateRow, promoted: string): Promise<void> {
     const cum = this.cumulative(this.store.study(study.id)!);
     const idea = winner.idea_id ? this.store.idea(winner.idea_id) : undefined;
-    await this.notify(study.id, "best.new", `New best for \`${study.slug}\`: c/${winner.n}${idea ? ` (${clip(idea.title, 100)})` : ""} ${formatPct(winner.effect)}${winner.ci_lo !== null && winner.ci_hi !== null ? ` (CI ${formatPct(winner.ci_lo)}..${formatPct(winner.ci_hi)})` : ""}; best vs base now ${formatPct(cum)}.`);
-    const text = `[autoresearch] FYI: best moved to ${promoted.slice(0, 10)} (c/${winner.n}, ${formatPct(winner.effect)}). Your next submission is rebased onto it automatically; only a CONFLICT verdict needs you to \`git rebase studies/${study.slug}/best\`.`;
+    const metric = this.metricInfo(study);
+    await this.notify(
+      study.id,
+      "best.new",
+      `New best for \`${study.slug}\`: c/${winner.n}${idea ? ` ${clip(idea.title, 100)}` : ""}, ${improvementText(winner.effect, metric, { digits: 1, factor: false })} than the previous best${winner.ci_lo !== null && winner.ci_hi !== null ? ` (${ciText(winner.ci_lo, winner.ci_hi)})` : ""}. Best vs base is now ${improvementText(cum, metric)}.`,
+    );
+    const text = `[autoresearch] FYI: best moved to ${promoted.slice(0, 10)} (c/${winner.n}, ${improvementText(winner.effect, metric, { factor: false })} than the best before it). Your next submission is rebased onto it automatically; only a CONFLICT verdict needs you to \`git rebase studies/${study.slug}/best\`.`;
     for (const w of this.store.threads(study.id, { role: "worker", states: ["active"] })) {
       if (!w.thread_id || w.thread_id === winner.thread_id) continue;
       const pending = this.store.candidates(study.id, { threadId: w.thread_id }).some((c) => c.stage !== "decided");
@@ -1451,14 +1556,36 @@ export class Engine {
         : /^budget exhausted/u.test(reason)
           ? "budget.exhausted"
           : "study.paused";
-    await this.notify(studyId, kind, `Study \`${study.slug}\` paused by the system: ${reason}. The human decides what happens next (\`bb study resume ${study.slug}\`${kind === "budget.exhausted" ? ` or \`bb study harvest ${study.slug}\`` : ""}).`);
+    const next =
+      kind === "budget.exhausted"
+        ? `Next: harvest the wins on the Harvest tab (\`bb study harvest ${study.slug}\`), or raise the budget with a spec change.`
+        : kind === "drift" || kind === "oracle.broken"
+          ? `Next: check the bench host on the Bench tab, then resume on the Overview (\`bb study resume ${study.slug}\`).`
+          : `Next: resume on the Overview when it's fixed (\`bb study resume ${study.slug}\`).`;
+    await this.notify(studyId, kind, `\`${study.slug}\` paused itself: ${reason}. ${next}`);
+  }
+
+  /** The primary metric's name, unit and direction (for text in the shared improvement convention). */
+  metricInfo(study: StudyRow): MetricInfo {
+    try {
+      const m = this.store.spec(study).metric;
+      return { name: m.name, unit: m.unit, direction: m.direction };
+    } catch {
+      return { name: "metric", unit: "", direction: "lower" };
+    }
   }
 
   cumulative(study: StudyRow): number | null {
     if (!study.base_sha || !study.best_sha || study.base_sha === study.best_sha) return null;
     // Compound the promoted effects (each measured against the best before it).
     const wins = this.store.candidates(study.id, { stages: ["decided"] }).filter((c) => c.verdict === "win" && c.effect !== null);
-    return wins.reduce((acc, c) => 1 - (1 - acc) * (1 - c.effect!), 0);
+    let direction: "lower" | "higher" = "lower";
+    try {
+      direction = this.store.spec(study).metric.direction;
+    } catch {
+      // no spec: lower is the default direction
+    }
+    return compound(wins.map((c) => c.effect!), direction);
   }
 
   budgetLine(study: StudyRow, spec: StudySpec): string {
@@ -1541,7 +1668,7 @@ export function profileSummary(stdout: string, stderr: string): string {
 
 function calibrationNotice(study: StudyRow, report: CalibrationReport): string {
   if (!report.ok) {
-    return `Calibration of \`${study.slug}\` failed; the study is back in Draft.\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}\nFix the spec or oracle (ask the study thread's agent to call study_propose with a revised spec), then re-run \`bb study calibrate ${study.slug}\`.`;
+    return `Calibration of \`${study.slug}\` failed; the study is back in Draft. Next: ask the study thread to revise the spec, then approve the new version on the Oracle tab (\`bb study calibrate ${study.slug}\`).\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}`;
   }
-  return `Calibration of \`${study.slug}\` is ready. ${report.report}\nApprove and start the run with \`bb study start ${study.slug}\`.`;
+  return `Calibration of \`${study.slug}\` is ready. Next: review it and start the study on the Oracle tab (\`bb study start ${study.slug}\`).\n${report.report}`;
 }

@@ -26,7 +26,7 @@ import { checkHealth } from "./health.ts";
 import { HOLDOUT_FAIL, runHoldout } from "./holdout.ts";
 import { HostJobLostError, RunAbortedError, type HostRunner } from "./host/runner.ts";
 import { BenchError, strategyFor, type Bench, type MeasureOutcome, type RunResult, type Side } from "./noise.ts";
-import { clip, formatDuration, safeJson, verdictMessage } from "./prompts.ts";
+import { clip, formatDuration, messageText, safeJson, verdictMessage, type AgentMessage } from "./prompts.ts";
 import { checkScope } from "./scope.ts";
 import { bestBranch, candidateRef, formatPct, type StudySpec } from "./spec.ts";
 import { applyConfirmation, decideVerdict, type VerdictResult } from "./verdict.ts";
@@ -192,7 +192,7 @@ export class Pipeline {
     if (!scope.ok) {
       const decided = this.decide(candidate, { verdict: "rejected", reasons: scope.reasons }, { reported: true });
       const left = spec.agents.max_submissions_per_worker - worker.submissions - 1;
-      return { ok: true, candidate: decided, text: withNotice(notice, verdictMessage(decided, { submissionsLeft: left, spec })) };
+      return { ok: true, candidate: decided, text: messageText(withNotice(notice, verdictMessage(decided, { submissionsLeft: left, spec }))) };
     }
     store.updateCandidate(candidate.id, { stage: "gating" });
     this.changed(study.id);
@@ -666,7 +666,7 @@ export class Pipeline {
       void this.hooks.notify(
         study,
         "bench.offline",
-        `Bench host ${host.name} has been offline for ${Math.round((now - since) / 60_000)} min. Measurements on it wait at the measure step; workers keep editing until backpressure stops new spawns.`,
+        `Bench host ${host.name} has been offline for ${Math.round((now - since) / 60_000)} min, so measurements on it wait. Next: bring the machine back online (Bench tab); workers keep editing meanwhile.`,
       );
     }
   }
@@ -943,8 +943,11 @@ export class Pipeline {
   }
 }
 
-function withNotice(notice: string | null, text: string): string {
-  return notice ? `${notice}\n\n${text}` : text;
+function withNotice(notice: string | null, text: string): string;
+function withNotice(notice: string | null, text: AgentMessage): AgentMessage;
+function withNotice(notice: string | null, text: string | AgentMessage): string | AgentMessage {
+  if (!notice) return text;
+  return typeof text === "string" ? `${notice}\n\n${text}` : { summary: text.summary, detail: `${notice}\n\n${text.detail}` };
 }
 
 

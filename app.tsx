@@ -5,7 +5,7 @@
 // @get-bb/plugin-sdk/app are provided by the BB app at load time (never
 // bundled). components/ui/ is vendored shadcn source from the BB registry.
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
-import { StudiesPanel } from "./src/app/StudiesPage.tsx";
+import { StudiesAccessory, StudiesPanel } from "./src/app/StudiesPage.tsx";
 import { ThreadBadge } from "./src/app/ThreadBadge.tsx";
 
 /** The plugin's flask glyph (same shape as assets/flask.svg). */
@@ -27,6 +27,8 @@ export default definePluginApp((app) => {
     icon: "autoresearch-flask",
     path: "studies",
     component: StudiesPanel,
+    // How many approvals, system pauses, failed calibrations and ready harvests wait for the human.
+    experimental_sidebarAccessory: StudiesAccessory,
   });
   app.slots.experimental_threadHeaderAction({
     id: "study-badge",

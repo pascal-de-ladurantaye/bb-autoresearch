@@ -112,7 +112,7 @@ export class Harvester {
         this.store.updateHarvest(harvestId, { state: "failed", error: clip(errText(e), 1000), finished_at: this.ctx.now() });
         this.store.event(h.study_id, "harvest.failed", "plugin", { harvest: harvestId, error: clip(errText(e), 500) });
         const study = this.store.study(h.study_id);
-        if (study) await this.hooks.notify(study, "harvest.failed", `Harvest h${harvestId} of \`${study.slug}\` failed: ${clip(errText(e), 500)}. Fix the cause and run \`bb study harvest ${study.slug} --restart\`, or \`bb study resume ${study.slug}\` to keep exploring.`);
+        if (study) await this.hooks.notify(study, "harvest.failed", `Harvest h${harvestId} of \`${study.slug}\` failed: ${clip(errText(e), 500)}. Next: fix the cause and start a new harvest on the Harvest tab (\`bb study harvest ${study.slug} --restart\`), or resume to keep exploring.`);
       } finally {
         this.jobs.delete(harvestId);
         const h = this.store.harvest(harvestId);
@@ -242,9 +242,9 @@ export class Harvester {
     const useFallback = (why: string) => {
       this.store.updateHarvest(h.id, { grouping_source: "fallback", grouping_notes: why });
       this.store.event(study.id, "harvest.grouping_fallback", "plugin", { harvest: h.id, reason: why });
-      return fallbackGrouping(promotions);
+      return fallbackGrouping(promotions, why);
     };
-    if (h.grouping_source === "fallback") return useFallback(h.grouping_notes ?? "one changeset per promotion (asked for by the human)");
+    if (h.grouping_source === "fallback") return useFallback(h.grouping_notes ?? "one changeset per promotion, as you asked");
     if (promotions.length === 1) return useFallback("one promotion: one changeset");
     const asked = await this.hooks.sendGroupingRound(study, h, promotions).catch((e) => {
       this.ctx.bb.log("warn", `harvest grouping round: ${errText(e)}`);
@@ -684,9 +684,9 @@ export function harvestReadyText(ctx: Ctx, study: StudyRow, h: HarvestRow): stri
   const deps = cs.filter((c) => (safeJson<number[]>(c.depends_on_json) ?? []).length).length;
   const drop = cs.filter((c) => c.droppable).length;
   return [
-    `Harvest h${h.id} of \`${study.slug}\` is ready: ${cs.length} changeset(s)${deps ? `, ${deps} stacked on another` : ""}${drop ? `, ${drop} flagged droppable (no measurable contribution; your call)` : ""}.`,
+    `Harvest h${h.id} of \`${study.slug}\` is ready: ${cs.length} changeset(s)${deps ? `, ${deps} stacked on another` : ""}${drop ? `, ${drop} flagged droppable (your call)` : ""}. Next: review them on the Harvest tab, then publish draft PRs, keep exploring, or archive.`,
     h.export_dir ? `Dry-run PR bodies and the report: ${h.export_dir}. Local branches: studies/${study.slug}/harvest/h${h.id}/*.` : "",
-    `Review on the Harvest tab. Then: \`bb study harvest ${study.slug} --publish\` opens DRAFT PRs on GitHub, \`bb study resume ${study.slug}\` keeps exploring, or \`bb study archive ${study.slug}\` ends the study.`,
+    `CLI: \`bb study harvest ${study.slug} --publish\` (DRAFT PRs on GitHub), \`bb study resume ${study.slug}\` (keep exploring), \`bb study archive ${study.slug}\` (done).`,
   ]
     .filter(Boolean)
     .join("\n");

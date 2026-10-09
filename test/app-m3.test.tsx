@@ -3,7 +3,7 @@
 // real RPC handlers, with extra state seeded straight into the store.
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { configure, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
 import type { Engine } from "../src/engine.ts";
@@ -29,6 +29,9 @@ const METHODS = [
   "study.resume",
   "study.concurrency",
 ];
+
+// The full suite runs real-git tests in parallel; give async queries room under load.
+configure({ asyncUtilTimeout: 8000 });
 
 describe("frontend: M3 study tabs", () => {
   let harness: Harness;
@@ -95,7 +98,9 @@ describe("frontend: M3 study tabs", () => {
     await page.findByText("Trailing whitespace was 20% of the output.");
     expect(page.getByText("Gzip is out of scope.")).toBeTruthy();
     expect(page.getByText("the output format changes")).toBeTruthy();
-    expect(page.getByLabelText("Findings").textContent).toMatch(/Shrink the output.*size.*c\/1.*win.*−20\.0%/u);
+    expect(page.getByLabelText("Findings").textContent).toMatch(/Shrink the output.*size.*c\/1.*win.*\+20\.0%/u);
+    // A finding without an idea says so (no blank theme).
+    expect(page.getByLabelText("Findings").textContent).toMatch(/not tied to an idea· no theme/u);
 
     fireEvent.change(page.getByLabelText("Search findings"), { target: { value: "gzip" } });
     await waitFor(() => expect(page.inspection.rpcCalls.some((c) => c.method === "study.findings" && (c.input as { query?: string }).query === "gzip")).toBe(true));
@@ -150,9 +155,12 @@ describe("frontend: M3 study tabs", () => {
 
   it("harvest: empty state starts a dry run", async () => {
     const page = await open("toy-size/harvest");
-    await page.findByText(/A harvest started here is a dry run/u);
+    await page.findByText(/A dry run: nothing is pushed until you publish/u);
     expect(page.getByText("bb study harvest toy-size")).toBeTruthy();
-    fireEvent.click(await page.findByRole("button", { name: "Start harvest (dry run)" }));
+    fireEvent.click(await page.findByRole("button", { name: "Start harvest…" }));
+    // A deliberate step: the dialog says what happens, then the confirm button starts it.
+    await page.findByText(/candidates in flight finish first/u);
+    fireEvent.click(await page.findByRole("button", { name: "Start harvest" }));
     await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size" }));
     await waitUntil(() => engine.ctx.store.latestHarvest(study().id) !== undefined);
     expect(study().state).toBe("harvesting");
@@ -183,23 +191,28 @@ describe("frontend: M3 study tabs", () => {
     });
     const page = await open("toy-size/harvest");
     const list = await page.findByLabelText("Changesets");
-    expect(list.textContent).toMatch(/#1Drop trailing whitespace.*contribution \+5\.00% \(CI \+4\.00% … \+6\.00%\), n=5/u);
-    expect(list.textContent).toMatch(/#2Compact the header.*depends on #1/u);
-    expect(list.textContent).toContain("needed by #2");
-    expect(list.textContent).toContain("standalone: conflict: does not apply on base");
-    expect(page.getByRole("alert").textContent).toMatch(/Interaction warning/u);
+    // Contributions are shares of the base→best gain (0.05 of 0.2 = 25%), with the CI.
+    expect(list.textContent).toMatch(/#1Drop trailing whitespace.*Contributes 25.0% of the gain \(CI 20.0% to 30.0%\).*5 pairs/u);
+    expect(list.textContent).toMatch(/#2Compact the header.*Builds on #1/u);
+    expect(list.textContent).toContain("#2 builds on this one.");
+    expect(list.textContent).toMatch(/Ships in stack 1 \(#1 → #2\), as the first PR, based on main/u);
+    expect(list.textContent).toContain("Alone on its PR base (stacked on studies/toy-size/pr/1): conflict: does not apply on base");
+    expect(list.textContent).not.toContain("base base");
+    expect(page.getByRole("alert").textContent).toMatch(/The changes interact/u);
     expect(page.getByLabelText("Stacks").textContent).toContain("#1 → #2");
-    fireEvent.click(page.getByText(/PR draft: Drop trailing whitespace/u));
+    fireEvent.click(page.getByText(/PR preview: Drop trailing whitespace/u));
     expect(page.getByText(/Whitespace-body-marker/u)).toBeTruthy();
     expect(page.getByText("bb study harvest toy-size --publish")).toBeTruthy();
     expect(page.getByText("/exports/h1")).toBeTruthy();
-    expect(page.queryByRole("button", { name: /publish/iu })).toBeNull();
+    // Publishing is in the app now, behind a confirmation.
+    expect(page.getByRole("button", { name: "Publish draft PRs…" })).toBeTruthy();
     // A new dry run is offered once this one is ready.
-    fireEvent.click(page.getByRole("button", { name: "Start a new harvest (dry run)" }));
+    fireEvent.click(page.getByRole("button", { name: "Start a new harvest…" }));
+    fireEvent.click(await page.findByRole("button", { name: "Start harvest" }));
     await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size", restart: true }));
     await waitUntil(() => store.harvests(s.id).length === 2);
     // Report on demand.
-    fireEvent.click(page.getByRole("button", { name: "Load report" }));
+    fireEvent.click(page.getByRole("button", { name: "Show report" }));
     expect((await page.findByLabelText("Study report")).textContent).toContain("toy-size");
   });
 

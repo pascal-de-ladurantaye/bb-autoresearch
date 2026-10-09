@@ -5,13 +5,12 @@ import { cn } from "@/lib/utils";
 import { BenchHostList } from "./BenchHosts.tsx";
 import { useLive } from "./data.ts";
 import { ago, bytes, duration, frac, ratio, shortSha } from "./format.ts";
-import { EmptyState, ErrorLine, Mono, Section, Stat } from "./ui.tsx";
+import { EmptyState, Mono, Section, Stat, TabState } from "./ui.tsx";
 
 export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandidate: (n: number) => void }) {
   const b = useLive((rpc) => rpc.call("study.bench", { slug }), [slug], 10_000);
   const v = b.data;
-  if (!v) return b.error ? <ErrorLine error={b.error} /> : <EmptyState>Loading bench…</EmptyState>;
-  const hostName = (id: string) => v.hosts.find((h) => h.hostId === id)?.name ?? id;
+  if (!v) return <TabState loading={b.loading} error={b.error} retry={b.refetch} label="the bench" />;
   const u = v.utilization;
   const cand = (n: number | null) =>
     n === null ? (
@@ -23,9 +22,9 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
     );
   return (
     <div className="space-y-5">
-      <ErrorLine error={b.error} />
+      {b.error ? <TabState loading={false} error={b.error} retry={b.refetch} label="the bench" /> : null}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-        <Stat label="Bench utilization" value={ratio(u.ratio)} hint={`${ratio(u.steadyRatio)} since first submission`} />
+        <Stat label="Bench utilization" help="utilization" value={ratio(u.ratio)} hint={`${ratio(u.steadyRatio)} since the first submission`} />
         <Stat label="Busy" value={duration(u.busySeconds)} hint={`of ${duration(u.runningSeconds)} running`} />
         <Stat label="Queue" value={v.queue.length} hint={u.overlaps ? `${u.overlaps} overlapping interval(s)` : "no overlaps"} />
         <Stat label="Gate runs" value={`${v.gates.flaky} flaky · ${v.gates.failed} failed`} hint="last 200 gate events" />
@@ -44,7 +43,7 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
                   {q.stage}
                   {q.rebases ? <span className="text-xs text-muted-foreground"> · rebased {q.rebases}×</span> : null}
                 </Td>
-                <Td className="text-xs text-muted-foreground">{q.benchHostId ? hostName(q.benchHostId) : "—"}</Td>
+                <Td className="text-xs text-muted-foreground">{q.benchHostName ?? "—"}</Td>
                 <Td className="text-xs text-muted-foreground">{ago(q.queuedAt)}</Td>
               </tr>
             ))}
@@ -58,13 +57,16 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
         {v.health.length ? (
           <Table head={["When", "Host", "Context", "Result", "Summary"]} label="Health checks">
             {v.health.map((h) => (
-              <tr key={h.id} className="border-b border-border align-top last:border-0">
-                <Td className="text-xs text-muted-foreground">{ago(h.at)}</Td>
-                <Td>{hostName(h.hostId)}</Td>
+              <tr key={h.id} className={cn("border-b border-border align-top last:border-0", h.latest && "bg-state-active")}>
+                <Td className="text-xs text-muted-foreground">
+                  {ago(h.at)}
+                  {h.latest ? <span className="ml-1 rounded bg-foreground px-1 text-[10px] font-medium text-background">latest</span> : null}
+                </Td>
+                <Td>{h.hostName}</Td>
                 <Td className="text-xs">{h.context}</Td>
-                <Td className={cn("text-xs", h.ok ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400")}>
-                  {h.ok ? "ok" : "problems"}
-                  {h.problems.length ? <div className="text-amber-700 dark:text-amber-300">{h.problems.join("; ")}</div> : null}
+                <Td className={cn("text-xs", h.ok ? "text-success" : "text-warning-text")}>
+                  {h.ok ? "✓ ok" : "⚠ problems"}
+                  {h.problems.length ? <div className="text-warning-text">{h.problems.join("; ")}</div> : null}
                 </Td>
                 <Td className="text-xs text-muted-foreground">{h.summary || "—"}</Td>
               </tr>
@@ -75,18 +77,18 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
         )}
       </Section>
 
-      <Section title={`Drift checks (${v.drift.length})`}>
+      <Section title={`Drift checks (${v.drift.length})`} help="drift">
         {v.drift.length ? (
           <Table head={["Started", "Host", "Segment", "Best", "Status", "Pairs", "Noise", "Calibrated", "Ratio"]} label="Drift checks">
             {v.drift.map((d) => (
               <tr key={d.id} className="border-b border-border last:border-0">
                 <Td className="text-xs text-muted-foreground">{ago(d.startedAt)}</Td>
-                <Td>{hostName(d.hostId)}</Td>
+                <Td>{d.hostName}</Td>
                 <Td className="tabular-nums">{d.segment}</Td>
                 <Td>
                   <Mono>{shortSha(d.bestSha)}</Mono>
                 </Td>
-                <Td className={cn("text-xs", d.status === "drift" || d.status === "error" ? "text-amber-600 dark:text-amber-400" : "")}>{d.status}</Td>
+                <Td className={cn("text-xs", d.status === "drift" || d.status === "error" ? "text-warning-text" : "")}>{d.status}</Td>
                 <Td className="tabular-nums">{d.pairs ?? "—"}</Td>
                 <Td className="tabular-nums">{frac(d.noise)}</Td>
                 <Td className="tabular-nums">{frac(d.calibrated)}</Td>
@@ -105,7 +107,7 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
             {v.transfers.map((t) => (
               <tr key={t.id} className="border-b border-border align-top last:border-0">
                 <Td className="text-xs text-muted-foreground">{ago(t.at)}</Td>
-                <Td>{hostName(t.hostId)}</Td>
+                <Td>{t.hostName}</Td>
                 <Td>
                   <Mono>{shortSha(t.sha)}</Mono>
                 </Td>
@@ -113,7 +115,7 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
                 <Td className="tabular-nums">{bytes(t.bytes)}</Td>
                 <Td className="tabular-nums">{t.chunks}</Td>
                 <Td className="tabular-nums">{t.ms} ms</Td>
-                <Td className={cn("text-xs", t.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive")}>{t.ok ? "ok" : `failed${t.error ? `: ${t.error}` : ""}`}</Td>
+                <Td className={cn("text-xs", t.ok ? "text-success" : "text-destructive")}>{t.ok ? "✓ ok" : `✗ failed${t.error ? `: ${t.error}` : ""}`}</Td>
               </tr>
             ))}
           </Table>
@@ -128,7 +130,7 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
             {v.intervals.map((i) => (
               <tr key={i.id} className="border-b border-border last:border-0">
                 <Td className="text-xs text-muted-foreground">{ago(i.startedAt)}</Td>
-                <Td>{hostName(i.hostId)}</Td>
+                <Td>{i.hostName}</Td>
                 <Td className="text-xs">{i.kind}</Td>
                 <Td>{cand(i.candidate)}</Td>
                 <Td className="tabular-nums">

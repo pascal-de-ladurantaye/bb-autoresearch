@@ -56,7 +56,13 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
       return { threadId: thread.id, environmentId: thread.environmentId };
     },
     async send(threadId, text) {
-      await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text, mentions: [] }] });
+      // A structured message: the human sees the one-line summary in the
+      // timeline; the detail is an agent-only block (still in the agent's context).
+      const input =
+        typeof text === "string"
+          ? [{ type: "text" as const, text, mentions: [] }]
+          : [{ type: "text" as const, text: text.summary, mentions: [] }, ...(text.detail ? [{ type: "text" as const, text: text.detail, mentions: [], visibility: "agent-only" as const }] : [])];
+      await bb.sdk.threads.send({ threadId, mode: "auto", input });
     },
     async steer(threadId, text) {
       await bb.sdk.threads.send({ threadId, mode: "steer", input: [{ type: "text", text, mentions: [] }] });

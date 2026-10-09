@@ -121,16 +121,18 @@ Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries m
 
 Call `study_propose` with the full TOML. If it returns errors, fix them and call it again (same slug). This thread becomes the study thread: later you receive `[autoresearch]` strategist rounds here.
 
-Then tell the human, in two or three lines:
+Then tell the human, in two or three lines, that the study waits for them on the **Studies** page (sidebar → Studies → `<slug>`; the header badge of this thread links there):
 
-1. Review: `bb study show <slug>`
-2. Approve and calibrate: `bb study calibrate <slug>` (gates on base, then A/A noise measurement; prints the detectable effect and cost per evaluation)
-3. Start: `bb study start <slug>`. Seed ideas any time with `bb study ideas add <slug> "<idea>"` or on the **Studies** page in the sidebar, which also shows calibration results, the trajectory, and every candidate.
+1. **Needs you → Approve spec vN and calibrate**: they review the spec on the Oracle tab and approve it in the app (CLI: `bb study calibrate <slug>`). Calibration runs the gates on the base commit, then A/A measurements, and reports the smallest win it can detect and the cost per evaluation.
+2. **Needs you → Approve and start** once calibration is ready (CLI: `bb study start <slug>`).
+3. Ideas can be seeded on the Ideas tab (or `bb study ideas add <slug> "<idea>"`) at any time.
+
+Keep numbers in the plugin's convention: better is positive, in the metric's own terms ("12% lower p99", "+12%").
 
 The plugin doesn't start turns in this thread to report calibration: the result is a notice on the Studies page, and it reaches you with the human's next message here.
 
-Never run those commands yourself: approval, calibration, starting, and pausing are the human's decisions.
+Never approve, calibrate, start, or pause yourself (neither in the app nor with the CLI): those are the human's decisions.
 
 ## Revising the spec later
 
-Once the study has run, `study_propose` with the same slug records a **pending** spec; the study keeps running on the old one. If the oracle is unchanged (budget, agents, scope limits), the human applies it with `bb study approve <slug>`. If the oracle changed (metric, guardrails, commands, protocol, bench hosts, holdout, protected paths), the human runs `bb study calibrate <slug>`: in-flight measurements are cancelled, best is calibrated under the new oracle, and `bb study start` opens a new segment.
+Once the study has run, `study_propose` with the same slug records a **pending** spec; the study keeps running on the old one. If the oracle is unchanged (budget, agents, scope limits), the human applies it on the Oracle tab ("Apply spec…", or `bb study approve <slug>`). If the oracle changed (metric, guardrails, commands, protocol, bench hosts, holdout, protected paths), the human approves and recalibrates there ("Approve and recalibrate…", or `bb study calibrate <slug>`): in-flight measurements are cancelled, best is calibrated under the new oracle, and approving that calibration opens a new segment.

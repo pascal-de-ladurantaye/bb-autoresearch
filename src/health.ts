@@ -84,7 +84,7 @@ export async function checkHealth(
     store.updateBenchHost(study.id, host.host_id, { unhealthy_notified_at: now });
     await notify(
       "bench.unhealthy",
-      `Bench host ${host.name} has failed its health check for ${Math.round((now - since) / 60_000)} min; measurements on it are deferred. ${a.problems.join("; ")}. (${a.summary})`,
+      `Bench host ${host.name} has failed its health check for ${Math.round((now - since) / 60_000)} min, so measurements on it wait. Next: quiet the machine, or loosen [oracle.health] with a spec change (Bench tab).\n${a.problems.join("; ")}. (${a.summary})`,
     );
   }
   return { ...a, skipped: false };

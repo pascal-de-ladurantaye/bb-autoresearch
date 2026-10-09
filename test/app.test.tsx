@@ -3,12 +3,15 @@
 // (fake plugin host + fake bench host behind them).
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { configure, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
 import { FakeHost, FakePort, fakeHostSpec, waitFor as waitUntil } from "./helpers.ts";
 
 type Harness = ReturnType<typeof createFakePluginHost>["harness"];
+
+// The full suite runs real-git tests in parallel; give async queries room under load.
+configure({ asyncUtilTimeout: 8000 });
 
 describe("frontend: Studies panel and thread badge", () => {
   let harness: Harness;
@@ -54,17 +57,20 @@ describe("frontend: Studies panel and thread badge", () => {
     const app = await loadPluginApp(() => import("../app.tsx"));
     const list = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: realRpc() });
     await list.findByText("toy-size");
-    expect(await list.findByText("−20.0%")).toBeTruthy();
+    // Better is positive, in the metric's own words.
+    expect(await list.findByText("20.0% lower size")).toBeTruthy();
     fireEvent.click(list.getByText("toy-size"));
     expect(list.inspection.navigateCalls.at(-1)).toMatchObject({ method: "toPluginPanel" });
     list.lifecycle.unmount();
 
     const page = renderSlot(app.navPanels[0]!, { subPath: "toy-size/overview" }, { rpc: realRpc() });
     await page.findByText("Trajectory");
-    await page.findByText(/Bench utilization/u);
-    expect(page.getAllByText("−20.0%").length).toBeGreaterThan(0);
+    await page.findByText(/Best vs base \(size, lower is better\)/u);
+    expect(page.getAllByText("20.0% lower size").length).toBeGreaterThan(0);
+    // The raw values travel with the improvement.
+    expect(page.getByText(/1,000 → 800/u)).toBeTruthy();
     // M2: bench hosts with health, drift and segment on the Overview.
-    await page.findByText(/Bench hosts \(1\) · segment 1 · oracle [0-9a-f]{16}/u);
+    await page.findByText(/Bench hosts \(1\) · segment 1/u);
     expect(page.getByLabelText("Bench hosts").textContent).toMatch(/local checkouts.*healthy.*drift not run/u);
     // Pause from the page: the real handler runs.
     fireEvent.click(await page.findByText("Pause"));
@@ -93,7 +99,7 @@ describe("frontend: Studies panel and thread badge", () => {
     const app = await loadPluginApp(() => import("../app.tsx"));
     const badge = app.threadHeaderActions[0]!;
     const study = renderSlot(badge, { threadId: "thr_study", projectId: "proj_1", isCompactViewport: false }, { rpc: realRpc() });
-    await study.findByText(/run 1 · best −20\.0%/u);
+    await study.findByText(/20\.0% lower size · 1 worker/u);
     study.lifecycle.unmount();
     const worker = renderSlot(badge, { threadId: "thr_w1", projectId: "proj_1", isCompactViewport: false }, { rpc: realRpc() });
     await worker.findByText(/toy-size · idea #1 · submission 1\/2/u);

@@ -1,25 +1,36 @@
 // Oracle tab: the active spec (holdout redacted by the server), a pending
-// spec with its diff and the CLI command that approves it, version history,
-// the calibration report, and segments. Approval is CLI-only by design.
+// spec with its diff and the button that approves it, version history, the
+// calibration report with its approval, and segments. In-app and CLI
+// approval are equivalent and audited the same way (threat model).
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { OracleView } from "../views.ts";
-import { useLive } from "./data.ts";
+import type { OracleView, OverviewResult } from "../views.ts";
+import { ApproveSpecDialog, StartDialog } from "./Actions.tsx";
+import { useLive, type Rpc } from "./data.ts";
 import { ago, duration, frac, shortSha } from "./format.ts";
-import { EmptyState, ErrorLine, Mono, Section, StatePill } from "./ui.tsx";
+import { Callout, EmptyState, Help, Mono, Section, StatePill, TabState } from "./ui.tsx";
 
-export function OracleTab({ slug }: { slug: string }) {
-  const o = useLive((rpc) => rpc.call("study.oracle", { slug }), [slug], 15_000);
+export function OracleTab({ slug, o: overview, rpc, onChanged }: { slug: string; o: OverviewResult; rpc: Rpc; onChanged: () => void }) {
+  const o = useLive((r) => r.call("study.oracle", { slug }), [slug], 15_000);
+  const [dialog, setDialog] = useState<null | { kind: "approve"; version: number; changesOracle: boolean } | { kind: "start" }>(null);
   const v = o.data;
-  if (!v) return o.error ? <ErrorLine error={o.error} /> : <EmptyState>Loading oracle…</EmptyState>;
+  if (!v) return <TabState loading={o.loading} error={o.error} retry={o.refetch} label="the oracle" />;
+  const done = () => {
+    o.refetch();
+    onChanged();
+  };
   return (
     <div className="space-y-5">
-      <ErrorLine error={o.error} />
-      {v.pending ? <PendingSpec pending={v.pending} active={v.specVersion} /> : null}
-      <Calibration c={v.calibration} />
+      {o.error ? <TabState loading={false} error={o.error} retry={o.refetch} label="the oracle" /> : null}
+      {v.pending ? <PendingSpec pending={v.pending} active={v.specVersion} onApprove={() => setDialog({ kind: "approve", version: v.pending!.version, changesOracle: v.pending!.changesOracle })} /> : null}
+      <Calibration c={v.calibration} specVersion={v.specVersion} onAction={(a) => setDialog(a.kind === "start" ? { kind: "start" } : { kind: "approve", version: a.version, changesOracle: a.changesOracle })} />
+      {dialog?.kind === "approve" ? <ApproveSpecDialog o={overview} version={dialog.version} changesOracle={dialog.changesOracle} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
+      {dialog?.kind === "start" ? <StartDialog o={overview} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
       <Section title={`Active spec v${v.specVersion}${v.holdoutConfigured ? " · holdout configured (hidden)" : ""}`}>
         {v.activeToml ? <pre className="max-h-96 overflow-auto rounded-md border border-border bg-muted p-3 font-mono text-xs" aria-label="Active spec">{v.activeToml}</pre> : <EmptyState>No active spec.</EmptyState>}
       </Section>
-      <Section title={`Segments (${v.segments.length})`}>
+      <Section title={`Segments (${v.segments.length})`} help="segment">
         {v.segments.length ? (
           <div className="overflow-x-auto rounded-lg border border-border bg-card">
             <table className="w-full text-sm" aria-label="Segments">
@@ -30,8 +41,8 @@ export function OracleTab({ slug }: { slug: string }) {
                   <th className="px-3 py-2 font-medium">Spec</th>
                   <th className="px-3 py-2 font-medium">Baseline</th>
                   <th className="px-3 py-2 text-right font-medium">Noise floor</th>
-                  <th className="px-3 py-2 text-right font-medium">MDE</th>
-                  <th className="px-3 py-2 text-right font-medium">Eval</th>
+                  <th className="px-3 py-2 text-right font-medium">Win threshold (MDE)</th>
+                  <th className="px-3 py-2 text-right font-medium">Per evaluation</th>
                   <th className="px-3 py-2 font-medium">Hosts</th>
                 </tr>
               </thead>
@@ -40,7 +51,8 @@ export function OracleTab({ slug }: { slug: string }) {
                   <tr key={g.k} className={cn("border-b border-border align-top last:border-0", g.active && "bg-state-active")}>
                     <td className="px-3 py-2 tabular-nums">
                       {g.k}
-                      {g.active ? <span className="ml-1 text-xs text-emerald-600 dark:text-emerald-400">active</span> : null}
+                      {g.active ? <span className="ml-1 text-xs text-success">active</span> : null}
+                      {g.awaitingApproval ? <span className="ml-1 text-xs text-foreground">awaiting your approval</span> : null}
                     </td>
                     <td className="px-3 py-2">
                       <Mono>{g.oracleHash}</Mono>
@@ -61,7 +73,7 @@ export function OracleTab({ slug }: { slug: string }) {
             </table>
           </div>
         ) : (
-          <EmptyState>No segments yet: the first one starts when the study is calibrated and started.</EmptyState>
+          <EmptyState>No segments yet: the first one is created by calibration and starts when you approve it.</EmptyState>
         )}
       </Section>
       <Section title={`Spec versions (${v.versions.length})`}>
@@ -81,8 +93,8 @@ export function OracleTab({ slug }: { slug: string }) {
                 <tr key={s.version} className={cn("border-b border-border last:border-0", s.active && "bg-state-active")}>
                   <td className="px-3 py-2 tabular-nums">
                     v{s.version}
-                    {s.active ? <span className="ml-1 text-xs text-emerald-600 dark:text-emerald-400">active</span> : null}
-                    {s.pending ? <span className="ml-1 text-xs text-sky-600 dark:text-sky-400">pending</span> : null}
+                    {s.active ? <span className="ml-1 text-xs text-success">active</span> : null}
+                    {s.pending ? <span className="ml-1 text-xs text-foreground">pending your approval</span> : null}
                   </td>
                   <td className="px-3 py-2">
                     <Mono>{s.oracleHash}</Mono>
@@ -100,21 +112,20 @@ export function OracleTab({ slug }: { slug: string }) {
   );
 }
 
-function PendingSpec({ pending, active }: { pending: NonNullable<OracleView["pending"]>; active: number }) {
+function PendingSpec({ pending, active, onApprove }: { pending: NonNullable<OracleView["pending"]>; active: number; onApprove: () => void }) {
   return (
     <Section title={`Pending spec v${pending.version}`}>
-      <div role="status" className="space-y-1 rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-sm">
-        <p>
-          Spec v{pending.version} waits for approval; the study keeps running on v{active}.{" "}
-          {pending.changesOracle ? `The oracle changed (${pending.oracleHash}): approving recalibrates and starts a new segment.` : "The oracle is unchanged: approving applies it without recalibration."}
-        </p>
-        <p>
-          Approve from a terminal: <Mono className="text-foreground">{pending.command}</Mono>
-        </p>
-      </div>
+      <Callout
+        tone="action"
+        title={`Spec v${pending.version} waits for your approval; the study keeps running on v${active}.`}
+        actions={<Button size="sm" onClick={onApprove}>{pending.changesOracle ? "Approve and recalibrate…" : "Apply spec…"}</Button>}
+      >
+        {pending.changesOracle ? `The oracle changed (${pending.oracleHash}): approving recalibrates on the current best and starts a new segment.` : "The oracle is unchanged: approving applies it without recalibration."} CLI <Mono>{pending.command}</Mono>. The diff below is
+        against v{active}.
+      </Callout>
       <pre className="max-h-96 overflow-auto rounded-md border border-border bg-card p-2 font-mono text-xs" aria-label="Pending spec diff">
         {pending.diff.map((l, i) => (
-          <div key={i} className={cn(l.op === "add" && "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300", l.op === "del" && "bg-red-500/15 text-red-700 dark:text-red-300")}>
+          <div key={i} className={cn(l.op === "add" && "bg-success/15 text-success", l.op === "del" && "bg-destructive/15 text-destructive")}>
             {l.op === "add" ? "+ " : l.op === "del" ? "- " : "  "}
             {l.text}
           </div>
@@ -124,14 +135,23 @@ function PendingSpec({ pending, active }: { pending: NonNullable<OracleView["pen
   );
 }
 
-function Calibration({ c }: { c: OracleView["calibration"] }) {
+function Calibration({ c, specVersion, onAction }: { c: OracleView["calibration"]; specVersion: number; onAction: (a: NonNullable<OracleView["calibration"]["action"]>) => void }) {
   return (
-    <Section title="Calibration">
+    <Section title="Calibration" help="calibration">
+      {c.action ? (
+        <Callout
+          tone="action"
+          title={c.action.kind === "start" ? "Calibration is ready: review it, then approve and start." : c.status === "failed" ? `The last calibration failed. Approve spec v${specVersion} to calibrate again.` : `Spec v${specVersion} waits for your approval.`}
+          actions={<Button size="sm" onClick={() => onAction(c.action!)}>{c.action.kind === "start" ? "Approve and start…" : "Approve and calibrate…"}</Button>}
+        >
+          {c.action.kind === "start" ? "Starting spawns workers and spends tokens and bench time." : "Approving runs the gates on the base commit, then A/A measurements to learn the noise."} CLI <Mono>{c.nextCommand}</Mono>
+        </Callout>
+      ) : null}
       <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
           <StatePill state={c.status ?? "not run"} />
-          {c.ok !== null ? <span className={c.ok ? "text-xs text-emerald-600 dark:text-emerald-400" : "text-xs text-destructive"}>{c.ok ? "passed" : "failed"}</span> : null}
-          <span className="text-xs text-muted-foreground">{c.approved ? "approved" : "not approved"}</span>
+          {c.ok !== null ? <span className={c.ok ? "text-xs text-success" : "text-xs text-destructive"}>{c.ok ? "passed" : "failed"}</span> : null}
+          <span className="text-xs text-muted-foreground">{c.approved ? "approved" : "not approved yet"}</span>
           {c.baselineSha ? (
             <span className="text-xs text-muted-foreground">
               baseline <Mono>{shortSha(c.baselineSha)}</Mono>
@@ -144,9 +164,10 @@ function Calibration({ c }: { c: OracleView["calibration"] }) {
           ) : null}
           {c.finishedAt ? <span className="text-xs text-muted-foreground">finished {ago(c.finishedAt)}</span> : null}
         </div>
-        {c.nextCommand ? (
-          <p>
-            Next: <Mono className="text-foreground">{c.nextCommand}</Mono>
+        {c.hosts.length ? (
+          <p className="text-sm">
+            A win must improve by more than <strong>{frac(Math.max(...c.hosts.map((h) => h.mde)))}</strong> with confidence <Help term="mde" />
+            {c.detectable !== null ? <> (in practice, changes of about {frac(c.detectable)} or more are detected)</> : null}. Run-to-run noise is {frac(Math.max(...c.hosts.map((h) => h.noiseFloor)))} per pair <Help term="noiseFloor" />.
           </p>
         ) : null}
         {c.problems.length ? (
@@ -162,8 +183,8 @@ function Calibration({ c }: { c: OracleView["calibration"] }) {
               <tr>
                 <th className="py-1 font-medium">Host</th>
                 <th className="py-1 text-right font-medium">Noise floor</th>
-                <th className="py-1 text-right font-medium">MDE</th>
-                <th className="py-1 text-right font-medium">Eval</th>
+                <th className="py-1 text-right font-medium">Win threshold (MDE)</th>
+                <th className="py-1 text-right font-medium">Per evaluation</th>
               </tr>
             </thead>
             <tbody>

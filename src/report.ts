@@ -6,13 +6,43 @@ import type { Ctx } from "./context.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
 import { harvestAccounting, type Accounting, type Estimate } from "./harvest-math.ts";
 import type { StackRecord } from "./harvest.ts";
+import { amountText, ciText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
-import { formatPct, type StudySpec } from "./spec.ts";
+import type { StudySpec } from "./spec.ts";
 
-const pct = (v: number | null | undefined) => formatPct(v ?? null);
+// Every number follows src/present.ts: better is positive, in the metric's
+// own terms; harvest contributions are shares of the base→best gain.
+const pct = (v: number | null | undefined) => signedPct(v ?? null, 2);
 
 function ci(lo: number | null, hi: number | null): string {
-  return lo === null || hi === null ? "" : ` (CI ${pct(lo)}..${pct(hi)})`;
+  return lo === null || hi === null ? "" : ` (${ciText(lo, hi, 2)})`;
+}
+
+function metricOf(spec: StudySpec): MetricInfo {
+  return { name: spec.metric.name, unit: spec.metric.unit, direction: spec.metric.direction };
+}
+
+/** An improvement in words with its CI: "62.9% fewer ops (CI +62.6% to +63.3%)". */
+function better(spec: StudySpec, v: number | null, lo: number | null = null, hi: number | null = null): string {
+  return v === null ? "not measured" : `${improvementText(v, metricOf(spec), { factor: false })}${lo !== null && hi !== null ? ` (${ciText(lo, hi)})` : ""}`;
+}
+
+/** Raw value of the primary metric on best (the promoted candidate's median), for metric units. */
+function bestRaw(ctx: Ctx, study: StudyRow, spec: StudySpec): number | null {
+  const promoted = ctx.store.candidates(study.id, { stages: ["decided"] }).find((c) => c.promoted_sha === study.best_sha);
+  const v = promoted ? safeJson<{ candidate?: Record<string, number> }>(promoted.metrics_json)?.candidate?.[spec.metric.name] : undefined;
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** A relative-to-best term as a share of the harvest's total gain: "83.0% of the gain (CI 82.5% to 83.3%) · ≈ 171,456 fewer opcodes". */
+export function shareText(e: Estimate | null, total: number | null, metric: MetricInfo, raw: number | null = null): string {
+  if (!e) return "not measured";
+  const share = shareOfGain(e.value, total);
+  if (share === null) return `${pct(e.value)} vs best (total gain not measured)`;
+  const lo = e.lo === null ? null : shareOfGain(e.lo, total);
+  const hi = e.hi === null ? null : shareOfGain(e.hi, total);
+  const units = raw !== null ? ` · ${amountText(e.value * Math.abs(raw), metric)}` : "";
+  return `${sharePct(share, 1)} of the gain${lo !== null && hi !== null ? ` (CI ${sharePct(Math.min(lo, hi), 1)} to ${sharePct(Math.max(lo, hi), 1)})` : ""}${units}`;
 }
 
 export function estimateText(e: Estimate | null): string {
@@ -30,11 +60,19 @@ export function accountingFor(ctx: Ctx, h: HarvestRow): Accounting {
   });
 }
 
-export function accountingText(a: Accounting): string[] {
+export function accountingText(a: Accounting, spec?: StudySpec): string[] {
   const lines: string[] = [];
-  lines.push(`- Total gain (base vs best, relative to best): ${estimateText(a.total)}`);
-  lines.push(`- Sum of contributions: ${a.sum === null ? "n/a" : `${pct(a.sum)}${a.sumHalfWidth !== null ? ` ± ${(a.sumHalfWidth * 100).toFixed(2)}%` : ""}`} over ${a.items.filter((i) => i.estimate).length} term(s)`);
-  if (a.gap !== null) lines.push(`- Gap (total − sum): ${pct(a.gap)}${a.gapHalfWidth !== null ? ` (CI half-width ${(a.gapHalfWidth * 100).toFixed(2)}%)` : ""}`);
+  const t = a.total?.value ?? null;
+  const share = (v: number | null) => (v === null || t === null || t === 0 ? null : v / t);
+  if (spec && t !== null) {
+    const m = metricOf(spec);
+    const vb = vsBaseFromVsBest(t, m.direction);
+    const lo = vsBaseFromVsBest(a.total?.lo, m.direction);
+    const hi = vsBaseFromVsBest(a.total?.hi, m.direction);
+    lines.push(`- Measured gain (base vs best): ${improvementText(vb, m)}${lo !== null && hi !== null ? ` (${ciText(lo, hi)})` : ""}`);
+  } else lines.push(`- Measured gain (base vs best): ${a.total ? "see below" : "not measured"}`);
+  lines.push(`- Explained by the ${a.items.filter((i) => i.estimate).length} measured term(s): ${a.sum === null || share(a.sum) === null ? "n/a" : `${sharePct(share(a.sum), 1)} of the gain${a.sumHalfWidth !== null ? ` ± ${sharePct(share(a.sumHalfWidth), 1)}` : ""}`}`);
+  if (a.gap !== null && share(a.gap) !== null) lines.push(`- Unexplained: ${sharePct(share(a.gap), 1)}${a.gapHalfWidth !== null ? ` (noise allows ± ${sharePct(share(a.gapHalfWidth), 1)})` : ""}`);
   if (a.missing.length) lines.push(`- Not measured: ${a.missing.join(", ")}`);
   if (a.interaction) {
     lines.push(
@@ -69,18 +107,20 @@ export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow
   const nums = safeJson<number[]>(cs.candidates_json) ?? [];
   const cands = nums.map((n) => ctx.store.candidateByN(study.id, n)).filter((c): c is CandidateRow => Boolean(c));
   const deps = (safeJson<number[]>(cs.depends_on_json) ?? []).map((id) => all.find((c) => c.id === id)).filter((c): c is ChangesetRow => Boolean(c));
+  const metric = metricOf(spec);
+  const raw = bestRaw(ctx, study, spec);
   const lines = [
     `## What`,
     clip(cs.title, 200),
     "",
-    ...cands.map((c) => `- c/${c.n}: ${clip(c.summary.split("\n")[0] ?? "", 200)} (measured ${pct(c.effect)}${ci(c.ci_lo, c.ci_hi)} when promoted)`),
+    ...cands.map((c) => `- c/${c.n}: ${clip(c.summary.split("\n")[0] ?? "", 200)} (when promoted: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it)`),
     "",
     `## Why`,
     clip(cs.rationale || "Promoted by the autoresearch study because it measurably improved the metric.", 2000),
     "",
     `## Measured effect on \`${spec.metric.name}\` (${spec.metric.direction} is better, ${spec.oracle.noise} oracle)`,
-    `- Contribution (ablation: best without this change, measured against best): ${cs.contribution === null ? `not measured alone (${cs.ablation_status}${cs.ablation_detail ? `: ${clip(cs.ablation_detail, 200)}` : ""})` : `${pct(cs.contribution)}${ci(cs.ci_lo, cs.ci_hi)}, n=${cs.n ?? "?"}`}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
-    `- Standalone (applied on ${cs.pr_base === "base" || !cs.pr_base ? `\`${spec.study.base}\` at the study base` : `${cs.pr_base}`}): ${standaloneText(cs)}`,
+    `- Contribution: ${cs.contribution === null ? `not measured alone (${cs.ablation_status}${cs.ablation_detail ? `: ${clip(cs.ablation_detail, 200)}` : ""})` : `${shareText({ value: cs.contribution, lo: cs.ci_lo, hi: cs.ci_hi }, h.total_effect, metric, raw)} the study found (${cs.n ?? "?"} pairs; ablation: best with this change reverted is ${pct(cs.contribution)} worse than best)`}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
+    `- Alone on ${cs.pr_base === "base" || !cs.pr_base ? `\`${spec.study.base}\`, the study base` : `the PR below it (${cs.pr_base})`}: ${standaloneText(cs, spec)}`,
   ];
   if (deps.length) lines.push(`- Depends on: ${deps.map((d) => `#${d.k} ${clip(d.title, 60)}`).join(", ")}${cs.dependency_reason ? ` (${clip(cs.dependency_reason, 300)})` : ""}`);
   const dependents = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(cs.id));
@@ -95,10 +135,14 @@ export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow
   return clip(lines.join("\n"), 60_000);
 }
 
-export function standaloneText(cs: ChangesetRow): string {
+export function standaloneText(cs: ChangesetRow, spec?: StudySpec): string {
   switch (cs.standalone_status) {
     case "pass":
-      return cs.standalone_effect === null ? "gates pass (effect not measured)" : `gates pass; effect ${pct(cs.standalone_effect)}${ci(cs.standalone_ci_lo, cs.standalone_ci_hi)}`;
+      return cs.standalone_effect === null
+        ? "gates pass (effect not measured)"
+        : spec
+          ? `gates pass; ${better(spec, cs.standalone_effect, cs.standalone_ci_lo, cs.standalone_ci_hi)}`
+          : `gates pass; effect ${pct(cs.standalone_effect)}${ci(cs.standalone_ci_lo, cs.standalone_ci_hi)}`;
     case "pending":
       return "not checked yet";
     default:
@@ -114,7 +158,8 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   const counts = new Map<string, number>();
   for (const c of decided) counts.set(c.verdict ?? "?", (counts.get(c.verdict ?? "?") ?? 0) + 1);
   const titles = new Map(store.ideas(study.id).map((i) => [i.id, i.title] as const));
-  const cumulative = wins.reduce((acc, c) => (c.effect === null ? acc : 1 - (1 - acc) * (1 - c.effect)), 0);
+  const metric = metricOf(spec);
+  const cumulative = compound(wins.filter((c) => c.effect !== null).map((c) => c.effect!), metric.direction);
   const budget = store.budget(study);
   const tokens = store.studyTokens(study.id);
   const lines: string[] = [
@@ -123,24 +168,25 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
     `> ${clip(spec.study.objective, 600)}`,
     "",
     `- State: ${study.state} · metric \`${spec.metric.name}\`${spec.metric.unit ? ` (${spec.metric.unit})` : ""}, ${spec.metric.direction} is better · ${spec.oracle.noise} oracle`,
-    `- Base \`${study.base_sha?.slice(0, 10) ?? "?"}\` → best \`${study.best_sha?.slice(0, 10) ?? "?"}\` (branch \`studies/${study.slug}/best\`): ${wins.length ? `${pct(cumulative)} (compounded promoted effects)` : "no promotion"}`,
+    `- Base \`${study.base_sha?.slice(0, 10) ?? "?"}\` → best \`${study.best_sha?.slice(0, 10) ?? "?"}\` (branch \`studies/${study.slug}/best\`): ${wins.length ? `${improvementText(cumulative, metric)} (compounded from the promoted candidates)` : "no promotion"}`,
+    `- Convention: every improvement is better-is-positive in the metric's own direction; "+10%" means 10% ${spec.metric.direction === "lower" ? "lower" : "higher"} ${spec.metric.name}.`,
     `- Candidates: ${decided.length} decided (${[...counts].map(([k, v]) => `${k} ${v}`).join(", ") || "none"}) · bench time ${formatDuration(budget.bench_seconds)} of ${spec.budget.max_bench_hours} h${tokens !== null ? ` · ${tokens.toLocaleString("en-US")} tokens${wins.length ? ` (${Math.round(tokens / wins.length).toLocaleString("en-US")} per win)` : ""}` : ""}`,
-    `- Guardrails: ${spec.guardrail.map((g) => `${g.name} ≤ ${pct(g.max_regression)} worse`).join(", ") || "none"}${spec.oracle.holdout ? " · holdout: configured (results private)" : ""}`,
+    `- Guardrails: ${spec.guardrail.map((g) => `${g.name} at most ${magnitudePct(g.max_regression, 1)} worse per promotion`).join(", ") || "none"}${spec.oracle.holdout ? " · holdout: configured (results private)" : ""}`,
     "",
     "## Trajectory",
     "",
-    "| # | Idea | Verdict | Effect | CI | Best after |",
+    "| # | Idea | Verdict | Improvement vs best then | CI | Best vs base after |",
     "|---|---|---|---|---|---|",
   ];
   let cum = 0;
   for (const c of decided.slice(-200)) {
-    if (c.verdict === "win" && c.effect !== null) cum = 1 - (1 - cum) * (1 - c.effect);
-    lines.push(`| c/${c.n} | ${mdCell(titles.get(c.idea_id ?? -1) ?? c.summary.split("\n")[0] ?? "", 60)} | ${c.verdict} | ${pct(c.effect)} | ${c.ci_lo !== null && c.ci_hi !== null ? `${pct(c.ci_lo)}..${pct(c.ci_hi)}` : ""} | ${pct(cum)} |`);
+    if (c.verdict === "win" && c.effect !== null) cum = compound([cum, c.effect], metric.direction);
+    lines.push(`| c/${c.n} | ${mdCell(titles.get(c.idea_id ?? -1) ?? c.summary.split("\n")[0] ?? "", 60)} | ${c.verdict} | ${signedPct(c.effect)} | ${c.ci_lo !== null && c.ci_hi !== null ? `${signedPct(Math.min(c.ci_lo, c.ci_hi))} to ${signedPct(Math.max(c.ci_lo, c.ci_hi))}` : ""} | ${signedPct(cum)} |`);
   }
   if (decided.length > 200) lines.push(`| … | ${decided.length - 200} earlier candidates omitted | | | | |`);
   lines.push("", "## Wins", "");
   if (!wins.length) lines.push("No promotions.");
-  for (const c of wins) lines.push(`- **c/${c.n}** ${mdText(titles.get(c.idea_id ?? -1) ?? "", 120)}: ${pct(c.effect)}${ci(c.ci_lo, c.ci_hi)} · ${mdText(c.summary.split("\n")[0] ?? "", 200)}`);
+  for (const c of wins) lines.push(`- **c/${c.n}** ${mdText(titles.get(c.idea_id ?? -1) ?? "", 120)}: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it · ${mdText(c.summary.split("\n")[0] ?? "", 200)}`);
   lines.push("", "## Notable losses and why", "");
   const losses = decided
     .filter((c) => ["lose", "inconclusive", "gate_failed", "rejected", "conflict"].includes(c.verdict ?? ""))
@@ -150,14 +196,14 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   for (const c of losses) {
     const reasons = safeJson<string[]>(c.reasons_json) ?? [];
     const finding = store.findings(study.id, { limit: 200 }).find((f) => f.candidate_id === c.id);
-    lines.push(`- c/${c.n} ${mdText(titles.get(c.idea_id ?? -1) ?? "", 100)}: **${c.verdict}** ${pct(c.effect)}${reasons[0] ? ` — ${mdText(reasons[0], 200)}` : ""}${finding ? `. Learned: ${mdText(finding.learned, 300)}` : ""}`);
+    lines.push(`- c/${c.n} ${mdText(titles.get(c.idea_id ?? -1) ?? "", 100)}: **${c.verdict}** ${signedPct(c.effect)}${reasons[0] ? ` — ${mdText(reasons[0], 200)}` : ""}${finding ? `. Learned: ${mdText(finding.learned, 300)}` : ""}`);
   }
   lines.push("", "## Dossier", "");
   const dossier = store.dossier(study.id);
   lines.push(dossier ? clip(dossier.text, 8000) : "No dossier was written.");
   lines.push("", "## Calibration and segments", "");
   for (const g of store.segments(study.id)) {
-    lines.push(`- Segment ${g.k}: oracle \`${g.oracle_hash}\`, spec v${g.spec_version ?? "?"}, baseline \`${g.baseline_sha.slice(0, 10)}\`, noise floor ${pct(g.noise_floor)}, MDE ${pct(g.mde)}, ≈${formatDuration(g.eval_seconds ?? 0)} per evaluation.${g.report ? ` ${mdText(g.report, 400)}` : ""}`);
+    lines.push(`- Segment ${g.k}: oracle \`${g.oracle_hash}\`, spec v${g.spec_version ?? "?"}, baseline \`${g.baseline_sha.slice(0, 10)}\`, noise floor ${magnitudePct(g.noise_floor)}, win threshold (MDE) ${magnitudePct(g.mde)}, ≈${formatDuration(g.eval_seconds ?? 0)} per evaluation.${g.report ? ` ${mdText(g.report, 400)}` : ""}`);
   }
   const drift = store.driftChecks(study.id, 50);
   if (drift.length) lines.push(`- Drift checks: ${drift.length} (${drift.filter((d) => d.status === "drift").length} over the limit)`);
@@ -172,25 +218,26 @@ export function harvestSection(ctx: Ctx, study: StudyRow, spec: StudySpec, h: Ha
   const lines = [
     `## Harvest h${h.id} (${h.state})`,
     "",
-    `Grouping: ${h.grouping_source ?? "pending"}${h.grouping_notes ? ` (${mdText(h.grouping_notes, 300)})` : ""}. Base \`${h.base_sha?.slice(0, 10) ?? "?"}\`, best \`${h.best_sha?.slice(0, 10) ?? "?"}\`. Contributions come from ablation: best with the changeset reverted, measured against best with the study's ${spec.oracle.noise} protocol, so a positive number is how much the change helps relative to best.`,
+    `Grouping: ${h.grouping_source ?? "pending"}${h.grouping_notes ? ` (${mdText(h.grouping_notes, 300)})` : ""}. Base \`${h.base_sha?.slice(0, 10) ?? "?"}\`, best \`${h.best_sha?.slice(0, 10) ?? "?"}\`. Contributions come from ablation: best with the changeset reverted, measured against best with the study's ${spec.oracle.noise} protocol. Each is shown as its share of the measured base→best gain.`,
     "",
-    "| # | Changeset | Candidates | Contribution | Standalone | Depends on | PR branch |",
+    "| # | Changeset | Candidates | Share of the gain | Alone on its PR base | Depends on | PR branch |",
     "|---|---|---|---|---|---|---|",
   ];
   for (const c of cs) {
     const deps = (safeJson<number[]>(c.depends_on_json) ?? []).map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`);
     lines.push(
-      `| ${c.k} | ${mdCell(c.title, 60)}${c.droppable ? " (droppable)" : ""} | ${(safeJson<number[]>(c.candidates_json) ?? []).map((n) => `c/${n}`).join(", ")} | ${c.contribution === null ? c.ablation_status : `${pct(c.contribution)}${ci(c.ci_lo, c.ci_hi)}`} | ${mdCell(standaloneText(c), 60)} | ${deps.join(", ") || "—"} | ${c.branch ? `\`${c.branch}\`` : "—"} |`,
+      `| ${c.k} | ${mdCell(c.title, 60)}${c.droppable ? " (droppable)" : ""} | ${(safeJson<number[]>(c.candidates_json) ?? []).map((n) => `c/${n}`).join(", ")} | ${c.contribution === null ? `not measured alone (${c.ablation_status})` : mdCell(shareText({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, h.total_effect, metricOf(spec)), 80)} | ${mdCell(standaloneText(c, spec), 80)} | ${deps.join(", ") || "—"} | ${c.branch ? `\`${c.branch}\`` : "—"} |`,
     );
   }
   if (stacks.length) {
     lines.push("", "Stacks (dependent changesets, PRs stacked in this order):");
-    for (const s of stacks) lines.push(`- Stack ${s.stack}: ${s.members.map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`).join(" → ")}${s.status === "measured" ? `; ablated together: ${estimateText(s.estimate)}` : s.status === "not_needed" ? "" : `; joint ablation ${s.status}${s.detail ? ` (${mdText(s.detail, 200)})` : ""}`}`);
+    for (const s of stacks) lines.push(`- Stack ${s.stack}: ${s.members.map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`).join(" → ")}${s.status === "measured" ? `; together: ${shareText(s.estimate, h.total_effect, metricOf(spec))}` : s.status === "not_needed" ? "" : `; joint ablation ${s.status}${s.detail ? ` (${mdText(s.detail, 200)})` : ""}`}`);
   }
   const drop = cs.filter((c) => c.droppable);
   if (drop.length) lines.push("", `Droppable (no measurable contribution; the human decides): ${drop.map((c) => `#${c.k} ${mdText(c.title, 60)}`).join(", ")}.`);
-  lines.push("", "### Sum of contributions vs total gain", "", ...accountingText(accountingFor(ctx, h)));
-  if (h.total_vs_base !== null) lines.push(`- Relative to base, best is ${pct(h.total_vs_base)} better (measured).`);
+  lines.push("", "### Sum of contributions vs total gain", "", ...accountingText(accountingFor(ctx, h), spec));
+  const vb = vsBaseFromVsBest(h.total_effect, spec.metric.direction);
+  if (vb !== null) lines.push(`- For the record: relative to best the total gain is ${pct(h.total_effect)}; relative to base it is ${improvementText(vb, metricOf(spec))}.`);
   lines.push(`- Harvest bench time: ${formatDuration(h.bench_seconds)}.`);
   return lines;
 }

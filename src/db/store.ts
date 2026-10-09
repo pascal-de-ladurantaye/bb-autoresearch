@@ -43,6 +43,8 @@ export interface StudyRow {
   usage_json: string | null;
   usage_at: number | null;
   budget_notices_json: string;
+  /** When the human last looked at the study's notices (the "new" count). */
+  notices_seen_at: number | null;
 }
 
 export interface SpecVersionRow {
@@ -357,6 +359,8 @@ export interface ChangesetRow {
   pr_body: string | null;
   pr_url: string | null;
   pr_status: "drafted" | "branch" | "pushed" | "opened" | "failed" | null;
+  /** The human's choice for a droppable changeset: "keep", "drop", or null (undecided). */
+  human_choice: "keep" | "drop" | null;
 }
 
 export interface Budget {
@@ -780,7 +784,7 @@ export class Store {
     return this.tx(() => {
       const r = this.db
         .prepare(`INSERT INTO harvests (study_id, state, from_state, measure_standalone, started_at, grouping_source, grouping_notes) VALUES (?, 'waiting', ?, ?, ?, ?, ?)`)
-        .run(row.study_id, row.from_state, row.measure_standalone, this.now(), row.grouping_source ?? null, row.grouping_source === "fallback" ? "one changeset per promotion (asked for by the human)" : null);
+        .run(row.study_id, row.from_state, row.measure_standalone, this.now(), row.grouping_source ?? null, row.grouping_source === "fallback" ? "one changeset per promotion, as you asked" : null);
       const id = Number(r.lastInsertRowid);
       this.event(row.study_id, "harvest.started", actor, { harvest: id, from: row.from_state });
       return this.harvest(id)!;

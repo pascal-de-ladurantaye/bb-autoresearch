@@ -17,8 +17,11 @@ const COLUMNS = [
   { key: "abandoned", title: "Abandoned / vetoed" },
 ] as const;
 
-export function IdeasTab({ slug, ideas, rpc, onChanged, onOpenCandidate }: { slug: string; ideas: IdeaView[]; rpc: Rpc; onChanged: () => void; onOpenCandidate: (n: number) => void }) {
+export function IdeasTab({ slug, state, ideas, rpc, onChanged, onOpenCandidate }: { slug: string; state: string; ideas: IdeaView[]; rpc: Rpc; onChanged: () => void; onOpenCandidate: (n: number) => void }) {
   const [busy, setBusy] = useState(false);
+  const [vetoing, setVetoing] = useState<number | null>(null);
+  const [vetoReason, setVetoReason] = useState("");
+  const editable = state !== "archived";
   const act = async (fn: () => Promise<{ message: string }>, quiet = false) => {
     setBusy(true);
     try {
@@ -43,7 +46,14 @@ export function IdeasTab({ slug, ideas, rpc, onChanged, onOpenCandidate }: { slu
   const byStatus = (key: string) => (key === "queued" ? queued : ideas.filter((i) => (key === "abandoned" ? i.status === "abandoned" || i.status === "retired" : i.status === key)));
   return (
     <div className="space-y-4">
-      <AddIdea slug={slug} rpc={rpc} onChanged={onChanged} />
+      {editable ? (
+        <AddIdea slug={slug} rpc={rpc} onChanged={onChanged} />
+      ) : (
+        <p className="text-sm text-muted-foreground">The study is archived: the board is read-only.</p>
+      )}
+      <p className="text-xs text-muted-foreground">
+        Pinned ideas run first, then the order below. Your ideas are pinned by default; the strategist adds its own and never re-assigns an idea that lost. Veto retires an idea for good.
+      </p>
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
         {COLUMNS.map((col) => {
           const list = byStatus(col.key);
@@ -64,7 +74,11 @@ export function IdeasTab({ slug, ideas, rpc, onChanged, onOpenCandidate }: { slu
                         {[i.theme && `theme ${i.theme}`, i.source, col.key === "queued" ? `p ${i.priority}` : null, i.startRef && `from ${i.startRef}`, i.variationOf && `varies #${i.variationOf}`].filter(Boolean).join(" · ")}
                       </div>
                     </div>
-                    {i.pinned ? <Icon name="Pin" className="size-3.5 shrink-0 text-foreground" aria-label="Pinned" /> : null}
+                    {i.pinned ? (
+                      <span className="inline-flex shrink-0 items-center gap-0.5 text-xs text-foreground">
+                        <Icon name="Pin" className="size-3.5" aria-hidden /> pinned
+                      </span>
+                    ) : null}
                   </div>
                   {i.rationale ? <p className="line-clamp-3 text-xs text-muted-foreground">{i.rationale}</p> : null}
                   {i.candidates.length ? (
@@ -74,11 +88,34 @@ export function IdeasTab({ slug, ideas, rpc, onChanged, onOpenCandidate }: { slu
                           c/{n}
                         </button>
                       ))}
-                      {i.bestEffect !== null ? <span className="text-muted-foreground">best {pct(i.bestEffect)}</span> : null}
+                      {i.bestEffect !== null ? <span className="text-muted-foreground">best {pct(i.bestEffect)} vs best then</span> : null}
                     </div>
                   ) : null}
                   {i.statusReason && col.key !== "queued" ? <p className="text-xs text-muted-foreground">{i.statusReason}</p> : null}
-                  {col.key === "queued" ? (
+                  {col.key === "queued" && editable && vetoing === i.id ? (
+                    <form
+                      className="space-y-1 pt-1"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void act(() => rpc.call("ideas.veto", { slug, id: i.id, reason: vetoReason.trim() }));
+                        setVetoing(null);
+                        setVetoReason("");
+                      }}
+                    >
+                      <label className="block text-xs text-muted-foreground" htmlFor={`veto-${i.id}`}>
+                        Why veto #{i.id}? (optional, the strategist reads it)
+                      </label>
+                      <Input id={`veto-${i.id}`} className="h-8" autoFocus value={vetoReason} onChange={(e) => setVetoReason(e.target.value)} onKeyDown={(e) => e.key === "Escape" && setVetoing(null)} />
+                      <div className="flex gap-1">
+                        <Button size="sm" variant="destructive" type="submit" disabled={busy}>
+                          Veto
+                        </Button>
+                        <Button size="sm" variant="ghost" type="button" onClick={() => setVetoing(null)}>
+                          Cancel
+                        </Button>
+                      </div>
+                    </form>
+                  ) : col.key === "queued" && editable ? (
                     <div className="flex gap-1 pt-1">
                       <IconButton label={i.pinned ? "Unpin" : "Pin"} icon="Pin" disabled={busy} onClick={() => void act(() => rpc.call("ideas.update", { slug, id: i.id, pinned: !i.pinned }), true)} />
                       <IconButton label="Move up" icon="ArrowUp" disabled={busy || idx === 0} onClick={() => move(i.id, -1)} />
@@ -89,9 +126,8 @@ export function IdeasTab({ slug, ideas, rpc, onChanged, onOpenCandidate }: { slu
                         className="ml-auto hover:text-destructive"
                         disabled={busy}
                         onClick={() => {
-                          const reason = window.prompt(`Veto idea #${i.id}? Optional reason:`, "");
-                          if (reason === null) return;
-                          void act(() => rpc.call("ideas.veto", { slug, id: i.id, reason }));
+                          setVetoReason("");
+                          setVetoing(i.id);
                         }}
                       />
                     </div>
@@ -136,6 +172,7 @@ function AddIdea({ slug, rpc, onChanged }: { slug: string; rpc: Rpc; onChanged: 
       });
       toast.success(r.message);
       setTitle("");
+      setTheme("");
       setRationale("");
       setStartRef("");
       onChanged();
@@ -156,7 +193,7 @@ function AddIdea({ slug, rpc, onChanged }: { slug: string; rpc: Rpc; onChanged: 
       </Button>
       <Input className="md:col-span-3" value={rationale} onChange={(e) => setRationale(e.target.value)} placeholder="Rationale (optional)" aria-label="Rationale" />
       <label className="flex items-center gap-2 text-sm text-muted-foreground">
-        <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} /> Pin
+        <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} /> Pin (runs first)
       </label>
     </form>
   );

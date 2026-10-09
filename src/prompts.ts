@@ -4,6 +4,27 @@
 import type { CandidateRow, FindingRow, IdeaRow, StudyRow, ThreadRow } from "./db/store.ts";
 import { formatPct, type StudySpec } from "./spec.ts";
 import type { RoundTrigger } from "./scheduler.ts";
+import { ciText as ciRange, improvementText, type MetricInfo } from "./present.ts";
+
+/**
+ * A message for an agent thread: a short `summary` a human skimming the
+ * thread understands in one line, and the complete `detail` the agent needs.
+ * The BB adapter sends `detail` as an agent-only input block (hidden from the
+ * human's timeline, still in the agent's context); the agent sees both.
+ */
+export interface AgentMessage {
+  summary: string;
+  detail: string;
+}
+
+/** The whole message as one text (tool results, logs, tests). */
+export function messageText(m: string | AgentMessage): string {
+  return typeof m === "string" ? m : m.detail ? `${m.summary}\n\n${m.detail}` : m.summary;
+}
+
+function metricOf(spec: StudySpec): MetricInfo {
+  return { name: spec.metric.name, unit: spec.metric.unit, direction: spec.metric.direction };
+}
 
 export function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
@@ -98,7 +119,7 @@ export function workerBrief(b: BriefInput): string {
   return lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
 }
 
-export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number; spec: StudySpec }): string {
+export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number; spec: StudySpec }): AgentMessage {
   const reasons = safeJson<string[]>(c.reasons_json) ?? [];
   const metrics = safeJson<{ best?: Record<string, number>; candidate?: Record<string, number>; guardrails?: Record<string, number> }>(c.metrics_json);
   const diag = safeJson<string[]>(c.diag_json) ?? [];
@@ -110,7 +131,10 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
     conflict: "CONFLICT",
     rejected: "REJECTED (scope)",
   };
-  const lines = [`[autoresearch] Verdict for c/${c.n}: ${head[c.verdict ?? ""] ?? c.verdict}${c.effect !== null ? ` · effect ${ciText(c)}` : ""}`];
+  const metric = metricOf(opts.spec);
+  const effect = c.effect === null ? "" : `, ${improvementText(c.effect, metric, { digits: 1, factor: false })} than best${c.ci_lo !== null && c.ci_hi !== null && c.ci_lo !== c.ci_hi ? ` (${ciRange(c.ci_lo, c.ci_hi)})` : ""}`;
+  const summary = `[autoresearch] Verdict for c/${c.n}: ${head[c.verdict ?? ""] ?? c.verdict}${effect}.${reasons[0] && c.verdict !== "win" ? ` ${clip(reasons[0], 160)}` : ""}`;
+  const lines = [`Effect (better is positive): ${c.effect !== null ? ciText(c) : "not measured"}`];
   for (const r of reasons.slice(0, 8)) lines.push(`- ${clip(r, 400)}`);
   if (metrics?.best && metrics.candidate) {
     const keys = [opts.spec.metric.name, ...opts.spec.guardrail.map((g) => g.name)];
@@ -139,7 +163,7 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
       ? `You have ${opts.submissionsLeft} submission(s) left. Refine and call study_submit_candidate, or call study_record_finding then study_finish.`
       : "No submissions left: call study_record_finding, then study_finish.",
   );
-  return lines.join("\n");
+  return { summary, detail: lines.join("\n") };
 }
 
 export function nudgeMessage(minutes: number): string {
@@ -172,13 +196,22 @@ const TRIGGER_TEXT: Record<RoundTrigger, string> = {
   human: "the human sent a message",
 };
 
-export function strategistDigest(d: DigestInput): string {
+export function strategistDigest(d: DigestInput): AgentMessage {
   const queued = d.ideas.filter((i) => i.status === "queued");
   const running = d.ideas.filter((i) => i.status === "running");
   const counts = new Map<string, number>();
   for (const i of d.ideas) counts.set(i.status, (counts.get(i.status) ?? 0) + 1);
+  const metric = metricOf(d.spec);
+  const wins = d.verdicts.filter((c) => c.verdict === "win");
+  const verdictSummary = d.verdicts.length
+    ? `${d.verdicts.length} new verdict${d.verdicts.length === 1 ? "" : "s"} (${[...new Set(d.verdicts.map((c) => c.verdict))].map((v) => `${d.verdicts.filter((c) => c.verdict === v).length} ${v}`).join(", ")})`
+    : "no new verdicts";
+  const summary =
+    `[autoresearch] Strategist round ${d.round} (${TRIGGER_TEXT[d.trigger]}): ${verdictSummary}` +
+    `${wins.length ? `, best now ${improvementText(d.cumulative, metric)} vs base` : d.cumulative !== null ? `, best ${improvementText(d.cumulative, metric)} vs base` : ""}` +
+    ` · ${queued.length} idea${queued.length === 1 ? "" : "s"} queued · ${d.workers.length} worker${d.workers.length === 1 ? "" : "s"}${d.notices.length ? ` · ${d.notices.length} notice${d.notices.length === 1 ? "" : "s"} for you on the Studies page` : ""}.`;
   const lines = [
-    `[autoresearch] Strategist round ${d.round} · study \`${d.study.slug}\` · trigger: ${TRIGGER_TEXT[d.trigger]}`,
+    `Strategist round ${d.round} · study \`${d.study.slug}\` · trigger: ${TRIGGER_TEXT[d.trigger]}`,
     "",
     `Objective: ${quoted(d.spec.study.objective, 400)}`,
     `Metric: ${d.spec.metric.name} (${d.spec.metric.direction} is better) · best vs base: ${d.cumulative === null ? "no promotion yet" : formatPct(d.cumulative)} · state: ${d.study.state} · workers: ${d.workers.length}/${d.w}`,
@@ -220,9 +253,9 @@ export function strategistDigest(d: DigestInput): string {
     "- Retire dead directions with `study_retire_idea`; record what is known in `study_update_dossier`.",
     "- `study_search_findings` searches all findings and verdicts.",
     "- You do not edit code, run benchmarks, or decide verdicts. Concurrency, budget, oracle and pausing are human controls.",
-    "- Keep your reply short, then end your turn.",
+    "- Reply to the human in two or three short lines (what changed, what you queued, anything they should decide), then end your turn.",
   );
-  return clip(lines.join("\n"), 12_000);
+  return { summary, detail: clip(lines.join("\n"), 12_000) };
 }
 
 export function safeJson<T>(text: string | null): T | null {
@@ -249,9 +282,10 @@ export interface HarvestRoundInput {
 }
 
 /** The harvest grouping round: one turn asking the strategist for study_propose_harvest. */
-export function harvestRoundPrompt(d: HarvestRoundInput): string {
+export function harvestRoundPrompt(d: HarvestRoundInput): AgentMessage {
+  const summary = `[autoresearch] Harvest h${d.harvest.id}: please group the ${d.promotions.length} promotion${d.promotions.length === 1 ? "" : "s"} on best into changesets (one PR each) with study_propose_harvest.`;
   const lines = [
-    `[autoresearch] Harvest h${d.harvest.id} · study \`${d.study.slug}\` · group the promotions into changesets`,
+    `Harvest h${d.harvest.id} · study \`${d.study.slug}\` · group the promotions into changesets`,
     "",
     `Best is final for this harvest: ${d.promotions.length} promotion(s) on \`studies/${d.study.slug}/best\`, oldest first. Each changeset becomes one PR; the plugin then measures each one's contribution by reverting it from best (ablation), checks it alone on the base, and drafts the PRs. You don't run anything.`,
     "",
@@ -271,5 +305,5 @@ export function harvestRoundPrompt(d: HarvestRoundInput): string {
     "- If you don't answer, the plugin uses one changeset per promotion.",
     "- Keep your reply short, then end your turn.",
   );
-  return clip(lines.join("\n"), 12_000);
+  return { summary, detail: clip(lines.join("\n"), 12_000) };
 }

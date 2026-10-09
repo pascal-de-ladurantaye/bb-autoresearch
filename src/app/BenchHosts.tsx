@@ -12,9 +12,9 @@ export function BenchHostList({ hosts, queueDepth }: { hosts: BenchHostView[]; q
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-medium">{h.name}</span>
             <span className="text-xs text-muted-foreground">{h.mode === "clone" ? "own clone · git bundles" : "local checkouts"}</span>
-            <span className={h.status === "offline" ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>{h.status}</span>
-            <span className={h.healthOk === false ? "text-xs text-amber-600 dark:text-amber-400" : "text-xs text-emerald-600 dark:text-emerald-400"}>
-              {h.healthOk === null ? "health not checked" : h.healthOk ? "healthy" : "unhealthy"}
+            <span className={h.status === "offline" ? "text-xs font-medium text-destructive" : "text-xs text-muted-foreground"}>{h.status === "offline" ? "✗ offline" : h.status}</span>
+            <span className={h.healthOk === false ? "text-xs text-warning-text" : "text-xs text-success"}>
+              {h.healthOk === null ? "health not checked" : h.healthOk ? "✓ healthy" : "⚠ unhealthy"}
             </span>
             <span className="text-xs text-muted-foreground">
               drift {h.driftStatus ?? "not run"} ({h.evalsSinceDrift}/{h.driftEvery || "off"})
@@ -26,7 +26,7 @@ export function BenchHostList({ hosts, queueDepth }: { hosts: BenchHostView[]; q
             {h.mode === "clone" ? ` · ${h.bundles} bundle(s), ${Math.round(h.bundleBytes / 1024)} KiB` : ""}
             {h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toLocaleTimeString()}` : ""}
           </div>
-          {h.problems.length ? <div className="text-xs text-amber-700 dark:text-amber-300">{h.problems.join("; ")}</div> : null}
+          {h.problems.length ? <div className="text-xs text-warning-text">{h.problems.join("; ")}</div> : null}
           {h.healthSummary ? <div className="truncate text-xs text-muted-foreground">{h.healthSummary}</div> : null}
         </li>
       ))}

@@ -44,6 +44,12 @@ export interface ProviderUsage {
   windows: Array<{ label: string; usedPercent: number; resetsAt: number | null }>;
 }
 
+/** A plugin message: a one-line summary for the human and the full detail for the agent (sent agent-only). */
+export interface PortMessage {
+  summary: string;
+  detail: string;
+}
+
 export interface BbPort {
   primaryHostId(): Promise<string | null>;
   /** Enrolled BB machines (bench host names and ids are resolved against these). */
@@ -55,7 +61,7 @@ export interface BbPort {
   ensureSection(name: string): Promise<string | null>;
   spawnWorker(args: SpawnWorkerArgs): Promise<{ threadId: string; environmentId: string | null }>;
   /** Start a turn on an idle thread or queue/steer a running one (`mode: "auto"`). */
-  send(threadId: string, text: string): Promise<void>;
+  send(threadId: string, text: string | PortMessage): Promise<void>;
   /** Steer text into a turn that is running now. Never starts a turn; throws if none is running. */
   steer(threadId: string, text: string): Promise<void>;
   /** Flag a thread for the human without starting a turn. */

@@ -202,9 +202,9 @@ describe("harvest (real git)", () => {
     expect(h.publish_state).toBe("dry-run");
     expect(sh(repo, "remote")).toBe("");
     // PR body: what/why, contribution with CI, standalone effect, findings, study link.
-    expect(a.pr_body).toContain("Contribution (ablation");
+    expect(a.pr_body).toMatch(/Contribution: [\d.]+% of the gain \(CI [\d.]+% to [\d.]+%\).* the study found \(\d+ pairs; ablation/u);
     expect(a.pr_body).toContain("+15.69%");
-    expect(a.pr_body).toContain("Standalone");
+    expect(a.pr_body).toContain("Alone on `main`, the study base: gates pass;");
     expect(a.pr_body).toContain("Finding #1");
     expect(a.pr_body).toContain(`studies/${SLUG}/harvest`);
     expect(c4.pr_body).toContain("Depends on: #3 Shrink c");
@@ -221,7 +221,17 @@ describe("harvest (real git)", () => {
     const v = harvestView(engine, store.study(SLUG)!);
     expect(v.harvest!.changesets.find((c) => c.title === "Shrink c more")!.dependsOn).toEqual([3]);
     expect(v.harvest!.publishCommand).toBe(`bb study harvest ${SLUG} --publish`);
-    expect(harvestText(engine, SLUG)).toContain("depends on #3");
+    const text = harvestText(engine, SLUG);
+    expect(text).toContain("Builds on #3: reverting it from best fails while this one stays.");
+    expect(text).toContain("Reverting this from best conflicts with #4 (in src/c.txt)");
+    expect(text).toMatch(/Measured gain:\s+36\.3% lower size/u);
+    expect(text).toContain("#1 Shrink a [c/1] · 27.6% of the gain");
+    expect(text).toMatch(/Explained: +100% of the gain/u);
+    expect(text).toMatch(/Unexplained: +0% \(noise allows/u);
+    expect(text).toMatch(/PR base:\s+stacked on #3/u);
+    expect(text).toMatch(/PR base:\s+main, the study base/u);
+    expect(text).not.toContain("base base");
+    expect(text).not.toContain("vs best");
     expect(store.notices(studyId).map((x) => x.kind)).toContain("harvest.ready");
     // GitHub publishing refuses: there is no remote.
     await expect(engine.publishHarvest(SLUG, "human", true)).rejects.toThrow(/no remote named "origin"/u);

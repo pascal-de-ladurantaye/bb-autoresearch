@@ -399,4 +399,7 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE studies ADD COLUMN usage_at INTEGER`,
   /** Budget thresholds already announced, e.g. ["candidates:50","bench:80"]. */
   `ALTER TABLE studies ADD COLUMN budget_notices_json TEXT NOT NULL DEFAULT '[]'`,
+  /** Human interface: the human's keep/drop choice on a changeset, and when the human last looked at the notices. */
+  `ALTER TABLE changesets ADD COLUMN human_choice TEXT`,
+  `ALTER TABLE studies ADD COLUMN notices_seen_at INTEGER`,
 ];

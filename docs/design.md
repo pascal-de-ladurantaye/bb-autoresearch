@@ -24,6 +24,8 @@ All four milestones are built (BB 0.45, plugin SDK 0.6.14). Each was smoke-teste
 | M2: remote bench and trust | A study runs a full day on a remote x86 bench host without a human stepping in | **No.** Only one BB machine existed; the remote path ran against the server's own machine in clone mode for minutes. |
 | M3: harvest and operations | A harvested PR set whose measured contributions add up to the total gain within the CI | **On a toy only.** Harvest h4 of `toy-m3b`: sum of contributions +290.7% ± 1.4% vs measured total +293.9% (CI half-width of the gap 3.7%). See the M3 notes. |
 
+After M3, a dedicated human interface pass reworked the Studies page, the study thread messages, notices and the CLI around one way of expressing improvement, and moved approval and publishing into the app (see "Implementation notes: human interface").
+
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
 ## Problem
@@ -401,15 +403,19 @@ The sum of the measured contributions should roughly equal the total gain. A lar
 
 ### Study page
 
-A **Studies** nav panel lists every study with its state, best vs. base, and budget spent. The study page has these tabs:
+A **Studies** nav panel lists every study with its state, what needs the human, best vs. base, and budget spent; its sidebar entry carries a count of what needs the human. The study page is the primary surface: what you see first is the state and what the study is doing now, then **Needs you** (pending approvals, system pauses, drift alarms, a failed calibration, a harvest ready for review), then best vs. base and what is running. The study page has these tabs:
 
-- **Overview.** A trajectory chart (every candidate as a dot, best as a step line), best vs. base with CI, state, budget, and controls (pause, resume, concurrency, harvest).
+- **Overview.** Needs you, best vs. base in words with raw values and CI, what's running now, a trajectory chart (every candidate as a mark, best as a step line), secondary metrics and guardrails against their limits, budget, controls (pause, resume, concurrency, harvest, archive), and notices that each name the action they ask for.
 - **Ideas.** A board: queued, running, won, lost, abandoned. You can add, reorder, pin, or veto.
 - **Candidates.** A filterable table. Each row opens its diff, samples, verdict, and worker thread.
 - **Findings.** A searchable list.
-- **Oracle.** The spec, its version history, calibration reports, and approval for oracle changes.
+- **Oracle.** The spec, its version history, calibration reports, and approval of specs and calibrations.
 - **Bench.** Machines, queue, health, and drift checks.
-- **Harvest.** Proposed changesets, ablation results, and the drafted PRs.
+- **Harvest.** Proposed changesets, their contributions as shares of the gain, dependencies in words, PR previews, keep/drop for droppable changesets, and publishing the drafted PRs.
+
+Deliberate steps (approving a spec, approving a calibration and starting, publishing, archiving) run from the page behind a confirmation that states exactly what will happen, or from the CLI; both paths are equivalent and audited the same way (see the threat model).
+
+Every number follows one convention: **better is positive, in the metric's own terms** ("74.7% fewer ops (4.0×)", "+74.7%"), with the raw values next to it ("210,802 → 53,300 opcodes"). See "Implementation notes: human interface".
 
 Live updates use `bb.realtime` signals, and the page refetches through `bb.rpc`.
 
@@ -501,8 +507,8 @@ The dossier is stored as a versioned text blob per study. Git refs are the sourc
 - editing the benchmark, tests, or harness: scope check at submission, protected paths hashed into the oracle;
 - keeping a regression or a lucky number: the plugin owns every verdict, with paired sequential tests and confirmation runs;
 - special-casing the benchmark input: the holdout, whose inputs and numbers never enter agent context (only pass or fail);
-- widening their own resources: control RPCs are clamped to the approved spec (concurrency can only go down), and the spec and oracle can't be approved over RPC at all;
-- approving their own oracle: approval commands refuse a study's own worker and strategist threads, and a revised spec from the study thread stays pending until a human approves it;
+- widening their own resources: control RPCs are clamped to the approved spec (concurrency can only go down);
+- approving their own oracle: a revised spec from the study thread stays pending until it is approved, the CLI's approval commands refuse a study's own worker and strategist threads, and every approval (in the app or the CLI) names the exact spec version it approves and is audited;
 - doing any of this unnoticed: every human control is an append-only `control.*` event with the caller information BB provides and the study agent turns running at that moment, plus a notice (and an unread study thread when an agent turn was running).
 
 **What it cannot protect against on a full-access local machine.** An agent with a shell running as the user can do anything the user can:
@@ -512,6 +518,8 @@ The dossier is stored as a versioned text blob per study. Git refs are the sourc
 - Plugin forms (`bb.ui.requestInput`) can be answered with `bb thread interactions respond`, so a form is no stronger an approval channel.
 - With a `local` bench host, the holdout's files sit on the same disk the agents can read.
 - Nothing stops it from editing the plugin's SQLite database or source, or pushing.
+
+**In-app and CLI approval are equivalent.** Approving a spec, approving a calibration and starting, and publishing a harvest can be done on the Studies page (RPC with an explicit `confirm: true`, sent only from a dialog that states what will happen) or with the CLI. Neither path is stronger: BB cannot tell an agent from a human on any of them (RPC callers are all `client`, the CLI's thread id comes from the shell, forms can be answered from a shell), so a CLI-only rule only made the human's path longer. What makes approval trustworthy is the same on both paths: the action is deliberate (a confirmation, or a typed command), it approves a specific version (a stale page is refused), it is recorded as an append-only `control.*` event with the caller information BB gives and the study agent turns running at that moment, and it raises a notice the human sees on the page.
 
 There, the defenses are detection (the audit trail above) and isolation: a separate bench machine that holds the holdout, and agent permission modes and sandboxes that don't allow arbitrary shell access. A study whose results matter should run its bench on a machine its workers can't reach.
 
@@ -915,7 +923,7 @@ What M2 added, and every place it differs from the design or from M1. Same platf
 - **Threat model.** The threat model above is new.
 - **Controls are clamped.** `study.concurrency` (RPC and CLI) can only lower `max_workers` below the approved spec; asking for more is clamped, with a message saying so. Idea priorities were already clamped to ±100, and reorders to 200 ids.
 - **Controls are audited.** Every control is audited: pause, resume (with the pause reason it cleared), concurrency, the idea board, calibrate, approve, start, drift, and archive. Each is a `control.<kind>` event whose actor is `rpc:client`, `rpc:plugin:<id>`, `cli:human`, or `cli:thread:<id>`, with the study agent turns that were running at that moment. Each also raises a notice. The study thread is marked unread only when an agent turn was running.
-- **Approval is CLI-only.** Oracle and spec approval (calibrate, approve, start) exist only in the CLI, and the CLI refuses a study's own worker and strategist threads. The SDK gives no reliable way to tell an agent from a human: RPC callers are all `client`, the CLI thread id comes from the shell environment, and plugin forms can be answered with `bb thread interactions respond`. So approval can't be made impossible from an agent shell, only refused for the cooperative case and audited.
+- **Approval is CLI-only.** *(Superseded by the human interface pass: approval is also in the app, with the same audit; see the threat model.)* Oracle and spec approval (calibrate, approve, start) exist only in the CLI, and the CLI refuses a study's own worker and strategist threads. The SDK gives no reliable way to tell an agent from a human: RPC callers are all `client`, the CLI thread id comes from the shell environment, and plugin forms can be answered with `bb thread interactions respond`. So approval can't be made impossible from an agent shell, only refused for the cooperative case and audited.
 - **Smoke-test evidence.** The audit recorded `cli:thread:<id>` for CLI calls made from the building agent's own thread, and `rpc:client` for a `bb plugin rpc call`.
 
 ### Profiles
@@ -1007,7 +1015,7 @@ What M3 added, and every place it differs from the design or from M2. Same platf
   - a study link (`bb.server.experimental_appUrl` when configured, otherwise the page path).
 - **Publishers (`src/publisher.ts`, behind `PrPublisher`).**
   - `dry-run` is the only mode harvest itself runs. It writes `report.md`, `prs/<kk>-<title>.md`, and `manifest.json` through a new `writeExport` host op under `<dataDir>/exports/<slug>-harvest-h<N>/` on the edit host. Nothing is pushed.
-  - `github` runs only through `bb study harvest <slug> --publish` on a **ready** harvest (decision: always review a dry run first). It is CLI-only, like approval: the RPC can start dry runs but cannot publish.
+  - `github` runs only through `bb study harvest <slug> --publish` on a **ready** harvest (decision: always review a dry run first). It is CLI-only, like approval: the RPC can start dry runs but cannot publish. *(Superseded by the human interface pass: the Harvest tab publishes behind a confirmation that lists every branch, remote and draft PR.)*
   - The `github` publisher refuses when the flag is missing, when the repo has no remote named `[harvest].remote` (default `origin`), when that remote isn't GitHub, or when `gh` is missing. Otherwise it pushes each branch and runs `gh pr create --draft`, with stacked PRs based on the branch below. A failed push skips the PRs stacked on it.
   - It was tested against a mock `gh` only; no PR was ever opened.
 - **Report (`src/report.ts`, `bb study report`, `study.report`).** Trajectory table, wins, notable losses with their reasons and findings, the dossier, calibration and segments, drift checks, and the latest harvest (changesets, stacks, droppable, the sum-vs-total section). It never reads holdout data: a test checks the report and the new views for the holdout command and numbers.
@@ -1041,7 +1049,7 @@ What M3 added, and every place it differs from the design or from M2. Same platf
 
 - **New tabs (data from `src/views.ts` view models over RPC).**
   - **Findings:** search, outcome, theme, and verdict filters; links to candidates and worker threads.
-  - **Oracle:** the active spec as TOML with `[oracle.holdout]` removed (agents can call RPC), version history, calibration report per host, segments, and a pending spec with its line diff and the CLI command that approves it. Approval stays CLI-only.
+  - **Oracle:** the active spec as TOML with `[oracle.holdout]` removed (agents can call RPC), version history, calibration report per host, segments, and a pending spec with its line diff and the CLI command that approves it. Approval stays CLI-only. *(Superseded: see the human interface notes.)*
   - **Bench:** hosts, queue, utilization, health-check history, drift checks, bundle transfers, recent bench intervals, and flaky and failed gate counts.
   - **Harvest:** state, total, sum, gap and the interaction warning, changesets with ablation, standalone, dependencies, stack, PR branch and expandable PR body, stacks, the export dir, the publish command (no button), history, an on-demand report, and a dry-run start/restart button.
   - **Overview:** a provider-usage line and a Harvest link.
@@ -1126,3 +1134,98 @@ The M2 end-to-end test failed on a loaded laptop because `LocalHostRunner` probe
 - **Gate dependencies only.** A changeset that is semantically needed but doesn't break the gates when reverted (no test covers it) is not detected as a dependency.
 - **Interaction warnings.** They rely on bootstrap CIs that undercover at small n.
 - **Dollar budgets.** Dollar cost per thread isn't exposed by BB, so there are no dollar budgets.
+
+## Implementation notes: human interface
+
+A pass after M3 over every human step, with no new engine features. Same platform pins (BB 0.45.x, SDK 0.6.14). It started with a walk through the whole journey in the BB app on the M3 code, logging every confusing moment, dead end and forced trip to the CLI (18 of them, from "three different signs for the same number" to "approval needs a terminal"), and ended with the same journey on the new code.
+
+### One way to express improvement
+
+- **The convention (`src/present.ts`).** An improvement is a fraction relative to a reference, **positive = better in the metric's own direction**. It is written signed where space is short ("+74.7%", tables, the chart axis, the badge) and in words where it is the headline ("74.7% fewer ops (4.0×)", "12.0% higher throughput", "3.1% higher p99 (worse)"). Counts get "fewer/more", other metrics "lower/higher". A factor is added from 1.5× up. The raw values travel with it ("210,802 → 53,300 opcodes").
+- **Magnitudes are unsigned.** Noise floor, MDE, guardrail limits and CI half-widths are magnitudes ("1.00%"), never signed; a CI is always written low to high ("CI +73.7% to +75.6%").
+- **Everywhere the same.** The Overview cards, chart, candidates, findings, verdict messages, strategist digests, notices, PR bodies, the report and the CLI all use these helpers; the only raw relative-to-best numbers left are in `--json` output and one "for the record" line in PR bodies and the report.
+- **Harvest contributions are shares of the gain.** Ablation measures each changeset relative to best, which makes terms additive but huge after big wins (+128,672% on the before toy). The page, CLI, PR bodies and report now show each contribution as its **share of the base→best gain** with the CI as shares ("81.3% of the gain (CI 81.0% to 81.6%)"), in points of the headline ("81.3 of the 99.9 points") and in metric units ("≈ 171,548 fewer opcodes"). The accounting reads "Explained by the changesets 100% ± 0.3%" and "Unexplained 0.2% (noise allows ± 0.6%)".
+- **Two view-model fixes for higher-is-better metrics.** Compounding promoted effects used 1 − Π(1 − e), which is right only for lower-is-better; higher-is-better now uses Π(1 + e) − 1 (`compound`). Harvest's relative-to-base total used t / (1 + t); for higher-is-better it is t / (1 − t) (`vsBaseFromVsBest`). Neither changes a verdict: they only affected displayed best-vs-base numbers and notices. The stored `total_vs_base` column is no longer read.
+
+### The study page
+
+- **Hierarchy.** The header gives the state, a one-sentence status ("Running: 2 workers editing, measuring c/4.") and a "needs you (n)" chip. The Overview leads with **Needs you**, then best vs base (in words, raw values, CI), Now (workers and queue), Budget; then the trajectory, live workers and bench queue (only while there are any), secondary metrics, controls, bench hosts, notices, and a collapsed event log. A draft shows no running-state clutter.
+- **Needs you (`needsYou` in views.ts).** Derived from state on every read, so it can't go stale: a draft spec to approve, a failed calibration (with the problems and "ask the study thread to revise the spec"), a finished calibration to approve, a pending spec, a system pause (budget exhausted → harvest; drift or broken oracle → Bench, then resume), a bench host unhealthy or offline past its grace period, a harvest ready for review, a failed harvest or publish. Alerts sort first. Each item has the in-app action that resolves it and the CLI equivalent. A pause by the human needs nothing.
+- **Badges.** The nav panel's `experimental_sidebarAccessory` shows the number of needs-you items across studies (`studies.attention`); the study list marks each study; the study thread's header badge leads with the count and the first item ("draft · needs you: approve spec"). Notices count as new until the human has had the Overview open for 3 s (`study.notices.seen`, new column `studies.notices_seen_at`); the human's own control notices are an audit trail and never count.
+- **Notices name their action.** Every notice text was rewritten to "what happened. Next: what to do (where, or the CLI command)". `noticeAction` maps each kind to a tab and a label ("Review calibration and start", "Start harvest", "Open Bench"), and the Overview shows that button next to the notice; control notices fold into "Audit trail: n human controls".
+- **Inline help.** A "?" next to each statistical term opens one or two sentences (`GLOSSARY`): improvement convention, CI, MDE, noise floor, calibration, ablation, dependency edge, stack, standalone, droppable, unexplained, guardrail, drift, holdout, segment, utilization.
+- **States.** Every tab has a layout-keeping skeleton while loading, an error line with Retry, an empty state that says what will fill it, and keeps the last data while refetching (no flicker). The status line reserves its height; the chart's hover card has a fixed position.
+- **Tabs.** Oracle: approval buttons, MDE explained as "a win must improve by more than 1.00% with confidence (in practice changes of about 1.27% or more are detected)", the segment marked "awaiting your approval" until calibration is approved. Ideas: veto with an inline reason form (`window.prompt` doesn't exist in the desktop app, so veto was broken there), pinned shown in words, read-only when archived. Candidates: an Improvement column, CIs in order, a guardrail column, and in the detail a metrics table of every recorded metric. Findings: counts on every facet (outcome, theme including "no theme", verdict including "no candidate"), a finding's idea falls back to its candidate's idea, paging by 50. Bench: host names everywhere and the latest health check of each host marked.
+
+### Secondary metrics and guardrails
+
+- **One status function.** `guardrailStatus` in views.ts is the only place the UI decides a guardrail's state: pass, warn (more than 80% of the limit used), broken, or missing, with a text that carries the state without color. It takes values and limits (and prefers the regression the verdict recorded), and already has slots for a CI and a cumulative limit against the segment base, so the follow-up that adds `max_total_regression` and CI-based guardrail decisions can fill them without touching components. Verdict semantics are unchanged.
+- **Where it shows.** The candidate detail has a metrics table (primary, guardrails with limit and status, informational metrics with a raw change and "no direction"); the candidates list has a guardrail column ("ok (1)", "rss near limit", "rss BROKEN"); the Overview shows each secondary metric of best against the segment base, the guardrail's position against its limit as a bar plus a word, the worst single promotion, and a small trend of best's value after each promotion.
+
+### In-app actions (decision 1)
+
+- **RPC.** `study.spec.approve {slug, version, confirm}` (draft: approve and calibrate; pending, oracle unchanged: apply; pending, oracle changed: approve and recalibrate), `study.start {slug, confirm}` (only from a finished calibration), `study.harvest.plan` (read: remote, URL, each branch → base, skips, and whether the preflight passes), `study.harvest.publish {slug, harvestId, confirm}`, `study.harvest.choice` (keep or drop a changeset nothing builds on), `study.archive {slug, confirm}`, plus `study.harvest.start` gained `onePerPromotion`.
+- **Deliberate.** Without `confirm: true` each refuses with what it would do ("confirmation required: this pushes 3 branch(es) of harvest h1 to origin and opens draft PRs on GitHub…"). Approval names the version the human reviewed; a stale page is refused. Plugins are refused as callers. Every action is a `control.*` event and a notice; a refused publish is audited too, kept on the harvest (`publish_state = failed`, the error), and becomes a needs-you item.
+- **Dialogs.** Each action's dialog states exactly what happens and shows the CLI equivalent. Publish loads the plan first, lists every branch and the draft PR it opens, and disables the confirm button with the reason when the preflight fails. Results (PR URLs, push or `gh` errors, skipped ones) stay on the Harvest tab.
+- **Dropping a changeset.** A droppable changeset gets Keep/Drop; a dropped one is skipped when publishing (new column `changesets.human_choice`). A changeset that others build on can't be dropped.
+- **CLI unchanged.** `calibrate`, `approve`, `start`, `harvest --publish` and `archive` behave as before and are audited the same way.
+
+### Harvest review
+
+- Each changeset shows its title, the contribution as above, the dependency explanation in words ("Reverting this from best conflicts with #6 (in src/toy.py), so it can't be measured alone…", "Builds on #1 and #3…", "Ships in stack 1 (#1 → #3 → #6), as a PR stacked on #3"), the standalone result in the convention, the PR base in words (no more "base base"), the PR body rendered with the host `Markdown` component, and the keep/drop choice.
+- A progress line shows the phases. A small gap beyond the noise (within 2× its CI half-width, common with bootstrap CIs at n ≈ 20) is an info callout that says so; a large one or an unmeasured term is an alert.
+- Fallback rationale says why: "Promotion c/1 as its own changeset (one changeset per promotion, as you asked)".
+- With zero promotions the start button is disabled with the reason next to it.
+
+### Study thread messages (decision 2)
+
+- **Agent-only detail.** `threads.send` input blocks accept `visibility: "agent-only"` (SDK 0.6.14, `promptInputSchema`). Verdicts, strategist digests and the harvest grouping round are now an `AgentMessage`: a one-line summary the human sees, and the full detail as an agent-only block. Live check: the human timeline showed only "[autoresearch] Verdict for c/2: WIN: promoted to best, 62.9% fewer ops than best (CI +62.6% to +63.3%)." and the worker still quoted the medians and guardrail from the hidden detail.
+- **Summaries.** A strategist round reads "[autoresearch] Strategist round 2 (new verdicts): 5 new verdicts (4 win, 1 inconclusive), best now 98.8% fewer ops (82×) vs base · 3 ideas queued · 1 worker · 9 notices for you on the Studies page." The digest asks the strategist to answer the human in two or three short lines.
+- **Tool results** (a scope rejection, the submission ticket) stay one text, since a tool result has no visibility.
+
+### CLI
+
+- `--json` on every command, one JSON document from the same view models as the page; errors use the SDK envelope with a `hint` that names the command to run next.
+- New `bb study needs [slug]`.
+- `list` is a table with a NEEDS YOU column (active studies first), `show` gains a Needs you section, `harvest` prints shares, explanations and PR bases in the page's words. Same numbers and wording as the UI.
+
+### Accessibility and theming
+
+- The tabs are a WAI-ARIA tablist with roving focus (arrow keys, Home, End). Every control has a visible focus ring and an accessible name; chart marks are focusable and open their candidate.
+- Color never carries meaning alone: verdicts carry a glyph and a word, chart marks differ by shape (● win, × lose, ○ other), guardrails and health checks carry words.
+- **Theme tokens only.** Tailwind `dark:` variants in a plugin bundle compile to `prefers-color-scheme`, so they follow the OS, not BB's theme (a light BB theme on a dark OS rendered light-on-light text). All `dark:` variants were removed in favor of host tokens (`text-success`, `text-warning-text`, `bg-warning/10`, `text-destructive`, `bg-muted`). Light theme was checked by switching the tab's root class to `light` (screenshots), not through BB's settings.
+- New vendored components from the BB registry (desktop-v0.45.0): `dialog`, `popover` and their support files; `@radix-ui/react-dialog` and `-popover` are type-only dev dependencies at the host's range.
+
+### Data model
+
+Append-only migrations: `changesets.human_choice`, `studies.notices_seen_at`. New events: `harvest.choice`, `harvest.publish_refused`; new control kinds `control.harvest_choice` and the in-app `control.calibrate|approve|start|publish|archive`; new notice kind `harvest.published`.
+
+### Usability check (BB 0.45, one MacBook, toy repo under /tmp)
+
+The same toy as M3 (`src/toy.py`, opcodes counted by the protected `bench/measure.py` with 0.5% noise), with a guardrail `src_lines` (≤ 30% worse per promotion) and an informational `wall_ms`; `max_workers = 2`, `max_candidates = 5`, local bench. Clicks were driven through the in-app browser; times are wall time from the action to the next state.
+
+| Step | Before (M3 code) | After |
+|---|---|---|
+| Create (study-create conversation) | no entry point; a typed request; 87 s to a draft | New study (1 click, prompt prefilled) + project (2) + send (1); 23 s to a draft |
+| Find the study | sidebar → Studies → row | the thread's header badge ("needs you: approve spec"): 1 click |
+| Approve the spec and calibrate | CLI `bb study calibrate` (twice: the first calibration failed on laptop load, visible only below the fold) | Needs you → Approve and calibrate… → confirm: 2 clicks; 3 s to ready |
+| Seed ideas | Ideas tab, 2 ideas | Ideas tab + 3 adds: 4 clicks, 7 s |
+| Steer (reorder, veto with reason, unpin, concurrency and back, pause, resume) | veto used `window.prompt`, absent in the desktop app | 8 clicks plus typing, all in-app |
+| Approve calibration and start | CLI `bb study start` | Approve and start… → confirm: 2 clicks (+1 for the tab) |
+| Run to the budget | 140 s | 122 s |
+| Harvest (dry run) | Harvest tab button; 33 s | Needs you → Start harvest… → confirm: 2 clicks; 27 s |
+| Review changesets | "+128,672%" next to "−99.9%", "base base" | shares, points, units, dependency text; Review harvest: 1 click |
+| Publish | CLI only, no preview | Publish draft PRs… → plan with the refusal ("no remote named origin"), confirm disabled; Cancel: 2 clicks |
+| Archive | CLI only | Archive… → confirm: 2 clicks; 2 s |
+
+Main path after: 21 clicks and no trip to the CLI (before: five forced CLI trips). Screenshots of every tab and flow, before and after, are in the building thread's storage (`shots/before`, `shots/after`, `shots/after-same-data` for the before study re-rendered by the new code).
+
+### Remaining friction and not done
+
+- **New study composer.** It opens with "No project" selected and placeholders to edit; `toCompose` takes no project, so the human picks it (2 clicks).
+- **Audit alarms for the human's own controls.** In-app controls used while workers run are flagged as "made while study agent turns were running", and the strategist relays that ("if that wasn't you…"). That is the threat model working (RPC can't identify the caller), but it reads as an alarm after ordinary steering.
+- **Old notices keep their old text.** Texts are stored; only notices raised after this pass follow the new wording.
+- **Archiving a study leaves its study thread** (the conversation) unarchived; the human archives it like any thread.
+- **Interaction warnings** still rest on bootstrap CIs that undercover at small n; the info callout only softens the wording.
+- **Light theme** was checked by switching the root class in the browser tab, not by changing BB's theme setting; real light-theme contrast with a custom palette is untested.
+- **The creating agent** in the live run still listed CLI next steps (from the old `study_propose` result text, fixed after the run) and the updated skill wasn't re-run live.

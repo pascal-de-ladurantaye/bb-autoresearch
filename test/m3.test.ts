@@ -284,7 +284,7 @@ describe("operations on a running study (fake host)", () => {
     expect(f.total).toBe(2);
     expect(f.findings.map((x) => x.learned)).toEqual(["The allocator is not hot"]);
     expect(f.outcomes.map((o) => o.value).sort()).toEqual(["improved", "no_effect"]);
-    expect(f.themes).toEqual([{ value: "alloc", count: 2 }]);
+    expect(f.themes.map(({ value, count }) => ({ value, count }))).toEqual([{ value: "alloc", count: 2 }]);
     expect(findingsView(engine, s, { outcome: "improved" }).findings).toHaveLength(1);
     // A revised spec after the run started is pending: the view shows its diff and the CLI command.
     await engine.proposeStudy("thr_study", "proj_1", SPEC_NOISY('\n[oracle.holdout]\nmeasure = "holdout run --secret-workload"\n').replace("max_candidates = 10", "max_candidates = 12"));
@@ -305,7 +305,9 @@ describe("operations on a running study (fake host)", () => {
     expect(b.hosts).toHaveLength(1);
     expect(b.intervals.some((i) => i.kind === "calibration")).toBe(true);
     const hv = harvestView(engine, s);
-    expect(hv).toMatchObject({ harvest: null, canStart: true, startCommand: "bb study harvest toy-size" });
+    // No promotion yet: harvest can't start, and the view says why.
+    expect(hv).toMatchObject({ harvest: null, canStart: false, promotions: 0, startCommand: "bb study harvest toy-size" });
+    expect(hv.cannotStartReason).toMatch(/no candidate has been promoted/u);
   });
 
   it("harvest needs a best; report section renders the interaction warning from stored results", async () => {
@@ -320,7 +322,9 @@ describe("operations on a running study (fake host)", () => {
     store.updateHarvest(h.id, { state: "ready", total_effect: 0.2, total_ci_lo: 0.19, total_ci_hi: 0.21 });
     const text = harvestSection(engine.ctx, store.study(id)!, store.spec(store.study(id)!), store.harvest(h.id)!).join("\n");
     expect(text).toContain("Interaction warning");
-    expect(text).toContain("Sum of contributions: +10.00%");
+    // 0.1 of a 0.2 total: half the gain, in shares (the convention), not raw relative-to-best numbers.
+    expect(text).toContain("Explained by the 2 measured term(s): 50.0% of the gain");
+    expect(text).toContain("| 1 | One | c/1 | 25.0% of the gain (CI 20.0% to 30.0%)");
     expect(harvestView(engine, store.study(id)!).harvest!.accounting.interaction).toBe(true);
   });
 });
@@ -364,5 +368,7 @@ describe("RPC handlers (plugin harness)", () => {
     const pub = await harness.behavior.runCli(["harvest", "toy-size", "--publish"]).catch((e: Error) => ({ exitCode: 1, stdout: "", stderr: e.message }));
     expect(pub.exitCode).not.toBe(0);
     expect(`${pub.stderr ?? ""}`).toContain("publish refused");
+    // The refusal says what to run next.
+    expect(`${pub.stderr ?? ""}`).toContain("`bb study harvest toy-size`");
   });
 });

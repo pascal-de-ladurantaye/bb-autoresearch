@@ -76,13 +76,13 @@ describe("rpc: study page data and controls", () => {
   it("thread.badge describes study and worker threads, and nothing else", async () => {
     const study = (await call<{ badge: any }>("thread.badge", { threadId: "thr_study" })).badge;
     expect(study).toMatchObject({ kind: "study", slug: "toy-size" });
-    expect(study.text).toMatch(/run 0 · no win yet · 1 worker · queue 0/u);
+    expect(study.text).toMatch(/^no win yet · 1 worker · queue 0$/u);
     const worker = (await call<{ badge: any }>("thread.badge", { threadId: "thr_w1" })).badge;
     expect(worker.text).toBe("toy-size · idea #1 · submission 0/2 · working");
     expect((await call<{ badge: any }>("thread.badge", { threadId: "thr_other" })).badge).toBeNull();
     await winOnce();
     const after = (await call<{ badge: any }>("thread.badge", { threadId: "thr_study" })).badge;
-    expect(after.text).toMatch(/run 1 · best −20\.0%/u);
+    expect(after.text).toMatch(/^20\.0% lower size · 1 worker/u);
   });
 
   it("controls: pause, resume, concurrency; idea add, reorder, pin, veto", async () => {

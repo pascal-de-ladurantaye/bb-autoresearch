@@ -169,7 +169,7 @@ describe("M2 remote bench (fake hosts)", () => {
     expect([...edit.checkouts.keys()].every((k) => k.includes("-gate"))).toBe(true);
     const view = benchHostsView(engine, store.study(id)!);
     expect(view.map((h) => h.bundles)).toEqual([expect.any(Number), expect.any(Number)]);
-    expect(showStudy(engine, SLUG, 0)).toContain("Bench host bench-b [own clone via git bundles] online");
+    expect(showStudy(engine, SLUG, 0)).toContain("  bench-b [own clone via git bundles] online");
   });
 
   it("caches the best build per bench host until a promotion invalidates it", async () => {
@@ -378,7 +378,7 @@ describe("M2 remote bench (fake hosts)", () => {
     expect(store.candidateByN(id, 2)!.verdict).toBe("lose");
     expect(store.candidateByN(id, 3)!.verdict).toBe("lose"); // 900 vs best 800
     expect(benchA.commands).toContain("measure run --v2");
-    expect(showStudy(engine, SLUG, 0)).toContain("Segment 2 (oracle");
+    expect(showStudy(engine, SLUG, 0)).toMatch(/Segment:\s+2 \(oracle/u);
   });
 
   it("an oracle change that fails calibration keeps the old spec and pauses", async () => {
