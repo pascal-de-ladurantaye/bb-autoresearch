@@ -5,20 +5,23 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { Rpc } from "./data.ts";
 import { ago, duration, metricChange, pct, ratio, shortSha } from "./format.ts";
+import { BenchHostList } from "./BenchHosts.tsx";
 import { TrajectoryChart } from "./TrajectoryChart.tsx";
 import { EmptyState, Mono, Section, Stat } from "./ui.tsx";
-import type { OverviewResult } from "../views.ts";
+import type { OverviewResult, UsageView } from "../views.ts";
 
 export function OverviewTab({
   o,
   rpc,
   onChanged,
   onOpenCandidate,
+  onOpenHarvest,
 }: {
   o: OverviewResult;
   rpc: Rpc;
   onChanged: () => void;
   onOpenCandidate: (n: number) => void;
+  onOpenHarvest: () => void;
 }) {
   const nav = useBbNavigate();
   const [busy, setBusy] = useState(false);
@@ -108,6 +111,17 @@ export function OverviewTab({
         </p>
       </Section>
 
+      <Usage u={o.usage} />
+      {o.harvest ? (
+        <p className="text-sm">
+          Harvest h{o.harvest.id}: {o.harvest.state}
+          {o.harvest.detail ? ` (${o.harvest.detail})` : ""} · {o.harvest.changesets} changeset(s) · started {ago(o.harvest.startedAt)}{" "}
+          <button type="button" className="underline underline-offset-2" onClick={onOpenHarvest}>
+            Open Harvest
+          </button>
+        </p>
+      ) : null}
+
       {o.segment.pendingSpecVersion !== null ? (
         <div role="status" className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-sm text-foreground">
           Spec v{o.segment.pendingSpecVersion} waits for approval:{" "}
@@ -125,31 +139,7 @@ export function OverviewTab({
 
       <Section title={`Bench hosts (${o.benchHosts.length}) · segment ${o.segment.k}${o.segment.oracleHash ? ` · oracle ${o.segment.oracleHash}` : ""}`}>
         {o.benchHosts.length ? (
-          <ul className="divide-y divide-border rounded-lg border border-border bg-card" aria-label="Bench hosts">
-            {o.benchHosts.map((h) => (
-              <li key={h.hostId} className="space-y-0.5 px-3 py-2 text-sm">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium">{h.name}</span>
-                  <span className="text-xs text-muted-foreground">{h.mode === "clone" ? "own clone · git bundles" : "local checkouts"}</span>
-                  <span className={h.status === "offline" ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>{h.status}</span>
-                  <span className={h.healthOk === false ? "text-xs text-amber-600 dark:text-amber-400" : "text-xs text-emerald-600 dark:text-emerald-400"}>
-                    {h.healthOk === null ? "health not checked" : h.healthOk ? "healthy" : "unhealthy"}
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    drift {h.driftStatus ?? "not run"} ({h.evalsSinceDrift}/{h.driftEvery || "off"})
-                  </span>
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {h.measuring !== null ? `measuring c/${h.measuring}` : "idle"}
-                  {h.progress ? ` · ${h.progress}` : ""} · queue {o.benchDepth} · best build {h.bestBuildSha ? shortSha(h.bestBuildSha) : "not cached"}
-                  {h.mode === "clone" ? ` · ${h.bundles} bundle(s), ${Math.round(h.bundleBytes / 1024)} KiB` : ""}
-                  {h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toLocaleTimeString()}` : ""}
-                </div>
-                {h.problems.length ? <div className="text-xs text-amber-700 dark:text-amber-300">{h.problems.join("; ")}</div> : null}
-                {h.healthSummary ? <div className="truncate text-xs text-muted-foreground">{h.healthSummary}</div> : null}
-              </li>
-            ))}
-          </ul>
+          <BenchHostList hosts={o.benchHosts} queueDepth={o.benchDepth} />
         ) : (
           <EmptyState>Bench hosts are set when the study is calibrated.</EmptyState>
         )}
@@ -232,5 +222,22 @@ export function OverviewTab({
         </ul>
       </Section>
     </div>
+  );
+}
+
+function Usage({ u }: { u: UsageView }) {
+  const parts = [
+    u.rateLimited ? `rate limited until ${u.rateLimitedUntil ? new Date(u.rateLimitedUntil).toLocaleTimeString() : "?"}` : null,
+    u.tight ? `tight (≥ ${u.tightPercent}%)` : null,
+    u.maxPercent !== null ? `max window ${u.maxPercent.toFixed(0)}%` : "no usage reading",
+    u.tokens !== null ? `${u.tokens.toLocaleString()} tokens${u.maxTokens ? ` of ${u.maxTokens.toLocaleString()}` : ""}` : null,
+    u.tokensPerWin !== null ? `${u.tokensPerWin.toLocaleString()} per win` : null,
+    u.projectedBenchSeconds !== null ? `remaining budget ≈ ${duration(u.projectedBenchSeconds)} bench` : null,
+  ].filter(Boolean);
+  return (
+    <p className={u.rateLimited || u.tight ? "text-xs text-amber-700 dark:text-amber-300" : "text-xs text-muted-foreground"} aria-label="Provider usage">
+      Provider usage: {parts.join(" · ")}
+      {u.checkedAt ? ` · checked ${ago(u.checkedAt)}` : ""}
+    </p>
   );
 }

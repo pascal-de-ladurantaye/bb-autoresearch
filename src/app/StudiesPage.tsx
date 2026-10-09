@@ -6,11 +6,15 @@ import { cn } from "@/lib/utils";
 import { CandidatesTab } from "./Candidates.tsx";
 import { useLive, useStudyRpc } from "./data.ts";
 import { ago, duration, metricChange } from "./format.ts";
+import { BenchTab } from "./Bench.tsx";
+import { FindingsTab } from "./Findings.tsx";
+import { HarvestTab } from "./Harvest.tsx";
 import { IdeasTab } from "./Ideas.tsx";
+import { OracleTab } from "./Oracle.tsx";
 import { OverviewTab } from "./Overview.tsx";
 import { EmptyState, ErrorLine, StatePill } from "./ui.tsx";
 
-const TABS = ["overview", "ideas", "candidates"] as const;
+const TABS = ["overview", "ideas", "candidates", "findings", "oracle", "bench", "harvest"] as const;
 type Tab = (typeof TABS)[number];
 
 export function parseSubPath(subPath: string): { slug: string | null; tab: Tab; candidate: number | null } {
@@ -79,10 +83,13 @@ function StudyPage({ slug, tab, candidate }: { slug: string; tab: Tab; candidate
   const rpc = useStudyRpc();
   const o = useLive((r) => r.call("study.overview", { slug }), [slug]);
   const ideas = useLive((r) => r.call("study.ideas", { slug }), [slug], 10_000);
+  // Only the total, for the tab count.
+  const findings = useLive((r) => r.call("study.findings", { slug, limit: 1 }), [slug], 30_000);
   const go = useCallback((t: Tab, n: number | null = null) => nav.toPluginPanel("studies", { subPath: `${slug}/${t}${n !== null ? `/${n}` : ""}` }), [nav, slug]);
   const refetch = () => {
     o.refetch();
     ideas.refetch();
+    findings.refetch();
   };
   const data = o.data;
   return (
@@ -108,6 +115,9 @@ function StudyPage({ slug, tab, candidate }: { slug: string; tab: Tab; candidate
             {t}
             {t === "ideas" && ideas.data ? <span className="ml-1 text-xs text-muted-foreground">{ideas.data.ideas.filter((i) => i.status === "queued").length}</span> : null}
             {t === "candidates" && data ? <span className="ml-1 text-xs text-muted-foreground">{data.candidates}</span> : null}
+            {t === "findings" && findings.data ? <span className="ml-1 text-xs text-muted-foreground">{findings.data.total}</span> : null}
+            {t === "oracle" && data?.segment.pendingSpecVersion != null ? <span className="ml-1 text-xs text-sky-600 dark:text-sky-400">pending</span> : null}
+            {t === "harvest" && data?.harvest ? <span className="ml-1 text-xs text-muted-foreground">{data.harvest.state}</span> : null}
           </button>
         ))}
       </nav>
@@ -115,13 +125,21 @@ function StudyPage({ slug, tab, candidate }: { slug: string; tab: Tab; candidate
       {!data ? (
         <EmptyState>{o.loading ? "Loading study…" : "Study not found."}</EmptyState>
       ) : tab === "overview" ? (
-        <OverviewTab o={data} rpc={rpc} onChanged={refetch} onOpenCandidate={(n) => go("candidates", n)} />
+        <OverviewTab o={data} rpc={rpc} onChanged={refetch} onOpenCandidate={(n) => go("candidates", n)} onOpenHarvest={() => go("harvest")} />
       ) : tab === "ideas" ? (
         ideas.data ? (
           <IdeasTab slug={slug} ideas={ideas.data.ideas} rpc={rpc} onChanged={refetch} onOpenCandidate={(n) => go("candidates", n)} />
         ) : (
           <EmptyState>Loading ideas…</EmptyState>
         )
+      ) : tab === "findings" ? (
+        <FindingsTab slug={slug} direction={data.metric.direction} onOpenCandidate={(n) => go("candidates", n)} />
+      ) : tab === "oracle" ? (
+        <OracleTab slug={slug} />
+      ) : tab === "bench" ? (
+        <BenchTab slug={slug} onOpenCandidate={(n) => go("candidates", n)} />
+      ) : tab === "harvest" ? (
+        <HarvestTab slug={slug} direction={data.metric.direction} onOpenCandidate={(n) => go("candidates", n)} onChanged={refetch} />
       ) : (
         <CandidatesTab slug={slug} direction={data.metric.direction} metric={data.metric.name} selected={candidate} onSelect={(n) => go("candidates", n)} />
       )}

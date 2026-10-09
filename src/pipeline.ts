@@ -63,7 +63,7 @@ export function benchLockKey(study: StudyRow, spec: StudySpec, hostId: string): 
 }
 
 /** Hold the bench lock of `hostId` for `fn` and record the busy interval (bench utilization, overlap audits). */
-export async function withBench<T>(ctx: Ctx, study: StudyRow, hostId: string, kind: "measure" | "profile" | "calibration" | "drift", candidateId: number | null, fn: () => Promise<T>): Promise<T> {
+export async function withBench<T>(ctx: Ctx, study: StudyRow, hostId: string, kind: "measure" | "profile" | "calibration" | "drift" | "harvest", candidateId: number | null, fn: () => Promise<T>): Promise<T> {
   const key = benchLockKey(study, ctx.store.spec(study), hostId);
   return await ctx.benchLock.run(key, async () => {
     const id = ctx.store.openBenchInterval({ study_id: study.id, host_id: hostId, lock_key: key, kind, candidate_id: candidateId });
@@ -146,6 +146,7 @@ export class Pipeline {
     const spec = store.spec(study);
     // A study recalibrating after an oracle change keeps taking submissions; they wait at the gate until it runs again.
     const recalibrating = study.state === "calibrating" && store.hasRun(study.id);
+    if (study.state === "harvesting") return { ok: false, text: `Study ${study.slug} is harvesting (turning its wins into PRs), so submissions are closed. Call study_record_finding with what you learned (and what you would try), then study_finish.` };
     if (!["running", "paused"].includes(study.state) && !recalibrating) return { ok: false, text: `Study ${study.slug} is ${study.state}; submissions are closed.` };
     if (!worker.thread_id || !worker.worktree_path || !worker.fork_sha) return { ok: false, text: "This worker has no worktree recorded yet; try again in a moment." };
     const pending = store.candidates(study.id, { threadId: worker.thread_id }).find((c) => c.stage !== "decided" || c.reported_at === null);
@@ -262,7 +263,8 @@ export class Pipeline {
 
   private launch(): void {
     const { store } = this.ctx;
-    const studies = store.studies(["running", "paused"]);
+    // Harvesting studies finish their in-flight candidates (no new submissions arrive).
+    const studies = store.studies(["running", "paused", "harvesting"]);
     const queued: Array<{ study: StudyRow; spec: StudySpec; c: CandidateRow }> = [];
     for (const study of studies) {
       for (const c of store.candidates(study.id, { stages: ["promoting"] })) {

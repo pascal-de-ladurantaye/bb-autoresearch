@@ -100,16 +100,58 @@ export interface BudgetState {
   maxBenchHours: number;
   deadline: string | undefined;
   now: number;
+  /** Tokens the study's threads used (null when no provider reports usage). */
+  tokens?: number | null;
+  maxTokens?: number | undefined;
 }
 
 export function budgetExhausted(b: BudgetState): string | null {
   if (b.candidates >= b.maxCandidates) return `max_candidates reached (${b.candidates}/${b.maxCandidates})`;
   if (b.benchSeconds >= b.maxBenchHours * 3600) return `max_bench_hours reached (${(b.benchSeconds / 3600).toFixed(3)} h)`;
+  if (b.maxTokens !== undefined && b.tokens !== null && b.tokens !== undefined && b.tokens >= b.maxTokens) return `max_tokens reached (${b.tokens.toLocaleString("en-US")} of ${b.maxTokens.toLocaleString("en-US")})`;
   if (b.deadline) {
     const end = Date.parse(b.deadline.length === 10 ? `${b.deadline}T23:59:59` : b.deadline);
     if (Number.isFinite(end) && b.now > end) return `deadline ${b.deadline} passed`;
   }
   return null;
+}
+
+/** Share of each budget limit used (0..1+); deadline is the share of time from `startedAt` to the deadline. */
+export function budgetShares(b: BudgetState & { startedAt?: number | null }): Record<"candidates" | "bench" | "tokens" | "deadline", number | null> {
+  let deadline: number | null = null;
+  if (b.deadline && b.startedAt) {
+    const end = Date.parse(b.deadline.length === 10 ? `${b.deadline}T23:59:59` : b.deadline);
+    if (Number.isFinite(end) && end > b.startedAt) deadline = (b.now - b.startedAt) / (end - b.startedAt);
+  }
+  return {
+    candidates: b.maxCandidates > 0 ? b.candidates / b.maxCandidates : null,
+    bench: b.maxBenchHours > 0 ? b.benchSeconds / (b.maxBenchHours * 3600) : null,
+    tokens: b.maxTokens !== undefined && b.tokens !== null && b.tokens !== undefined ? b.tokens / b.maxTokens : null,
+    deadline,
+  };
+}
+
+/** Thresholds (percent) newly crossed per budget dimension, as "dim:pct" keys not yet in `announced`. */
+export function newBudgetThresholds(shares: Record<string, number | null>, thresholds: readonly number[], announced: ReadonlySet<string>): Array<{ key: string; dim: string; pct: number; share: number }> {
+  const out: Array<{ key: string; dim: string; pct: number; share: number }> = [];
+  for (const [dim, share] of Object.entries(shares)) {
+    if (share === null) continue;
+    const crossed = [...thresholds].sort((a, b) => b - a).find((t) => share * 100 >= t);
+    if (crossed === undefined) continue;
+    const key = `${dim}:${crossed}`;
+    if (!announced.has(key)) out.push({ key, dim, pct: crossed, share });
+  }
+  return out;
+}
+
+/**
+ * W under provider limits: while a rate limit blocks turns, hold spawns
+ * (W = 1, and no new worker starts); while a usage window is tight, halve W.
+ */
+export function rateLimitedTarget(w: number, s: { blocked: boolean; tight: boolean }): { w: number; hold: boolean; reason: string | null } {
+  if (s.blocked) return { w: 1, hold: true, reason: "rate limited: spawns held until the window resets" };
+  if (s.tight) return { w: Math.max(1, Math.ceil(w / 2)), hold: false, reason: "usage window tight: W halved" };
+  return { w, hold: false, reason: null };
 }
 
 export type RoundTrigger = "verdicts" | "queue_low" | "stall" | "human" | "start";

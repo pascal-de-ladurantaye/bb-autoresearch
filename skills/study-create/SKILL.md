@@ -100,10 +100,19 @@ max_workers = 3                  # W adapts up to this: min(max, ceil(think/eval
 max_candidates = 50
 max_bench_hours = 8
 deadline = "2026-12-31"          # optional
+max_tokens = 5000000             # optional: tokens across the study's threads (as BB reports them)
+notify_at = [50, 80]             # budget shares (%) that raise a notice once
 
 [agents]
 worker = { permission_mode = "full" }   # optional: provider, model, permission_mode
 max_submissions_per_worker = 3
+max_rate_limit_retries = 3       # rate-limited turns retried at the window reset
+usage_tight_percent = 90         # a provider window at this % halves W
+
+[harvest]
+measure_standalone = true        # also measure each PR's effect on its base (bench time)
+group_timeout_minutes = 10       # wait this long for study_propose_harvest, then one changeset per win
+remote = "origin"                # the GitHub remote `--publish` pushes to
 ```
 
 Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries must name enrolled BB machines (checked when you call `study_propose`). Unknown keys are rejected.

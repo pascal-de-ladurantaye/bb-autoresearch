@@ -181,6 +181,10 @@ export const specSchema = z
           .string()
           .regex(/^\d{4}-\d{2}-\d{2}/u, "deadline: YYYY-MM-DD")
           .optional(),
+        /** Total tokens the study's threads may use (workers, plus the study thread since start), read from BB's per-thread usage. */
+        max_tokens: z.number().int().min(1000).max(1e12).optional(),
+        /** Budget shares that raise a notice once each (percent of every limit). */
+        notify_at: z.array(z.number().min(1).max(100)).max(5).default([50, 80]),
       })
       .strict()
       .prefault({}),
@@ -197,6 +201,22 @@ export const specSchema = z
         idle_abandon_minutes: z.number().min(0.1).max(24 * 60).default(30),
         /** study_request_profile calls per worker (each uses bench time). */
         max_profiles_per_worker: z.number().int().min(0).max(20).default(2),
+        /** Rate-limited turns are retried at the provider's window reset, at most this many times per thread. */
+        max_rate_limit_retries: z.number().int().min(0).max(20).default(3),
+        /** A usage window at or above this percent counts as "tight": the scheduler halves W. */
+        usage_tight_percent: z.number().min(1).max(100).default(90),
+      })
+      .strict()
+      .prefault({}),
+    /** Harvest: grouping, ablation and PR drafting (not part of the oracle hash). */
+    harvest: z
+      .object({
+        /** Measure each changeset applied alone on its PR base (costs bench time); gates always run. */
+        measure_standalone: z.boolean().default(true),
+        /** How long to wait for the strategist's study_propose_harvest before grouping one changeset per promotion. */
+        group_timeout_minutes: z.number().min(0.1).max(24 * 60).default(10),
+        /** Remote the github publisher pushes to. */
+        remote: z.string().min(1).max(100).default("origin"),
       })
       .strict()
       .prefault({}),

@@ -5,13 +5,26 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: autoresearch
 brandSublabel: BB plugin design
-pills: Draft | M0-M2 built | M3 to do
+pills: Draft | M0-M3 built | Exit criteria partly validated
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
 # Autoresearch for BB
 
 > Autoresearch works like a merge queue. The CI is a benchmark, and the authors are short-lived agents. The plugin runs the loop, measures every candidate, and decides what to keep. Agents only propose changes and explain what they learned.
+
+## Status
+
+All four milestones are built (BB 0.45, plugin SDK 0.6.14). Each was smoke-tested live on toy repositories on one MacBook; no milestone has run on a real workload. The exit criteria:
+
+| Milestone | Exit criterion | Validated? |
+|---|---|---|
+| M0: test the main assumption | Equal or better improvement than a serial single-agent loop at equal tokens, and a measured false-win rate | **No.** The head-to-head against a serial loop was never run. False-win rates are measured in simulation only (stats and expensive-class tests). |
+| M1: parallel | Bench busy > 80% of Running time; time to target clearly below M0 at similar tokens per win | **No.** Toy studies reached 85% in steady state when eval > think, but they are too short; no real workload, no M0 comparison. |
+| M2: remote bench and trust | A study runs a full day on a remote x86 bench host without a human stepping in | **No.** Only one BB machine existed; the remote path ran against the server's own machine in clone mode for minutes. |
+| M3: harvest and operations | A harvested PR set whose measured contributions add up to the total gain within the CI | **On a toy only.** Harvest h4 of `toy-m3b`: sum of contributions +290.7% ± 1.4% vs measured total +293.9% (CI half-width of the gap 3.7%). See the M3 notes. |
+
+What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
 ## Problem
 
@@ -421,7 +434,7 @@ bb study archive routing-p99
 
 ### Notifications
 
-Milestones reach the human through the study thread: a new best, a stall, a budget threshold, a broken oracle, or noise drift. The plugin posts them as part of a strategist round, and the thread then shows as unread. A direct push or Slack channel is an open question.
+Milestones reach the human as notices: a new best, a stall, a budget threshold, a broken oracle, noise drift, a rate limit, and a harvest that is ready. Each notice shows on the study page and in `bb study show`, marks the study thread unread (without starting a turn), and rides along in the next strategist round. BB gives plugins no push or Slack channel (see the M3 notes).
 
 ## Data model
 
@@ -504,7 +517,7 @@ There, the defenses are detection (the audit trail above) and isolation: a separ
 
 ## Budget and cost
 
-- **Limits.** `max_workers`, `max_candidates`, `max_bench_hours`, `deadline`. Token or dollar limits too, if BB exposes per-thread usage to plugins (see [Open questions](#open-questions)).
+- **Limits.** `max_workers`, `max_candidates`, `max_bench_hours`, `deadline`, and `max_tokens` (BB exposes per-thread token usage to plugins; dollar cost is not exposed per thread, see the M3 notes).
 - **Cost per evaluation.** Calibration estimates bench time per evaluation up front, so the study page can project spend before Running starts.
 - **Where tokens go.** Workers dominate token spend, because each one relearns part of the codebase. The dossier and brief are the main lever. Track tokens per accepted win as the efficiency metric.
 - **Cheap rejections.** Scope rejection, rebase conflicts, and gate failures all cost no bench time. Stopping early cuts bench time on clear losers.
@@ -546,9 +559,10 @@ The main assumption: short-lived workers with good briefs, judged by the plugin,
 
 ### M3: harvest and operations
 
-- [ ] Ablation, dependency detection, draft PRs and stacks, study report
-- [ ] Budgets, usage-window awareness, notifications
-- [ ] Findings, Oracle, Bench, and Harvest tabs
+- [x] Ablation, dependency detection, draft PRs and stacks, study report
+- [x] Budgets, usage-window awareness, notifications
+- [x] Findings, Oracle, Bench, and Harvest tabs
+- [ ] Exit criterion on a real workload (met on a toy; see the M3 notes)
 
 **Exit:** a harvested PR set where measured contributions add up to the total gain within the CI.
 
@@ -574,8 +588,8 @@ The main assumption: short-lived workers with good briefs, judged by the plugin,
 
 ## Open questions
 
-1. Can plugins read per-thread token or cost usage? Token budgets and tokens per win depend on it.
-2. What notification channel should be the default: study-thread attention only, or a push or Slack path a plugin can use directly?
+1. ~~Can plugins read per-thread token or cost usage?~~ Answered in M3: tokens yes (the thread's `thread/tokenUsage/updated` events, read with `bb.sdk.threads.events.list`), dollars no. `budget.max_tokens` and tokens per win are built on it.
+2. ~~What notification channel should be the default?~~ Answered in M3: study-thread attention is the only channel. The SDK has no push, notification, or Slack API for plugins; `bb.sdk.system.attention()` only reads the global "needs attention" flag.
 3. ~~What are the host RPC limits for long calls?~~ Answered in M2: a call is capped at 30 minutes, input at 32 MiB and output at 8 MiB. Long commands run as host background jobs polled in short calls, cancelled through `jobCancel`, with progress through host signals (see the M2 notes).
 4. Do hidden threads count against concurrency limits? Is a link from the study page enough for users to find them?
 5. Is `threads.compact` enough for the study thread, or should the plugin replace it with a fresh thread that starts from a digest?
@@ -966,3 +980,149 @@ New events: `bench.transfer`, `bench.unhealthy`, `bench.healthy`, `bench.offline
 - **Health tuning.** Health thresholds aren't calibrated per machine: the defaults suit a quiet dedicated host, and a busy laptop needs looser `[oracle.health]` limits.
 - **Caller identity.** Approval from an agent shell can't be prevented without caller identity from BB (see the threat model).
 - **M3 tabs.** The Findings, Oracle, Bench, and Harvest tabs.
+
+## Implementation notes: M3
+
+What M3 added, and every place it differs from the design or from M2. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+### Harvest
+
+- **Lifecycle.** `bb study harvest <slug>` (or the Harvest tab's dry-run button) moves Running or Paused to **Harvesting**. `bb study resume` is "keep exploring" (back to Running; a harvest still in progress is cancelled, a ready one stays for review). `bb study archive` ends the study and cancels a running harvest. A new harvest after a ready, failed or cancelled one needs `--restart`.
+- **Waiting (decision).** Harvest doesn't cancel anything. While Harvesting no worker spawns, submissions are refused with "record a finding, then finish", and the pipeline still finishes candidates already in flight. Only then is best frozen (`base_sha`, `best_sha`, and the promotion list from `git rev-list --first-parent base..best`, mapped to candidates by the `Autoresearch-Candidate` trailer).
+- **Grouping.** The plugin sends one strategist turn, `[autoresearch] Harvest h<N>`, listing the promotions (candidate, idea, effect, files). `study_propose_harvest` now validates against that list: every promoted candidate in exactly one group, unknown or duplicated numbers rejected with the reason so the strategist can retry; promotions it leaves out get a changeset of their own. Fallback, one changeset per promotion: when the study thread is missing, when its turn ends without a valid proposal (after `harvestGroupGraceMs`, 60 s), after `[harvest].group_timeout_minutes` (10), for a single promotion, or on request with `--one-per-promotion` (deterministic, no strategist turn). Changesets are ordered by their earliest commit on best.
+- **Git without checkouts.** A new host op `composeCommits` replays or reverts a list of commits onto a commit with one `git merge-tree` per step and returns one commit (or the conflicting step and paths). `commitLog` lists first-parent commits with their paths. Ablation commits, standalone commits and probes are dangling commits in the project repo; only the PR branches get refs.
+- **Ablation.** For each changeset S: revert S's commits from best (newest first), run the gates on the edit host, then measure best-without-S against best on the first online, healthy bench host with the study's noise-class protocol under the bench lock. For `noisy` the full `n_max` pairs run (no early stop: harvest needs an estimate, not a decision). The **contribution** is how much worse best gets without S, relative to best: `−effect`, CI flipped. The **total gain** is measured the same way, with the base as the "candidate", so every term is on the same scale and they add. The report also gives the total relative to base (`t / (1 + t)`).
+- **Scale (decision).** Contributions are relative to best, not base, because that is what ablation measures and it makes them additive. After big wins the numbers get large: on the toy, best is a quarter of base, so the total is +291% relative to best (−74% relative to base). The Harvest tab and report show both.
+- **Droppable.** A measured changeset whose contribution CI reaches zero (for `deterministic`, not above `tolerance`) is flagged droppable; the human decides.
+- **Dependencies (decision, changed during the smoke test).** A revert conflict or gate failure means a later changeset depends on S. Which one is found with git probes: revert S together with every later candidate (those sharing files with S, else all later ones); if that works, a candidate T is a dependent when keeping T in place makes S's revert fail again. Gate failures run the gates for each probe. If the failure can't be isolated (it fails even with all of them reverted, or no single one is to blame), every candidate is treated as dependent, because stacking is always safe. The first version attributed by shared file paths; on the one-file toy that stacked all six changesets together (harvest h2 below), so path overlap is now only the pre-filter.
+- **Stacks.** Dependency edges are grouped into connected components; each component is one **stack**, linearized in best order. A stack with a member that couldn't be ablated alone (conflict or gate failure) is ablated as a whole, and that joint contribution stands in for its members in the sum. A stack covering every changeset is the base itself, so it reuses the total measurement instead of measuring the same thing twice (h2 measured it twice and the two bootstrap CIs disagreed enough to raise a false interaction warning).
+- **Standalone check.** Each changeset is applied to its PR base: the segment base for an independent one, the previous layer's commit for a stacked one. Gates always run; the effect against the PR base is measured unless `[harvest].measure_standalone = false` or `--no-measure-standalone`. An independent changeset that doesn't apply to the base reveals an earlier dependency (found with the same probes, forward); the plugin adds the edge, restacks, and checks again.
+- **Accounting.** Sum of contributions (independent changesets, stack members when all were measured, otherwise the stack's joint ablation) vs the total gain. The gap's CI half-width is the root sum of squares of the terms' half-widths and the total's (independent errors). An **interaction warning** is raised when |gap| exceeds it, or when a term could not be measured at all. Small-sample bootstrap CIs of the median undercover, so expect occasional false warnings at `n_max` ≈ 10.
+- **PR drafting.** Drafting creates one local branch per changeset, `studies/<slug>/harvest/h<N>/<kk>-<title>`, whose tip is its standalone commit. Each commit message carries `Autoresearch-Study` and `Autoresearch-Changeset` trailers. A stacked branch sits on the branch below it. The PR body has:
+  - what (the promoted candidates' summaries and their effects when promoted) and why (the group rationale);
+  - the ablation contribution with CI and n, and the droppable flag;
+  - the standalone effect on its PR base;
+  - depends-on and needed-by;
+  - linked findings;
+  - a study link (`bb.server.experimental_appUrl` when configured, otherwise the page path).
+- **Publishers (`src/publisher.ts`, behind `PrPublisher`).**
+  - `dry-run` is the only mode harvest itself runs. It writes `report.md`, `prs/<kk>-<title>.md`, and `manifest.json` through a new `writeExport` host op under `<dataDir>/exports/<slug>-harvest-h<N>/` on the edit host. Nothing is pushed.
+  - `github` runs only through `bb study harvest <slug> --publish` on a **ready** harvest (decision: always review a dry run first). It is CLI-only, like approval: the RPC can start dry runs but cannot publish.
+  - The `github` publisher refuses when the flag is missing, when the repo has no remote named `[harvest].remote` (default `origin`), when that remote isn't GitHub, or when `gh` is missing. Otherwise it pushes each branch and runs `gh pr create --draft`, with stacked PRs based on the branch below. A failed push skips the PRs stacked on it.
+  - It was tested against a mock `gh` only; no PR was ever opened.
+- **Report (`src/report.ts`, `bb study report`, `study.report`).** Trajectory table, wins, notable losses with their reasons and findings, the dossier, calibration and segments, drift checks, and the latest harvest (changesets, stacks, droppable, the sum-vs-total section). It never reads holdout data: a test checks the report and the new views for the holdout command and numbers.
+- **Reconciliation.** Every phase persists per-changeset results; a plugin restart resumes a harvesting study's harvest where it stopped.
+
+### Budgets and provider usage
+
+- **What the SDK exposes (investigated).**
+  - `turn.failed` carries `errorInfo.category` and the provider's `rateLimits` (windows with `resetsAtMs` and status).
+  - `bb.sdk.threads.retry({ sendAt })` queues a retry on the clock.
+  - `bb.sdk.system.usageLimits()` returns each provider's subscription windows (`usedPercent`, `resetsAt`).
+  - **Per-thread tokens are readable:** the latest `thread/tokenUsage/updated` event (`bb.sdk.threads.events.list`) has cumulative `totalTokens`. Dollar cost per thread is not exposed.
+- **Rate limits.** A rate-limited turn of a worker or of the study thread is retried at the latest blocked window's reset plus 15 s (or now + 1 min × attempt when no reset is known), at most `agents.max_rate_limit_retries` (3) times per thread. Then the plugin gives up with a notice, and an idle worker is later abandoned. The study records `rate_limited_until`; until then no new worker spawns (W shown as 1).
+- **Usage windows.** Usage windows are read every 2 min for the providers the study's threads use. A window at or above `agents.usage_tight_percent` (90) halves W, recorded in the `scheduler.target` event. On the smoke-test machine `usageLimits` returned no providers (the default provider, pi, reports no windows), so this path is unit-tested only.
+- **Tokens.** Each live thread's total is read at most once a minute and once more when a worker ends. Study tokens are the workers' totals plus the study thread's growth since its first reading after start. `budget.max_tokens` (optional) is enforced like the other limits, and tokens per win show on the Overview, in `bb study show`, and in the report.
+- **All limits.** `max_candidates`, `max_bench_hours`, `deadline`, and `max_tokens` pause the study when reached and propose a harvest (decision: the design's lifecycle allows "budget exhausted → Harvesting"; the plugin pauses and asks, because harvest spends bench time). `budget.notify_at` (50 and 80 by default) raises one notice per dimension per threshold, the deadline counting time from the first start. The Overview projects the bench time the remaining candidate budget would take at the calibrated cost per evaluation. Harvest bench time counts toward the bench budget but is never blocked by it.
+
+### Notifications
+
+- **One mechanism.** M1's notices: a row in `notices`, the study page and `bb study show`, `markUnread` on the study thread (unless quiet), and the text in the next strategist round. Kinds:
+  - `best.new`;
+  - `stall` (quiet; the stall round itself follows);
+  - `budget.threshold` and `budget.exhausted`;
+  - `oracle.broken` (best fails to build or measure, the holdout fails on best, best can't be sent to a bench host) and `drift`;
+  - `rate_limit` and `usage.tight` (quiet);
+  - `harvest.ready` and `harvest.failed`;
+  - plus M1/M2's calibration, bench health, offline, spec and `control.*` notices.
+- **No push.** The SDK has no notification, push, or Slack API for plugins. `bb.sdk.system.attention()` only reads the global flag, and `threads.send` always starts or steers a turn. The unread study thread is what reaches the human, plus the Studies list's "new" count.
+
+### Human surface
+
+- **New tabs (data from `src/views.ts` view models over RPC).**
+  - **Findings:** search, outcome, theme, and verdict filters; links to candidates and worker threads.
+  - **Oracle:** the active spec as TOML with `[oracle.holdout]` removed (agents can call RPC), version history, calibration report per host, segments, and a pending spec with its line diff and the CLI command that approves it. Approval stays CLI-only.
+  - **Bench:** hosts, queue, utilization, health-check history, drift checks, bundle transfers, recent bench intervals, and flaky and failed gate counts.
+  - **Harvest:** state, total, sum, gap and the interaction warning, changesets with ablation, standalone, dependencies, stack, PR branch and expandable PR body, stacks, the export dir, the publish command (no button), history, an on-demand report, and a dry-run start/restart button.
+  - **Overview:** a provider-usage line and a Harvest link.
+- **New RPC.** `study.findings`, `study.oracle`, `study.bench`, `study.harvest`, `study.report`, and the audited control `study.harvest.start` (dry run only).
+- **CLI.** `bb study harvest [--wait] [--restart] [--one-per-promotion] [--no-measure-standalone] [--publish]` and `bb study report`. `show` gains a Usage line (tokens, tokens per win, rate limit, usage window, projected bench time) and the harvest line.
+- **Skills.** `skills/study-harvest` from the integration map wasn't added: the grouping round's prompt carries the instructions, and the `autoresearch` skill documents harvest, budgets and limits.
+
+### Spec additions
+
+- **Budget:** `budget.max_tokens` and `budget.notify_at`.
+- **Agents:** `agents.max_rate_limit_retries` and `agents.usage_tight_percent`.
+- **Harvest:** a new `[harvest]` section with `measure_standalone`, `group_timeout_minutes`, and `remote`. None of these are part of the oracle hash.
+
+### Data model
+
+M3's migrations are append-only:
+
+- new tables `harvests` and `changesets`;
+- `harvest_proposals.harvest_id`;
+- `threads`: `tokens`, `tokens_base`, `tokens_at`, `provider_id`, `rate_limit_retries`;
+- `studies`: `rate_limited_until`, `usage_json`, `usage_at`, `budget_notices_json`.
+
+New events:
+
+- harvest: `harvest.started`, `.phase`, `.frozen`, `.grouped`, `.grouping_fallback`, `.total`, `.ablation`, `.dependency`, `.standalone`, `.drafted`, `.ready`, `.failed`, `.resumed`, `.publishing`, `.published`;
+- usage and budget: `turn.rate_limit_gave_up`, `usage.tight`, `budget.threshold`;
+- controls: `control.harvest` and `control.publish`.
+
+### Hermetic tests (fix from the M2 review)
+
+The M2 end-to-end test failed on a loaded laptop because `LocalHostRunner` probed the real machine: at load 6 the health policy deferred the measurement. `LocalHostRunner` now takes an injected health probe, and every test uses `localRunner()` from `test/helpers.ts`, which returns fixed healthy readings and counts probes. Fixed sleeps and short polling loops in tests were replaced with bounded condition polling (`waitFor`, 10 s), including one test that relied on an 80 ms timing window. The full suite (17 files, 169 tests) passed three times in a row at load average 4.5–6.
+
+### Smoke test (BB 0.45, one MacBook, toy repo under /tmp)
+
+- **Toy.** `src/toy.py` has `slow_sum`, a naive `fib`, and a `dedupe` built on a linear `contains()` scan and a `bubble_sort`. The metric is the Python opcodes executed by `toy.run()` plus a fixed workload, counted with `sys.settrace` in the protected `bench/measure.py`, with 0.5% synthetic Gaussian noise, so the `noisy` protocol (real CIs) runs on a deterministic count. The gate is `bench/test_toy.py`. Calibration: noise floor 0.96%, MDE 1.00%, 0.9 s per evaluation, local bench.
+- **First attempt (`toy-m3`, discarded).** The repo had no `.gitignore`. Workers ran the tests, the snapshot's `git add -A` committed `src/__pycache__/*.pyc`, and two candidates got `conflict` verdicts on the binary. That is a real usability issue (below). The study was archived and the toy got a `.gitignore`.
+- **Study `toy-m3b`.** Settings: `max_workers = 2`, `max_candidates = 6`, default provider pi. Study thread `<thread>`; workers `<thread>`, `<thread>`, `<thread>`, `<thread>`, `<thread>`, `<thread>`.
+  - All 6 candidates won: 4 human-seeded ideas (set membership, iterative fib, `sorted()`, closed-form sum) and 2 strategist ideas (items via `map`, `sorted(set(items))`).
+  - Best vs base −74.4% (measured) after about 3 minutes of Running.
+  - The candidate budget ran out: the study paused itself with "harvest them with `bb study harvest`".
+  - Tokens: 295,901 in total (about 24k per worker, 149,883 for the study thread since start), so 49,317 per win.
+  - Notices: `best.new` ×6, `budget.threshold` ×2 (50% and 80% of candidates), `budget.exhausted`, `harvest.ready` per harvest, `control.*`.
+- **Harvest h1 (strategist grouping).**
+  - The study thread answered with `study_propose_harvest`, grouping the three dedupe promotions (c/1, c/3, c/6) into one changeset next to fib, sum, and items: 4 independent changesets, no edges.
+  - Total +292.57% (CI +291.34..+294.78%) relative to best; sum of contributions +291.05% ± 1.62%; gap +1.52% (half-width 2.36%): they add up.
+- **Harvest h2 (`--one-per-promotion`, first dependency code).** Path-level attribution put all six changesets into one stack (one file). The stack's separate measurement of base vs best gave a false interaction warning (gap −2.78%, half-width 1.52%). Both issues were fixed as described above.
+- **Harvests h3 and h4 (`--one-per-promotion`, final code).**
+  - Reverting c/1 or c/3 from best conflicts in `src/toy.py`; the probes isolate c/6 as the dependent of both. That gives **edges #6 → #1 and #6 → #3** and a stack `#1 → #3 → #6`, ablated together at +236.9%.
+  - The other three are independent:
+
+    | Changeset | Contribution (CI) |
+    |---|---|
+    | fib | +29.76% (+29.34..+30.08%) |
+    | sum | +20.38% (+19.98..+21.36%) |
+    | items | +3.65% (+3.14..+3.95%) |
+    | #6 | +3.75% (+2.90..+4.67%) |
+
+  - **h4 total** +293.91% (CI +289.32..+296.22%), **sum** +290.68% ± 1.39%, **gap** +3.23% (half-width 3.72%): "The contributions add up to the total gain within the CI." (h3: gap +0.03%, half-width 2.49%.)
+  - Standalone effects on each PR base:
+
+    | Changeset | PR base | Effect |
+    |---|---|---|
+    | #1 | base | +30.65% |
+    | #2 | base | +7.25% |
+    | #3 | #1 | +42.03% |
+    | #4 | base | +4.90% |
+    | #5 | base | +0.87% |
+    | #6 | #3 | +1.82% |
+
+  - Harvest bench time: 11 s.
+  - Six local branches; the stacked ones are chained (`06 → 03 → 01 → base`). The PR bodies and `report.md` were exported, and `--publish` was refused: "the repository has no remote named origin".
+- **UI.** All seven tabs rendered in the BB app; there are in-app browser screenshots of Overview, Findings, Oracle, Bench and Harvest.
+- **Cleanup.** Both studies and their threads were archived, and the temporary project, `/tmp` files, and toy exports were deleted. The plugin is left installed from the M3 worktree, disabled.
+
+### Not in M3, and known issues
+
+- **Exit criteria on real workloads.** Not run for any milestone (see Status). M3's criterion holds only on a toy with additive effects.
+- **GitHub publishing.** Never run against GitHub.
+- **Provider limits live.** Neither usage-window W-lowering nor rate-limit retries have been seen live.
+- **Snapshots commit build outputs.** `git add -A` in worker worktrees picks up untracked build outputs when the repo lacks a `.gitignore` (the `toy-m3` failure). Scope globs don't exclude them because they sit under `editable`.
+- **Attribution limits.** Dependency attribution is pairwise. A failure that needs two later changesets together to explain it falls back to "all later", and a stack is linearized in best order, so a member can be stacked under another it doesn't depend on (#3 under #1 on the toy).
+- **Gate dependencies only.** A changeset that is semantically needed but doesn't break the gates when reverted (no test covers it) is not detected as a dependency.
+- **Interaction warnings.** They rely on bootstrap CIs that undercover at small n.
+- **Dollar budgets.** Dollar cost per thread isn't exposed by BB, so there are no dollar budgets.

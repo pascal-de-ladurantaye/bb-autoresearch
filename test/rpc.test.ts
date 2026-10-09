@@ -2,7 +2,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
-import { FakeHost, FakePort, fakeHostSpec } from "./helpers.ts";
+import { FakeHost, FakePort, fakeHostSpec, waitFor } from "./helpers.ts";
 
 type Harness = ReturnType<typeof createFakePluginHost>["harness"];
 
@@ -27,7 +27,7 @@ describe("rpc: study page data and controls", () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["ideas", "add", "toy-size", "Shrink the output", "--theme", "size"]);
     await harness.behavior.runCli(["start", "toy-size"]);
-    for (let i = 0; i < 50 && port.spawned.length < 1; i++) await new Promise((r) => setTimeout(r, 5));
+    await waitFor(() => port.spawned.length >= 1);
   });
   afterEach(async () => {
     await harness.lifecycle.dispose();
@@ -37,7 +37,7 @@ describe("rpc: study page data and controls", () => {
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
     await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
-    for (let i = 0; i < 100 && !port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")); i++) await new Promise((r) => setTimeout(r, 5));
+    await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
   }
 
   it("studies.list and study.overview summarize state, budget, trajectory, utilization", async () => {

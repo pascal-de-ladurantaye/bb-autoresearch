@@ -24,6 +24,8 @@ export interface PluginDeps {
   config?: Partial<EngineConfig>;
   seed?: number;
   now?: () => number;
+  /** Tests: receive the engine (to seed or inspect state). */
+  onEngine?: (engine: Engine) => void;
 }
 
 export function createAutoresearchPlugin(deps: PluginDeps = {}) {
@@ -46,6 +48,7 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
       config: { ...DEFAULT_CONFIG, ...deps.config },
     };
     const engine = new Engine(ctx);
+    deps.onEngine?.(engine);
 
     registerTools(bb, engine);
     registerRpc(bb, engine);

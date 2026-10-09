@@ -167,6 +167,34 @@ export const jobStatus = z
   .strict();
 export type JobStatus = z.infer<typeof jobStatus>;
 
+export const commitInfo = z
+  .object({
+    sha,
+    parent: sha.nullable(),
+    subject: z.string(),
+    /** Full message (trailers included), clipped to 8 KiB. */
+    message: z.string(),
+    paths: z.array(z.string()).max(2000),
+  })
+  .strict();
+export type CommitInfo = z.infer<typeof commitInfo>;
+
+export const composeInput = z
+  .object({
+    repoPath: absPath,
+    onto: sha,
+    /** Applied in order: a pick replays `sha`'s change, a revert undoes it. */
+    steps: z.array(z.object({ sha, revert: z.boolean() }).strict()).min(1).max(500),
+    message: z.string().min(1).max(16_384),
+  })
+  .strict();
+export const composeOutput = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), sha, tree: sha }).strict(),
+  z.object({ status: z.literal("conflict"), at: sha, revert: z.boolean(), paths: z.array(z.string()), detail: z.string() }).strict(),
+]);
+export type ComposeInput = z.infer<typeof composeInput>;
+export type ComposeResult = z.infer<typeof composeOutput>;
+
 export const hostContract = defineRpcContract({
   ping: {
     input: z.null(),
@@ -253,6 +281,30 @@ export const hostContract = defineRpcContract({
   },
   /** Delete a bundle file (sender or receiver side). */
   bundleDiscard: { input: z.object({ id: bundleId }).strict(), output: z.object({ removed: z.boolean() }).strict() },
+  /** First-parent commits in `from..to`, oldest first, with their changed paths (harvest). */
+  commitLog: {
+    input: z.object({ repoPath: absPath, from: sha, to: sha }).strict(),
+    output: z.object({ commits: z.array(commitInfo).max(5000) }).strict(),
+  },
+  /** Build one commit on `onto` by replaying and/or reverting commits with three-way merges, without a checkout (harvest ablation and standalone branches). */
+  composeCommits: { input: composeInput, output: composeOutput },
+  /** The repo's remotes (the GitHub publisher refuses without a GitHub remote). */
+  gitRemotes: {
+    input: z.object({ repoPath: absPath }).strict(),
+    output: z.object({ remotes: z.array(z.object({ name: z.string(), url: z.string() }).strict()).max(50) }).strict(),
+  },
+  /** Write files under `<dataDir>/exports/<key>/` (harvest reports and PR bodies); returns the directory. */
+  writeExport: {
+    input: z
+      .object({
+        key,
+        files: z
+          .array(z.object({ path: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/u).refine((p) => !p.split("/").includes(".."), "no .."), content: z.string().max(4 * 1024 * 1024) }).strict())
+          .max(200),
+      })
+      .strict(),
+    output: z.object({ dir: absPath }).strict(),
+  },
   /** Remove plugin-owned checkouts whose key starts with `keyPrefix`. */
   removeCheckouts: {
     input: z.object({ repoPath: absPath, keyPrefix: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,120}$/u) }).strict(),

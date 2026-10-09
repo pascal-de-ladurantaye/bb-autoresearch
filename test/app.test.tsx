@@ -6,7 +6,7 @@ import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
-import { FakeHost, FakePort, fakeHostSpec } from "./helpers.ts";
+import { FakeHost, FakePort, fakeHostSpec, waitFor as waitUntil } from "./helpers.ts";
 
 type Harness = ReturnType<typeof createFakePluginHost>["harness"];
 
@@ -28,11 +28,11 @@ describe("frontend: Studies panel and thread badge", () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["ideas", "add", "toy-size", "Shrink the output", "--theme", "size"]);
     await harness.behavior.runCli(["start", "toy-size"]);
-    for (let i = 0; i < 50 && port.spawned.length < 1; i++) await new Promise((r) => setTimeout(r, 5));
+    await waitUntil(() => port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
     await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
-    for (let i = 0; i < 100 && !port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")); i++) await new Promise((r) => setTimeout(r, 5));
+    await waitUntil(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
   });
   afterEach(async () => {
     await harness.lifecycle.dispose();

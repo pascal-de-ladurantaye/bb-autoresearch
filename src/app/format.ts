@@ -56,4 +56,21 @@ export const STATE_TONE: Record<string, string> = {
   draft: "bg-muted text-muted-foreground",
   harvesting: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
   archived: "bg-muted text-muted-foreground",
+  // Harvest states.
+  ready: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+  failed: "bg-destructive/15 text-destructive",
+  cancelled: "bg-muted text-muted-foreground",
 };
+
+/** An unsigned fraction as a percentage (noise floors, MDEs). */
+export function frac(f: number | null | undefined, digits = 2): string {
+  if (f === null || f === undefined || !Number.isFinite(f)) return "—";
+  return `${(f * 100).toFixed(digits)}%`;
+}
+
+export function bytes(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+}

@@ -1,9 +1,12 @@
 // Read models for the study page, the thread header badge, and the CLI.
 // Pure functions of the store (plus the engine's scheduler view), bounded.
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
-import type { CandidateRow, StudyRow } from "./db/store.ts";
+import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
+import type { StackRecord } from "./harvest.ts";
 import { BENCH_BOUND_STAGES } from "./pipeline.ts";
 import { clip, safeJson } from "./prompts.ts";
+import { accountingFor, standaloneText } from "./report.ts";
 import { oracleHash, type StudySpec } from "./spec.ts";
 
 export interface StudySummary {
@@ -230,6 +233,8 @@ export function overview(engine: Engine, s: StudyRow) {
     trajectory: trajectory(engine, s),
     workerList: workers,
     queue,
+    usage: usageView(engine, s),
+    harvest: harvestSummary(engine, s),
     notices: store.notices(s.id, { limit: 10 }).map((n) => ({ id: n.id, at: n.at, kind: n.kind, text: clip(n.text, 1000), delivered: n.delivered_round !== null })),
     events: store.events(s.id, { limit: 25 }).map((e) => ({ id: e.id, at: e.at, kind: e.kind, actor: clip(e.actor, 40), data: clip(e.data_json, 300) })),
   };
@@ -446,3 +451,306 @@ function ordinal(n: number): string {
   const v = n % 100;
   return `${n}${s[(v - 20) % 10] ?? s[v] ?? s[0]}`;
 }
+
+// ------------------------------------------------------------------ M3
+
+/** Provider limits, tokens, and spend projection for the Overview. */
+export function usageView(engine: Engine, s: StudyRow) {
+  const { store } = engine.ctx;
+  const spec = specOf(engine, s);
+  const u = engine.usageState(s);
+  const tokens = store.studyTokens(s.id);
+  const wins = store.candidates(s.id, { stages: ["decided"] }).filter((c) => c.verdict === "win").length;
+  const seg = store.segment(s.id, s.segment);
+  const remaining = spec ? Math.max(0, spec.budget.max_candidates - store.candidateCount(s.id)) : 0;
+  return {
+    rateLimited: u.blocked,
+    rateLimitedUntil: u.blockedUntil,
+    tight: u.tight,
+    maxPercent: u.maxPercent,
+    tightPercent: spec?.agents.usage_tight_percent ?? 90,
+    providers: u.providers,
+    checkedAt: u.checkedAt,
+    tokens,
+    maxTokens: spec?.budget.max_tokens ?? null,
+    tokensPerWin: tokens !== null && wins > 0 ? Math.round(tokens / wins) : null,
+    /** Bench seconds the remaining candidate budget would take at the calibrated cost per evaluation. */
+    projectedBenchSeconds: seg?.eval_seconds ? seg.eval_seconds * remaining : null,
+    budgetNotices: safeJson<string[]>(s.budget_notices_json) ?? [],
+  };
+}
+
+/** Findings tab: searchable list with idea, theme, and candidate verdict. */
+export function findingsView(engine: Engine, s: StudyRow, q: { query?: string; outcome?: string; theme?: string; verdict?: string; limit?: number }) {
+  const { store } = engine.ctx;
+  const params: unknown[] = [s.id];
+  const where = [`f.study_id = ?`];
+  if (q.query) {
+    const like = `%${q.query.replace(/[%_]/gu, "")}%`;
+    where.push(`(f.learned LIKE ? OR f.revisit_if LIKE ? OR f.evidence LIKE ? OR i.title LIKE ? OR c.summary LIKE ?)`);
+    params.push(like, like, like, like, like);
+  }
+  if (q.outcome) {
+    where.push(`f.outcome = ?`);
+    params.push(q.outcome);
+  }
+  if (q.theme) {
+    where.push(`i.theme = ?`);
+    params.push(q.theme);
+  }
+  if (q.verdict) {
+    where.push(`c.verdict = ?`);
+    params.push(q.verdict);
+  }
+  const rows = store.db
+    .prepare(
+      `SELECT f.*, i.title AS idea_title, i.theme AS theme, c.n AS n, c.verdict AS verdict, c.effect AS effect FROM findings f
+       LEFT JOIN ideas i ON i.id = f.idea_id LEFT JOIN candidates c ON c.id = f.candidate_id
+       WHERE ${where.join(" AND ")} ORDER BY f.id DESC LIMIT ?`,
+    )
+    .all(...params, Math.min(q.limit ?? 200, 500)) as Array<{ id: number; idea_id: number | null; thread_id: string | null; outcome: string; learned: string; revisit_if: string; evidence: string; created_at: number; idea_title: string | null; theme: string | null; n: number | null; verdict: string | null; effect: number | null }>;
+  const facet = (sql: string) => (store.db.prepare(sql).all(s.id) as Array<{ k: string | null; c: number }>).filter((r) => r.k).map((r) => ({ value: r.k!, count: r.c }));
+  return {
+    total: (store.db.prepare(`SELECT COUNT(*) AS c FROM findings WHERE study_id = ?`).get(s.id) as { c: number }).c,
+    outcomes: facet(`SELECT outcome AS k, COUNT(*) AS c FROM findings WHERE study_id = ? GROUP BY outcome ORDER BY c DESC`),
+    themes: facet(`SELECT i.theme AS k, COUNT(*) AS c FROM findings f JOIN ideas i ON i.id = f.idea_id WHERE f.study_id = ? AND i.theme != '' GROUP BY i.theme ORDER BY c DESC`),
+    findings: rows.map((f) => ({
+      id: f.id,
+      ideaId: f.idea_id,
+      ideaTitle: f.idea_title ? clip(f.idea_title, 200) : null,
+      theme: f.theme || null,
+      candidate: f.n,
+      verdict: f.verdict,
+      effect: f.effect,
+      threadId: f.thread_id,
+      outcome: f.outcome,
+      learned: clip(f.learned, 4000),
+      revisitIf: clip(f.revisit_if, 1000),
+      evidence: clip(f.evidence, 2000),
+      createdAt: f.created_at,
+    })),
+  };
+}
+
+/**
+ * The spec as TOML with the holdout section removed: RPC is reachable by
+ * agents, and the holdout command must never enter agent context.
+ */
+export function redactedSpecToml(toml: string): { toml: string; holdout: boolean } {
+  let raw: Record<string, unknown>;
+  try {
+    raw = parseToml(toml) as Record<string, unknown>;
+  } catch {
+    return { toml: "(unparseable spec)", holdout: false };
+  }
+  const oracle = raw.oracle as Record<string, unknown> | undefined;
+  const holdout = Boolean(oracle && "holdout" in oracle);
+  if (oracle && holdout) delete oracle.holdout;
+  const text = stringifyToml(raw);
+  return { toml: holdout ? `# [oracle.holdout] is configured and hidden here: agents can read this view.\n${text}` : text, holdout };
+}
+
+function lineDiff(a: string, b: string): Array<{ op: "same" | "add" | "del"; text: string }> {
+  const x = a.split("\n");
+  const y = b.split("\n");
+  const n = x.length;
+  const m = y.length;
+  if (n * m > 400_000) return [...x.map((t) => ({ op: "del" as const, text: t })), ...y.map((t) => ({ op: "add" as const, text: t }))];
+  const dp = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i]![j] = x[i] === y[j] ? dp[i + 1]![j + 1]! + 1 : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
+  const out: Array<{ op: "same" | "add" | "del"; text: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (x[i] === y[j]) {
+      out.push({ op: "same", text: x[i]! });
+      i++;
+      j++;
+    } else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) out.push({ op: "del", text: x[i++]! });
+    else out.push({ op: "add", text: y[j++]! });
+  }
+  while (i < n) out.push({ op: "del", text: x[i++]! });
+  while (j < m) out.push({ op: "add", text: y[j++]! });
+  return out;
+}
+
+/** Oracle tab: the active spec (holdout hidden), version history, segments, calibration reports, and a pending spec with its diff. Approval stays CLI-only. */
+export function oracleView(engine: Engine, s: StudyRow) {
+  const { store } = engine.ctx;
+  const versions = store.specVersions(s.id);
+  const activeRow = versions.find((v) => v.version === s.spec_version) ?? null;
+  const active = activeRow ? redactedSpecToml(activeRow.spec_toml) : null;
+  const pendingRow = s.pending_spec_version !== null ? (versions.find((v) => v.version === s.pending_spec_version) ?? null) : null;
+  let pending = null as null | { version: number; oracleHash: string; changesOracle: boolean; command: string; toml: string; diff: Array<{ op: "same" | "add" | "del"; text: string }> };
+  if (pendingRow && activeRow) {
+    const changes = pendingRow.oracle_hash !== activeRow.oracle_hash;
+    const p = redactedSpecToml(pendingRow.spec_toml);
+    pending = {
+      version: pendingRow.version,
+      oracleHash: pendingRow.oracle_hash,
+      changesOracle: changes,
+      command: changes ? `bb study calibrate ${s.slug}` : `bb study approve ${s.slug}`,
+      toml: p.toml,
+      diff: lineDiff(active!.toml, p.toml).slice(0, 2000),
+    };
+  }
+  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number; report: string }>; finishedAt?: number }>(s.calibration_json);
+  return {
+    slug: s.slug,
+    state: s.state,
+    specVersion: s.spec_version,
+    activeToml: active?.toml ?? null,
+    holdoutConfigured: active?.holdout ?? false,
+    versions: versions.map((v) => ({
+      version: v.version,
+      oracleHash: v.oracle_hash,
+      createdAt: v.created_at,
+      approvedAt: v.approved_at,
+      active: v.version === s.spec_version,
+      pending: v.version === s.pending_spec_version,
+      benchHosts: (safeJson<Array<{ name: string; mode: string }>>(v.bench_json) ?? []).map((b) => `${b.name} (${b.mode})`),
+    })),
+    pending,
+    calibration: {
+      status: s.calibration_status,
+      approved: s.calibration_approved_at !== null,
+      ok: report?.ok ?? null,
+      report: report?.report ?? null,
+      problems: report?.problems ?? [],
+      baselineSha: report?.baselineSha ?? null,
+      oracleHash: report?.oracleHash ?? null,
+      hosts: (report?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: h.noiseFloor, mde: h.mde, evalSeconds: h.evalSeconds, report: clip(h.report, 600) })),
+      finishedAt: report?.finishedAt ?? null,
+      /** The command that approves what's waiting, if anything. */
+      nextCommand: s.state === "draft" ? `bb study calibrate ${s.slug}` : s.state === "calibrating" && s.calibration_status === "ready" && s.calibration_approved_at === null ? `bb study start ${s.slug}` : null,
+    },
+    segments: store.segments(s.id).map((g) => ({
+      k: g.k,
+      active: g.k === s.segment,
+      oracleHash: g.oracle_hash,
+      specVersion: g.spec_version,
+      baselineSha: g.baseline_sha,
+      noiseFloor: g.noise_floor,
+      mde: g.mde,
+      evalSeconds: g.eval_seconds,
+      gateSeconds: g.gate_seconds,
+      report: g.report ? clip(g.report, 1500) : null,
+      hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: h.noiseFloor, mde: h.mde, evalSeconds: h.evalSeconds })),
+      ref: `refs/studies/${s.slug}/segment/${g.k}`,
+      createdAt: g.created_at,
+    })),
+    /** Approval is a human control in the CLI only (see the threat model); the page shows what to run. */
+    approvalVia: "cli" as const,
+  };
+}
+
+/** Bench tab: machines, queue, health history, drift checks, bundle transfers, recent bench intervals. */
+export function benchView(engine: Engine, s: StudyRow) {
+  const { store } = engine.ctx;
+  const titles = new Map(store.ideas(s.id).map((i) => [i.id, i.title] as const));
+  const queue = store
+    .candidates(s.id, { stages: [...BENCH_BOUND_STAGES, "promoting"] })
+    .sort((a, b) => (a.queued_at ?? Number.MAX_SAFE_INTEGER) - (b.queued_at ?? Number.MAX_SAFE_INTEGER) || a.id - b.id)
+    .map((c) => ({ n: c.n, stage: c.stage, ideaTitle: c.idea_id !== null ? clip(titles.get(c.idea_id) ?? "", 120) : null, queuedAt: c.queued_at, benchHostId: c.bench_host_id, rebases: c.rebases }));
+  const now = engine.ctx.now();
+  const gateRuns = store.events(s.id, { kinds: ["gate.flaky", "gate.failed"], limit: 200 });
+  return {
+    hosts: benchHostsView(engine, s),
+    queue,
+    utilization: utilization(engine, s),
+    health: store.healthChecks(s.id, { limit: 100 }).map((h) => ({
+      id: h.id,
+      hostId: h.host_id,
+      at: h.at,
+      context: h.context,
+      ok: h.ok === 1,
+      problems: safeJson<string[]>(h.problems_json) ?? [],
+      summary: (() => {
+        const r = safeJson<{ loadavg?: number[]; cpus?: number; topProcesses?: Array<{ command: string; cpu: number }> }>(h.report_json);
+        return r ? `load ${(r.loadavg ?? []).map((v) => v.toFixed(2)).join("/")} on ${r.cpus ?? "?"} CPUs${r.topProcesses?.[0] ? ` · top ${r.topProcesses[0].command} ${r.topProcesses[0].cpu.toFixed(0)}%` : ""}` : "";
+      })(),
+    })),
+    drift: store.driftChecks(s.id, 50).map((d) => ({ id: d.id, hostId: d.host_id, segment: d.segment, bestSha: d.best_sha, startedAt: d.started_at, finishedAt: d.finished_at, status: d.status, pairs: d.pairs, noise: d.noise, calibrated: d.calibrated, ratio: d.ratio })),
+    transfers: store.transfers(s.id, 100).map((t) => ({ id: t.id, hostId: t.host_id, sha: t.sha, purpose: t.purpose, bytes: t.bytes, chunks: t.chunks, ms: t.ms, ok: t.ok === 1, error: t.error, at: t.at })),
+    intervals: store
+      .benchIntervals(s.id)
+      .slice(-60)
+      .reverse()
+      .map((i) => ({ id: i.id, hostId: i.host_id, kind: i.kind, candidate: i.candidate_id !== null ? (store.candidate(i.candidate_id)?.n ?? null) : null, startedAt: i.started_at, seconds: ((i.ended_at ?? now) - i.started_at) / 1000, open: i.ended_at === null })),
+    gates: { flaky: gateRuns.filter((e) => e.kind === "gate.flaky").length, failed: gateRuns.filter((e) => e.kind === "gate.failed").length },
+  };
+}
+
+function changesetView(c: ChangesetRow, all: ChangesetRow[]) {
+  const k = (id: number) => all.find((x) => x.id === id)?.k ?? null;
+  return {
+    id: c.id,
+    k: c.k,
+    title: c.title,
+    rationale: clip(c.rationale, 2000),
+    candidates: safeJson<number[]>(c.candidates_json) ?? [],
+    commits: safeJson<string[]>(c.commits_json) ?? [],
+    paths: (safeJson<string[]>(c.paths_json) ?? []).slice(0, 100),
+    ablation: { status: c.ablation_status, detail: c.ablation_detail, sha: c.ablation_sha, contribution: c.contribution, ciLo: c.ci_lo, ciHi: c.ci_hi, n: c.n },
+    droppable: c.droppable === 1,
+    dependsOn: (safeJson<number[]>(c.depends_on_json) ?? []).map(k).filter((x): x is number => x !== null),
+    neededBy: all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(c.id)).map((o) => o.k),
+    dependencyReason: c.dependency_reason,
+    stack: c.stack,
+    prBase: c.pr_base,
+    standalone: { status: c.standalone_status, detail: c.standalone_detail, sha: c.standalone_sha, effect: c.standalone_effect, ciLo: c.standalone_ci_lo, ciHi: c.standalone_ci_hi, text: standaloneText(c) },
+    pr: { branch: c.branch, title: c.pr_title, body: c.pr_body, url: c.pr_url, status: c.pr_status },
+  };
+}
+
+function harvestSummary(engine: Engine, s: StudyRow) {
+  const h = engine.ctx.store.latestHarvest(s.id);
+  if (!h) return null;
+  return { id: h.id, state: h.state, detail: h.phase_detail, changesets: engine.ctx.store.changesets(h.id).length, startedAt: h.started_at, finishedAt: h.finished_at };
+}
+
+/** Harvest tab: the latest harvest's changesets, ablations, dependency stacks, PR drafts, accounting and publish state. */
+export function harvestView(engine: Engine, s: StudyRow) {
+  const { store } = engine.ctx;
+  const all = store.harvests(s.id);
+  const h: HarvestRow | undefined = all[0];
+  const canStart = ["running", "paused"].includes(s.state) || (s.state === "harvesting" && (!h || ["ready", "failed", "cancelled"].includes(h.state)));
+  const promotions = store.candidates(s.id, { stages: ["decided"] }).filter((c) => c.verdict === "win").length;
+  const base = { slug: s.slug, state: s.state, promotions, canStart, startCommand: `bb study harvest ${s.slug}`, history: all.map((x) => ({ id: x.id, state: x.state, startedAt: x.started_at, finishedAt: x.finished_at })) };
+  if (!h) return { ...base, harvest: null };
+  const cs = store.changesets(h.id);
+  const stacks = safeJson<StackRecord[]>(h.stacks_json) ?? [];
+  const acc = accountingFor(engine.ctx, h);
+  return {
+    ...base,
+    harvest: {
+      id: h.id,
+      state: h.state,
+      detail: h.phase_detail,
+      error: h.error,
+      fromState: h.from_state,
+      baseSha: h.base_sha,
+      bestSha: h.best_sha,
+      groupingSource: h.grouping_source,
+      groupingNotes: h.grouping_notes,
+      measureStandalone: h.measure_standalone === 1,
+      total: h.total_effect === null ? null : { value: h.total_effect, lo: h.total_ci_lo, hi: h.total_ci_hi, n: h.total_n, vsBase: h.total_vs_base },
+      accounting: { sum: acc.sum, sumHalfWidth: acc.sumHalfWidth, gap: acc.gap, gapHalfWidth: acc.gapHalfWidth, interaction: acc.interaction, missing: acc.missing, items: acc.items.map((i) => ({ label: i.label, source: i.source, value: i.estimate?.value ?? null, lo: i.estimate?.lo ?? null, hi: i.estimate?.hi ?? null })) },
+      changesets: cs.map((c) => changesetView(c, cs)),
+      stacks: stacks.map((st) => ({ stack: st.stack, members: st.members.map((id) => cs.find((c) => c.id === id)?.k ?? null).filter((x): x is number => x !== null), status: st.status, estimate: st.estimate, detail: st.detail })),
+      publisher: h.publisher,
+      publishState: h.publish_state,
+      exportDir: h.export_dir,
+      publishCommand: h.state === "ready" && h.publish_state !== "published" ? `bb study harvest ${s.slug} --publish` : null,
+      benchSeconds: h.bench_seconds,
+      startedAt: h.started_at,
+      finishedAt: h.finished_at,
+    },
+  };
+}
+
+export type FindingsView = ReturnType<typeof findingsView>;
+export type OracleView = ReturnType<typeof oracleView>;
+export type BenchView = ReturnType<typeof benchView>;
+export type HarvestView = ReturnType<typeof harvestView>;
+export type UsageView = ReturnType<typeof usageView>;

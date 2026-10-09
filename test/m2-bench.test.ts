@@ -9,8 +9,9 @@ import { HOLDOUT_FAIL, HOLDOUT_PASS } from "../src/holdout.ts";
 import { expensiveStrategy, type Bench } from "../src/noise.ts";
 import { parseSpec } from "../src/spec.ts";
 import { seededRng } from "../src/stats.ts";
-import { benchHostsView, candidateDetail, candidatesView, overview } from "../src/views.ts";
-import { FakeHost, healthyReport, makeCtx, type Clock, type FakePort } from "./helpers.ts";
+import { studyReport } from "../src/report.ts";
+import { benchHostsView, benchView, candidateDetail, candidatesView, findingsView, harvestView, oracleView, overview } from "../src/views.ts";
+import { FakeHost, healthyReport, makeCtx, waitFor, type Clock, type FakePort } from "./helpers.ts";
 
 const SLUG = "toy-m2";
 
@@ -245,7 +246,7 @@ describe("M2 remote bench (fake hosts)", () => {
     const s = store.study(id)!;
     expect(s.state).toBe("paused");
     expect(s.pause_reason).toContain("noise drift on bench host bench-a");
-    expect(store.notices(id).map((n) => n.kind)).toContain("study.paused");
+    expect(store.notices(id).map((n) => n.kind)).toContain("drift");
     expect(store.benchHost(id, "host_a")!.drift_status).toBe("drift");
   });
 
@@ -285,6 +286,12 @@ describe("M2 remote bench (fake hosts)", () => {
       ...port.steered.map((m) => m.text),
       ...port.spawned.map((s) => s.prompt),
       JSON.stringify(overview(engine, study)),
+      // M3 views: the Oracle tab shows the spec with the holdout removed; the report and other tabs never carry it.
+      JSON.stringify(oracleView(engine, study)),
+      JSON.stringify(benchView(engine, study)),
+      JSON.stringify(findingsView(engine, study, {})),
+      JSON.stringify(harvestView(engine, study)),
+      studyReport(engine.ctx, study, store.spec(study), null),
       JSON.stringify(candidatesView(engine, study, {})),
       JSON.stringify(await candidateDetail(engine, study, 1)),
       JSON.stringify(await candidateDetail(engine, study, 2)),
@@ -299,6 +306,8 @@ describe("M2 remote bench (fake hosts)", () => {
       expect(surfaces).not.toContain(secret);
     }
     expect(surfaces).toContain("holdout: configured (hidden from agents)");
+    expect(oracleView(engine, study).holdoutConfigured).toBe(true);
+    expect(oracleView(engine, study).activeToml).toContain("[oracle.holdout] is configured and hidden here");
     expect(port.spawned[0]!.prompt).toContain("hidden holdout workload");
   });
 
@@ -478,8 +487,8 @@ describe("M2 remote bench (fake hosts)", () => {
     };
     await submit("thr_w1", "TA", 800);
     void engine.settle();
-    for (let i = 0; i < 100 && store.candidateByN(id, 1)!.stage !== "measuring"; i++) await new Promise((r) => setTimeout(r, 5));
-    for (let i = 0; i < 100 && store.sampleCount(store.candidateByN(id, 1)!.id) === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    await waitFor(() => store.candidateByN(id, 1)!.stage === "measuring");
+    await waitFor(() => store.sampleCount(store.candidateByN(id, 1)!.id) > 0);
     expect(store.sampleCount(store.candidateByN(id, 1)!.id)).toBeGreaterThan(0);
     // "Restart": a fresh engine on the same database.
     const fresh = new Engine(engine.ctx);

@@ -238,3 +238,38 @@ function fmtNum(v: number | undefined): string {
   if (v === undefined) return "n/a";
   return Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : v.toPrecision(4);
 }
+
+export interface HarvestRoundInput {
+  study: StudyRow;
+  spec: StudySpec;
+  harvest: { id: number };
+  promotions: Array<{ sha: string; n: number | null; title: string; paths: string[] }>;
+  candidates: Map<number, CandidateRow | undefined>;
+  dossier: { version: number; text: string } | null;
+}
+
+/** The harvest grouping round: one turn asking the strategist for study_propose_harvest. */
+export function harvestRoundPrompt(d: HarvestRoundInput): string {
+  const lines = [
+    `[autoresearch] Harvest h${d.harvest.id} · study \`${d.study.slug}\` · group the promotions into changesets`,
+    "",
+    `Best is final for this harvest: ${d.promotions.length} promotion(s) on \`studies/${d.study.slug}/best\`, oldest first. Each changeset becomes one PR; the plugin then measures each one's contribution by reverting it from best (ablation), checks it alone on the base, and drafts the PRs. You don't run anything.`,
+    "",
+    "## Promotions",
+  ];
+  for (const p of d.promotions) {
+    const c = p.n !== null ? d.candidates.get(p.n) : undefined;
+    lines.push(`- ${p.n !== null ? `c/${p.n}` : p.sha.slice(0, 10)} ${quoted(p.title, 120)}${c ? ` · ${ciText(c)}` : ""} · files: ${p.paths.slice(0, 8).join(", ")}${p.paths.length > 8 ? `, … ${p.paths.length - 8} more` : ""}`);
+  }
+  if (d.dossier) lines.push("", `## Dossier (v${d.dossier.version})`, clip(d.dossier.text, 1500));
+  lines.push(
+    "",
+    "## This round",
+    "- Call `study_propose_harvest` once with `groups`: each group has a title (the PR title), the candidate numbers it contains, and a rationale (the PR's why).",
+    "- Group by theme: promotions that are one idea refined twice, or that only make sense together, belong in one changeset. Unrelated wins stay separate so each PR can be reviewed and reverted alone.",
+    "- Every promotion must be in exactly one group. The tool rejects unknown or duplicated candidates; fix and call it again.",
+    "- If you don't answer, the plugin uses one changeset per promotion.",
+    "- Keep your reply short, then end your turn.",
+  );
+  return clip(lines.join("\n"), 12_000);
+}

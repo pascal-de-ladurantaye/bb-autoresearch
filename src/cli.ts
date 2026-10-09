@@ -4,9 +4,11 @@ import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type Plug
 import { EngineError, type Caller, type Engine } from "./engine.ts";
 import { errText } from "./pipeline.ts";
 import { ciText, clip, formatDuration, safeJson } from "./prompts.ts";
-import { benchHostsView, segmentView, utilization } from "./views.ts";
+import { benchHostsView, segmentView, usageView, utilization } from "./views.ts";
 import { formatPct } from "./spec.ts";
 import type { CalibrationReport } from "./calibration.ts";
+import { accountingText, accountingFor, standaloneText, studyReport } from "./report.ts";
+import type { StackRecord } from "./harvest.ts";
 
 const MAX = 60_000;
 
@@ -227,12 +229,39 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       harvest: cliCommand({
-        summary: "Turn base→best into reviewable PRs (arrives in M3)",
+        summary: "Harvest base→best into changesets with measured contributions and draft PRs (dry run; --publish opens DRAFT PRs on GitHub)",
+        positionals: slugArg,
+        options: {
+          publish: { type: "boolean", description: "Publish the READY harvest: push its branches and open DRAFT PRs with gh (refuses without a GitHub remote)" },
+          restart: { type: "boolean", description: "Start a fresh harvest when the last one is ready, failed, or cancelled" },
+          "one-per-promotion": { type: "boolean", description: "Skip the strategist's grouping: one changeset per promotion (deterministic)" },
+          "no-measure-standalone": { type: "boolean", description: "Only gate each changeset on its PR base; skip measuring its standalone effect (saves bench time)" },
+          wait: { type: "boolean", description: "Wait for the harvest to finish (up to --timeout)" },
+          timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait with --wait (default 25m, max 30m)" },
+        },
+        run: (input, ctx) =>
+          wrap(async () => {
+            const slug = input.positionals.slug;
+            const actor = guardHuman(engine, ctx);
+            if (input.options.publish) {
+              await engine.auditControl(slug, "publish", caller(ctx), "harvest publish requested (GitHub draft PRs)");
+              return out(await engine.publishHarvest(slug, actor, true));
+            }
+            const before = store.latestHarvest(engine.study(slug).id);
+            const r = engine.startHarvest(slug, actor, { restart: Boolean(input.options.restart), measureStandalone: !input.options["no-measure-standalone"], onePerPromotion: Boolean(input.options["one-per-promotion"]) });
+            if (r.harvest.id !== before?.id) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.id} started (dry run)`, { harvest: r.harvest.id });
+            if (input.options.wait) await engine.waitForHarvest(slug, input.options.timeout ?? 25 * 60_000);
+            const text = r.harvest.id !== before?.id && !input.options.wait ? r.text : `${r.harvest.id !== before?.id ? `${r.text}\n\n` : ""}${harvestText(engine, slug)}`;
+            return out(text);
+          }),
+      }),
+      report: cliCommand({
+        summary: "Print the study report (Markdown): trajectory, wins, notable losses, dossier, calibration, harvest",
         positionals: slugArg,
         run: (input) =>
           wrap(() => {
-            engine.study(input.positionals.slug);
-            return out(`Harvest (ablation + draft PRs) arrives in M3. Until then the promoted commits are on branch studies/${input.positionals.slug}/best, one squashed commit per win.`);
+            const s = engine.study(input.positionals.slug);
+            return out(studyReport(engine.ctx, s, store.spec(s), store.latestHarvest(s.id) ?? null));
           }),
       }),
     },
@@ -250,6 +279,17 @@ function utilizationLine(engine: Engine, s: ReturnType<Engine["study"]>): string
   const u = utilization(engine, s);
   const pct = (x: number | null) => (x === null ? "n/a" : `${(x * 100).toFixed(1)}%`);
   return `Bench: busy ${formatDuration(u.busySeconds)} of ${formatDuration(u.runningSeconds)} running (${pct(u.ratio)}; ${pct(u.steadyRatio)} since the first submission) · overlapping measurements ${u.overlaps}`;
+}
+
+function usageLine(engine: Engine, s: ReturnType<Engine["study"]>): string {
+  const u = usageView(engine, s);
+  const parts = [
+    u.tokens !== null ? `tokens ${u.tokens.toLocaleString("en-US")}${u.maxTokens ? ` of ${u.maxTokens.toLocaleString("en-US")}` : ""}${u.tokensPerWin !== null ? ` (${u.tokensPerWin.toLocaleString("en-US")} per win)` : ""}` : "tokens: not reported by the provider",
+    u.rateLimited ? `RATE LIMITED until ${new Date(u.rateLimitedUntil!).toISOString().slice(11, 16)} UTC (no new workers)` : null,
+    u.maxPercent !== null ? `usage window max ${u.maxPercent.toFixed(0)}%${u.tight ? " (tight: W halved)" : ""}` : null,
+    u.projectedBenchSeconds !== null ? `projected bench for the remaining budget ≈ ${formatDuration(u.projectedBenchSeconds)}` : null,
+  ].filter(Boolean);
+  return `Usage: ${parts.join(" · ")}`;
 }
 
 function segmentLine(engine: Engine, s: ReturnType<Engine["study"]>): string {
@@ -317,6 +357,8 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
     utilizationLine(engine, s),
     ...benchLines(engine, s),
     calibrationText(engine, slug),
+    usageLine(engine, s),
+    ...(store.latestHarvest(s.id) ? [harvestText(engine, slug).split("\n")[0]!] : []),
     "",
   ];
   const ideas = store.ideas(s.id);
@@ -351,5 +393,31 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
       lines.push(`  ${new Date(e.at).toISOString().slice(5, 19)} ${e.kind} (${clip(e.actor, 24)}) ${clip(e.data_json, 160)}`);
     }
   }
+  return lines.join("\n");
+}
+
+export function harvestText(engine: Engine, slug: string): string {
+  const { store } = engine.ctx;
+  const s = engine.study(slug);
+  const h = store.latestHarvest(s.id);
+  if (!h) return `${slug}: no harvest yet. \`bb study harvest ${slug}\` starts one (dry run).`;
+  const cs = store.changesets(h.id);
+  const lines = [
+    `Harvest h${h.id} · ${h.state}${h.phase_detail ? ` (${h.phase_detail})` : ""}${h.error ? ` · error: ${clip(h.error, 300)}` : ""} · study ${s.state}`,
+    `Base ${h.base_sha?.slice(0, 10) ?? "?"} → best ${h.best_sha?.slice(0, 10) ?? "?"} · grouping ${h.grouping_source ?? "pending"}${h.grouping_notes ? ` (${clip(h.grouping_notes, 200)})` : ""} · bench ${formatDuration(h.bench_seconds)}`,
+  ];
+  for (const c of cs) {
+    const deps = (safeJson<number[]>(c.depends_on_json) ?? []).map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`);
+    lines.push(
+      `  #${c.k} ${clip(c.title, 70)} [${(safeJson<number[]>(c.candidates_json) ?? []).map((n) => `c/${n}`).join(", ")}]` +
+        ` · contribution ${c.contribution === null ? c.ablation_status : `${formatPct(c.contribution)}${c.ci_lo !== null && c.ci_hi !== null ? ` (CI ${formatPct(c.ci_lo)}..${formatPct(c.ci_hi)})` : ""}`}${c.droppable ? " DROPPABLE" : ""}` +
+        `${deps.length ? ` · depends on ${deps.join(", ")}` : ""} · standalone ${clip(standaloneText(c), 80)}${c.branch ? ` · ${c.branch}` : ""}${c.pr_url ? ` · ${c.pr_url}` : ""}`,
+    );
+  }
+  const stacks = safeJson<StackRecord[]>(h.stacks_json) ?? [];
+  for (const st of stacks) lines.push(`  stack ${st.stack}: ${st.members.map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`).join(" → ")}${st.status === "measured" && st.estimate ? ` · ablated together ${formatPct(st.estimate.value)}` : ""}`);
+  if (h.total_effect !== null || cs.length) lines.push(...accountingText(accountingFor(engine.ctx, h)).map((l) => `  ${l.replace(/^- /u, "")}`));
+  if (h.export_dir) lines.push(`Dry-run export (report.md, prs/*.md, manifest.json): ${h.export_dir}`);
+  if (h.state === "ready") lines.push(`Next: \`bb study harvest ${slug} --publish\` (DRAFT PRs on GitHub) · \`bb study resume ${slug}\` (keep exploring) · \`bb study archive ${slug}\` (done) · \`bb study report ${slug}\``);
   return lines.join("\n");
 }

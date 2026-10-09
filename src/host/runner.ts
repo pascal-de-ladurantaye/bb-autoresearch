@@ -7,6 +7,9 @@
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type {
   BundleInfo,
+  CommitInfo,
+  ComposeInput,
+  ComposeResult,
   DiffSummary,
   ExecInput,
   ExecResult,
@@ -133,6 +136,10 @@ export interface HostRunner {
   bundleWrite(id: string, offset: number, data: string): Promise<number>;
   bundleApply(input: { repoPath: string; id: string; sha: string; ref: string; sha256: string }): Promise<{ ok: boolean; detail: string }>;
   bundleDiscard(id: string): Promise<void>;
+  commitLog(repoPath: string, from: string, to: string): Promise<CommitInfo[]>;
+  composeCommits(input: ComposeInput): Promise<ComposeResult>;
+  gitRemotes(repoPath: string): Promise<Array<{ name: string; url: string }>>;
+  writeExport(key: string, files: Array<{ path: string; content: string }>): Promise<string>;
 }
 
 const GIT_TIMEOUT = 5 * 60_000;
@@ -216,6 +223,18 @@ export class BbHostRunner implements HostRunner {
   async bundleDiscard(id: string) {
     await this.client.call("bundleDiscard", { id }, this.opts());
   }
+  async commitLog(repoPath: string, from: string, to: string) {
+    return (await this.client.call("commitLog", { repoPath, from, to }, this.opts())).commits;
+  }
+  async composeCommits(input: ComposeInput) {
+    return await this.client.call("composeCommits", input, this.opts());
+  }
+  async gitRemotes(repoPath: string) {
+    return (await this.client.call("gitRemotes", { repoPath }, this.opts(60_000))).remotes;
+  }
+  async writeExport(key: string, files: Array<{ path: string; content: string }>) {
+    return (await this.client.call("writeExport", { key, files }, this.opts(60_000))).dir;
+  }
 }
 
 export class LocalHostRunner implements HostRunner {
@@ -223,12 +242,15 @@ export class LocalHostRunner implements HostRunner {
   constructor(
     private readonly dataDir: string,
     readonly hostId = "local",
-    opts: { progressMs?: number; pollMs?: number } = {},
+    opts: { progressMs?: number; pollMs?: number; health?: () => Promise<HealthReport> } = {},
   ) {
     this.jobs = new JobRegistry(opts.progressMs ?? 5_000);
     this.pollMs = opts.pollMs ?? 1_000;
+    this.probe = opts.health ?? health;
   }
   private readonly pollMs: number;
+  /** The health probe: the real one by default; tests inject fixed readings so they never depend on machine load. */
+  private readonly probe: () => Promise<HealthReport>;
   exec(input: ExecInput, signal?: AbortSignal) {
     return ops.exec(input, signal);
   }
@@ -278,7 +300,7 @@ export class LocalHostRunner implements HostRunner {
     this.jobs.forgetAll();
   }
   health() {
-    return health();
+    return this.probe();
   }
   benchRepo(key: string) {
     return bundle.benchRepo(this.dataDir, key);
@@ -303,5 +325,17 @@ export class LocalHostRunner implements HostRunner {
   }
   async bundleDiscard(id: string) {
     bundle.bundleDiscard(this.dataDir, id);
+  }
+  async commitLog(repoPath: string, from: string, to: string) {
+    return (await ops.commitLog(repoPath, from, to)).commits;
+  }
+  composeCommits(input: ComposeInput) {
+    return ops.composeCommits(input);
+  }
+  async gitRemotes(repoPath: string) {
+    return (await ops.gitRemotes(repoPath)).remotes;
+  }
+  async writeExport(key: string, files: Array<{ path: string; content: string }>) {
+    return ops.writeExport(this.dataDir, key, files).dir;
   }
 }

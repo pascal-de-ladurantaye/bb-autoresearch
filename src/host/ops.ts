@@ -2,10 +2,13 @@
 // fs, and git on PATH. host.ts wires these to RPC handlers; tests and the
 // in-process LocalHostRunner call them directly.
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type {
+  CommitInfo,
+  ComposeInput,
+  ComposeResult,
   DiffSummary,
   ExecInput,
   ExecResult,
@@ -280,4 +283,67 @@ export async function removeCheckouts(dataDir: string, repoPath: string, keyPref
   }
   await git(repoPath, ["worktree", "prune"], { allowFail: true });
   return { removed };
+}
+
+// ---- harvest (M3) ----
+
+/** First-parent commits in from..to, oldest first, with changed paths. */
+export async function commitLog(repoPath: string, from: string, to: string): Promise<{ commits: CommitInfo[] }> {
+  const list = await git(repoPath, ["rev-list", "--first-parent", "--reverse", "--parents", `${from}..${to}`]);
+  const commits: CommitInfo[] = [];
+  for (const line of list.stdout.split("\n").filter(Boolean).slice(0, 5000)) {
+    const [sha, parent] = line.split(" ");
+    const message = (await git(repoPath, ["log", "-1", "--format=%B", sha!])).stdout;
+    const paths = parent
+      ? (await git(repoPath, ["diff", "--name-only", "--no-renames", parent, sha!])).stdout.split("\n").filter(Boolean)
+      : (await git(repoPath, ["show", "--name-only", "--format=", sha!])).stdout.split("\n").filter(Boolean);
+    commits.push({ sha: sha!, parent: parent ?? null, subject: message.split("\n")[0] ?? "", message: message.slice(0, 8192), paths: paths.slice(0, 2000) });
+  }
+  return { commits };
+}
+
+/**
+ * Replay (pick) or undo (revert) commits on `onto` with `git merge-tree`,
+ * one three-way merge per step, and return one commit whose parent is
+ * `onto`. A pick merges parent→sha into the current tree; a revert merges
+ * sha→parent. A conflict reports the step and the paths.
+ */
+export async function composeCommits(input: ComposeInput): Promise<ComposeResult> {
+  const { repoPath } = input;
+  let current = input.onto;
+  let tree = (await git(repoPath, ["rev-parse", `${current}^{tree}`])).stdout;
+  for (const step of input.steps) {
+    const parent = (await git(repoPath, ["rev-parse", `${step.sha}^`])).stdout;
+    const [mergeBase, theirs] = step.revert ? [step.sha, parent] : [parent, step.sha];
+    const r = await git(repoPath, ["merge-tree", "--write-tree", "--name-only", "--no-messages", `--merge-base=${mergeBase}`, current, theirs], { allowFail: true });
+    const lines = r.stdout.split("\n").filter(Boolean);
+    if (r.code === 1) return { status: "conflict", at: step.sha, revert: step.revert, paths: lines.slice(1, 200), detail: r.stderr.slice(-2000) };
+    if (r.code !== 0 || !lines[0]) throw new Error(`git merge-tree failed (${r.code}): ${r.stderr.slice(-2000)}`);
+    tree = lines[0];
+    current = (await git(repoPath, ["commit-tree", tree, "-p", current, "-m", "autoresearch harvest step"])).stdout;
+  }
+  const sha = (await git(repoPath, ["commit-tree", tree, "-p", input.onto, "-m", input.message])).stdout;
+  return { status: "ok", sha, tree };
+}
+
+export async function gitRemotes(repoPath: string): Promise<{ remotes: Array<{ name: string; url: string }> }> {
+  const r = await git(repoPath, ["remote", "-v"], { allowFail: true });
+  const seen = new Map<string, string>();
+  for (const line of r.stdout.split("\n")) {
+    const m = /^(\S+)\s+(\S+)\s+\((fetch|push)\)$/u.exec(line.trim());
+    if (m && !seen.has(m[1]!)) seen.set(m[1]!, m[2]!);
+  }
+  return { remotes: [...seen].slice(0, 50).map(([name, url]) => ({ name, url })) };
+}
+
+export function writeExport(dataDir: string, key: string, files: Array<{ path: string; content: string }>): { dir: string } {
+  const dir = join(dataDir, "exports", key);
+  mkdirSync(dir, { recursive: true });
+  for (const f of files) {
+    if (f.path.split("/").includes("..") || f.path.startsWith("/")) throw new Error(`bad export path ${f.path}`);
+    const p = join(dir, f.path);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, f.content);
+  }
+  return { dir };
 }

@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { Engine } from "../src/engine.ts";
 import type { Store } from "../src/db/store.ts";
 import { utilization } from "../src/views.ts";
-import { FakeHost, makeCtx, type Clock, type FakePort } from "./helpers.ts";
+import { FakeHost, makeCtx, waitFor, type Clock, type FakePort } from "./helpers.ts";
 
 const SLUG = "toy-noisy";
 
@@ -133,12 +133,16 @@ describe("M1 parallel study (fake host)", () => {
     ]);
     host.delays = { gate: 60, measure: 30 };
     let overlap = false;
-    host.onMeasure = () => {
-      if (host.active.gate > 0) overlap = true;
+    let waited = false;
+    host.onMeasure = async () => {
+      // A's first run waits (bounded) for B's gate: no dependence on wall-clock timing.
+      if (waited) return;
+      waited = true;
+      if (await waitFor(() => host.active.gate > 0, 5_000)) overlap = true;
     };
     await submit("thr_w1", "TA", 950);
-    // Let A clear its gate and start measuring, then B submits and gates during A's measurement.
-    await new Promise((r) => setTimeout(r, 80));
+    // Once A is measuring, B submits and gates during A's measurement.
+    await waitFor(() => host.active.measure > 0);
     await submit("thr_w2", "TB", 1050);
     await engine.settle();
     expect(overlap).toBe(true);
@@ -158,7 +162,7 @@ describe("M1 parallel study (fake host)", () => {
     clock.advance(10 * 60_000); // workers think for a while, so adaptive W stays at max_workers
     await Promise.all([submit("thr_w1", "TA", 1100), submit("thr_w2", "TB", 1100), submit("thr_w3", "TC", 1100)]);
     // Let the gates finish; the first measurement is now blocked.
-    for (let i = 0; i < 20 && store.candidates(id, { stages: ["gating"] }).length; i++) await new Promise((r) => setTimeout(r, 5));
+    await waitFor(() => store.candidates(id, { stages: ["gating"] }).length === 0);
     expect(engine.benchDepth(id)).toBe(3);
     // Worker 3 goes away; its candidate stays in the bench queue.
     port.threads.get("thr_w3")!.archivedAt = clock.now();

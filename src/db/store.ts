@@ -39,6 +39,10 @@ export interface StudyRow {
   running_seconds: number;
   pending_spec_version: number | null;
   prev_spec_version: number | null;
+  rate_limited_until: number | null;
+  usage_json: string | null;
+  usage_at: number | null;
+  budget_notices_json: string;
 }
 
 export interface SpecVersionRow {
@@ -107,6 +111,11 @@ export interface ThreadRow {
   pending_notice: string | null;
   finishing_at: number | null;
   profiles: number;
+  tokens: number | null;
+  tokens_base: number | null;
+  tokens_at: number | null;
+  provider_id: string | null;
+  rate_limit_retries: number;
 }
 
 export interface CandidateRow {
@@ -172,7 +181,7 @@ export interface BenchIntervalRow {
   study_id: string;
   host_id: string;
   lock_key: string;
-  kind: "measure" | "profile" | "calibration" | "drift";
+  kind: "measure" | "profile" | "calibration" | "drift" | "harvest";
   candidate_id: number | null;
   started_at: number;
   ended_at: number | null;
@@ -266,6 +275,88 @@ export interface ResolvedBenchHost {
   hostId: string;
   name: string;
   mode: BenchMode;
+}
+
+export const HARVEST_STATES = ["waiting", "grouping", "ablating", "checking", "drafting", "ready", "failed", "cancelled"] as const;
+export type HarvestState = (typeof HARVEST_STATES)[number];
+
+export interface HarvestRow {
+  id: number;
+  study_id: string;
+  state: HarvestState;
+  phase_detail: string | null;
+  /** The lifecycle state the study returns to with "keep exploring". */
+  from_state: "running" | "paused";
+  base_sha: string | null;
+  best_sha: string | null;
+  segment: number | null;
+  host_id: string | null;
+  proposal_id: number | null;
+  /** Promotions on best (harvest-math Promotion[]), set once the bench drained. */
+  promotions_json: string | null;
+  grouping_source: "strategist" | "fallback" | null;
+  grouping_notes: string | null;
+  round_sent_at: number | null;
+  measure_standalone: number;
+  /** Total gain relative to best: improvement of best over base, normalized by best (same scale as contributions). */
+  total_effect: number | null;
+  total_ci_lo: number | null;
+  total_ci_hi: number | null;
+  total_n: number | null;
+  /** The same gain normalized by base (the usual "best vs base"). */
+  total_vs_base: number | null;
+  stacks_json: string | null;
+  publisher: "dry-run" | "github";
+  publish_state: "dry-run" | "publishing" | "published" | "failed" | null;
+  publish_json: string | null;
+  export_dir: string | null;
+  bench_seconds: number;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+}
+
+export type AblationStatus = "pending" | "measured" | "conflict" | "gate_failed" | "error";
+export type StandaloneStatus = "pending" | "pass" | "conflict" | "gate_failed" | "error" | "skipped";
+
+export interface ChangesetRow {
+  id: number;
+  harvest_id: number;
+  study_id: string;
+  k: number;
+  title: string;
+  rationale: string;
+  candidates_json: string;
+  commits_json: string;
+  paths_json: string;
+  ablation_status: AblationStatus;
+  ablation_detail: string | null;
+  ablation_sha: string | null;
+  /** How much worse best gets without this changeset (positive = it helps), relative to best. */
+  contribution: number | null;
+  ci_lo: number | null;
+  ci_hi: number | null;
+  n: number | null;
+  droppable: number;
+  /** Changeset ids (same harvest) this one depends on. */
+  depends_on_json: string;
+  dependency_reason: string | null;
+  /** Stack index (dependent changesets share one), null when independent. */
+  stack: number | null;
+  /** Where its PR branches from: "base" or another changeset's branch. */
+  pr_base: string | null;
+  standalone_status: StandaloneStatus;
+  standalone_detail: string | null;
+  standalone_sha: string | null;
+  /** Effect of applying it on its PR base, relative to that base (positive = better). */
+  standalone_effect: number | null;
+  standalone_ci_lo: number | null;
+  standalone_ci_hi: number | null;
+  branch: string | null;
+  pr_title: string | null;
+  pr_body: string | null;
+  pr_url: string | null;
+  pr_status: "drafted" | "branch" | "pushed" | "opened" | "failed" | null;
 }
 
 export interface Budget {
@@ -671,12 +762,79 @@ export class Store {
     });
   }
 
-  addHarvestProposal(studyId: string, proposal: unknown, authorThreadId: string): number {
+  addHarvestProposal(studyId: string, proposal: unknown, authorThreadId: string, harvestId: number | null = null): number {
     const r = this.db
-      .prepare(`INSERT INTO harvest_proposals (study_id, proposal_json, author_thread_id, created_at) VALUES (?, ?, ?, ?)`)
-      .run(studyId, JSON.stringify(proposal), authorThreadId, this.now());
-    this.event(studyId, "harvest.proposed", authorThreadId, { proposal: Number(r.lastInsertRowid) });
+      .prepare(`INSERT INTO harvest_proposals (study_id, proposal_json, author_thread_id, created_at, harvest_id) VALUES (?, ?, ?, ?, ?)`)
+      .run(studyId, JSON.stringify(proposal), authorThreadId, this.now(), harvestId);
+    this.event(studyId, "harvest.proposed", authorThreadId, { proposal: Number(r.lastInsertRowid), harvest: harvestId });
     return Number(r.lastInsertRowid);
+  }
+  harvestProposal(harvestId: number): { id: number; proposal_json: string; author_thread_id: string | null; created_at: number } | undefined {
+    return this.db.prepare(`SELECT id, proposal_json, author_thread_id, created_at FROM harvest_proposals WHERE harvest_id = ? ORDER BY id DESC LIMIT 1`).get(harvestId) as
+      | { id: number; proposal_json: string; author_thread_id: string | null; created_at: number }
+      | undefined;
+  }
+
+  // ---- harvests (M3) ----
+  insertHarvest(row: Pick<HarvestRow, "study_id" | "from_state" | "measure_standalone"> & { grouping_source?: "fallback" | null }, actor: string): HarvestRow {
+    return this.tx(() => {
+      const r = this.db
+        .prepare(`INSERT INTO harvests (study_id, state, from_state, measure_standalone, started_at, grouping_source, grouping_notes) VALUES (?, 'waiting', ?, ?, ?, ?, ?)`)
+        .run(row.study_id, row.from_state, row.measure_standalone, this.now(), row.grouping_source ?? null, row.grouping_source === "fallback" ? "one changeset per promotion (asked for by the human)" : null);
+      const id = Number(r.lastInsertRowid);
+      this.event(row.study_id, "harvest.started", actor, { harvest: id, from: row.from_state });
+      return this.harvest(id)!;
+    });
+  }
+  harvest(id: number): HarvestRow | undefined {
+    return this.db.prepare(`SELECT * FROM harvests WHERE id = ?`).get(id) as HarvestRow | undefined;
+  }
+  latestHarvest(studyId: string): HarvestRow | undefined {
+    return this.db.prepare(`SELECT * FROM harvests WHERE study_id = ? ORDER BY id DESC LIMIT 1`).get(studyId) as HarvestRow | undefined;
+  }
+  harvests(studyId: string): HarvestRow[] {
+    return this.db.prepare(`SELECT * FROM harvests WHERE study_id = ? ORDER BY id DESC LIMIT 50`).all(studyId) as HarvestRow[];
+  }
+  activeHarvests(): HarvestRow[] {
+    return this.db.prepare(`SELECT * FROM harvests WHERE state IN ('waiting','grouping','ablating','checking','drafting') ORDER BY id`).all() as HarvestRow[];
+  }
+  updateHarvest(id: number, patch: Partial<Omit<HarvestRow, "id" | "study_id">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    this.db.prepare(`UPDATE harvests SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+  insertChangeset(row: Pick<ChangesetRow, "harvest_id" | "study_id" | "k" | "title" | "rationale" | "candidates_json" | "commits_json" | "paths_json">): ChangesetRow {
+    const r = this.db
+      .prepare(
+        `INSERT INTO changesets (harvest_id, study_id, k, title, rationale, candidates_json, commits_json, paths_json) VALUES (@harvest_id, @study_id, @k, @title, @rationale, @candidates_json, @commits_json, @paths_json)`,
+      )
+      .run(row);
+    return this.db.prepare(`SELECT * FROM changesets WHERE id = ?`).get(Number(r.lastInsertRowid)) as ChangesetRow;
+  }
+  changesets(harvestId: number): ChangesetRow[] {
+    return this.db.prepare(`SELECT * FROM changesets WHERE harvest_id = ? ORDER BY k`).all(harvestId) as ChangesetRow[];
+  }
+  changeset(id: number): ChangesetRow | undefined {
+    return this.db.prepare(`SELECT * FROM changesets WHERE id = ?`).get(id) as ChangesetRow | undefined;
+  }
+  updateChangeset(id: number, patch: Partial<Omit<ChangesetRow, "id" | "harvest_id" | "study_id">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    this.db.prepare(`UPDATE changesets SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+  deleteChangesets(harvestId: number): void {
+    this.db.prepare(`DELETE FROM changesets WHERE harvest_id = ?`).run(harvestId);
+  }
+
+  /** Tokens a study's threads reported (workers in full, the study thread since the study started), or null when no thread reported any. */
+  studyTokens(studyId: string): number | null {
+    const r = this.db
+      .prepare(`SELECT COUNT(tokens) AS n, COALESCE(SUM(MAX(0, tokens - COALESCE(tokens_base, 0))), 0) AS t FROM threads WHERE study_id = ? AND tokens IS NOT NULL`)
+      .get(studyId) as { n: number; t: number };
+    return r.n ? r.t : null;
+  }
+  specVersions(studyId: string): SpecVersionRow[] {
+    return this.db.prepare(`SELECT * FROM spec_versions WHERE study_id = ? ORDER BY version DESC LIMIT 100`).all(studyId) as SpecVersionRow[];
   }
 
   // ---- bench hosts (M2) ----

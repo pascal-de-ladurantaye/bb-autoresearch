@@ -12,7 +12,8 @@
 import { defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlerContext } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { EngineError, type Caller, type Engine } from "./engine.ts";
-import { candidateDetail, candidatesView, ideasView, overview, studySummary, threadBadge } from "./views.ts";
+import { studyReport } from "./report.ts";
+import { benchView, candidateDetail, candidatesView, findingsView, harvestView, ideasView, oracleView, overview, studySummary, threadBadge, type BenchView, type FindingsView, type HarvestView, type OracleView } from "./views.ts";
 
 type Overview = ReturnType<typeof overview>;
 type IdeaView = ReturnType<typeof ideasView>[number];
@@ -47,6 +48,25 @@ export const rpcContract = defineRpcContract({
   },
   "study.candidate": { input: z.object({ slug, n: z.number().int().positive() }).strict(), output: z.object({ candidate: trusted<CandidateDetail>().nullable() }) },
   "thread.badge": { input: z.object({ threadId: z.string().min(1).max(200) }).strict(), output: z.object({ badge: trusted<Badge>() }) },
+  "study.findings": {
+    input: z
+      .object({
+        slug,
+        query: z.string().max(200).optional(),
+        outcome: z.string().max(40).optional(),
+        theme: z.string().max(60).optional(),
+        verdict: z.enum(["win", "lose", "inconclusive", "gate_failed", "conflict", "rejected"]).optional(),
+        limit: z.number().int().min(1).max(500).optional(),
+      })
+      .strict(),
+    output: trusted<FindingsView>(),
+  },
+  "study.oracle": { input: z.object({ slug }).strict(), output: trusted<OracleView>() },
+  "study.bench": { input: z.object({ slug }).strict(), output: trusted<BenchView>() },
+  "study.harvest": { input: z.object({ slug }).strict(), output: trusted<HarvestView>() },
+  "study.report": { input: z.object({ slug }).strict(), output: z.object({ markdown: z.string() }) },
+  /** Human control: start a DRY-RUN harvest (local branches and files only). Publishing to GitHub is CLI-only. */
+  "study.harvest.start": { input: z.object({ slug, restart: z.boolean().optional() }).strict(), output: ok },
   "study.pause": { input: z.object({ slug }).strict(), output: ok },
   "study.resume": { input: z.object({ slug }).strict(), output: ok },
   "study.concurrency": { input: z.object({ slug, maxWorkers: z.number().int().min(1).max(64).nullable() }).strict(), output: ok },
@@ -90,6 +110,20 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
     "study.candidates": ({ slug, ...f }) => ({ candidates: candidatesView(engine, engine.study(slug), f) }),
     "study.candidate": async ({ slug, n }) => ({ candidate: await candidateDetail(engine, engine.study(slug), n) }),
     "thread.badge": ({ threadId }) => ({ badge: threadBadge(engine, threadId) }),
+    "study.findings": ({ slug, ...q }) => findingsView(engine, engine.study(slug), q),
+    "study.oracle": ({ slug }) => oracleView(engine, engine.study(slug)),
+    "study.bench": ({ slug }) => benchView(engine, engine.study(slug)),
+    "study.harvest": ({ slug }) => harvestView(engine, engine.study(slug)),
+    "study.report": ({ slug }) => {
+      const s = engine.study(slug);
+      return { markdown: studyReport(engine.ctx, s, store.spec(s), store.latestHarvest(s.id) ?? null) };
+    },
+    "study.harvest.start": async ({ slug, restart }, ctx) => {
+      const caller = humanOnly(ctx);
+      const r = engine.startHarvest(slug, ACTOR, { restart: restart ?? false });
+      await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.id} started (dry run)`, { harvest: r.harvest.id });
+      return { ok: true, message: r.text };
+    },
     "study.pause": async ({ slug }, ctx) => {
       const caller = humanOnly(ctx);
       const message = engine.pause(slug, ACTOR);

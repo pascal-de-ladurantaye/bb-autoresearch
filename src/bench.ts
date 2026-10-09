@@ -20,7 +20,7 @@ import type { HostInfo } from "./ports.ts";
 import type { StudySpec } from "./spec.ts";
 import { ensureCommit, TransferError } from "./transfer.ts";
 
-export type CheckoutRole = "best" | "cand" | "drift" | "profile";
+export type CheckoutRole = "best" | "cand" | "drift" | "profile" | "hbase" | "harvest";
 
 /** Resolve the spec's bench_hosts against BB machines. Empty means ["local"]. */
 export function resolveBenchHosts(entries: string[], hosts: HostInfo[], editHostId: string): { ok: true; hosts: ResolvedBenchHost[] } | { ok: false; errors: string[] } {

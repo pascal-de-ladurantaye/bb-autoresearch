@@ -67,7 +67,7 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
     async getThread(threadId): Promise<ThreadInfo | null> {
       try {
         const t = await bb.sdk.threads.get({ threadId });
-        return { id: t.id, status: t.status, archivedAt: t.archivedAt, deletedAt: t.deletedAt, environmentId: t.environmentId };
+        return { id: t.id, status: t.status, archivedAt: t.archivedAt, deletedAt: t.deletedAt, environmentId: t.environmentId, providerId: t.providerId };
       } catch (e) {
         if (isNotFound(e)) return null;
         throw e;
@@ -118,6 +118,29 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
         runners.set(hostId, r);
       }
       return r;
+    },
+    async threadTokens(threadId) {
+      // Per-thread usage is readable from the thread's event log: the latest
+      // thread/tokenUsage/updated carries cumulative totals. Providers that
+      // never report usage leave this null.
+      const rows = await bb.sdk.threads.events.list({ threadId, types: ["thread/tokenUsage/updated"], order: "desc", limit: "1" });
+      const row = rows[0] as { data?: { tokenUsage?: { total?: { totalTokens?: number } } } } | undefined;
+      const total = row?.data?.tokenUsage?.total?.totalTokens;
+      return typeof total === "number" && Number.isFinite(total) ? total : null;
+    },
+    async usageLimits(providerId) {
+      const res = await bb.sdk.system.usageLimits(providerId ? { providerId } : {});
+      return Object.entries(res).map(([id, u]) => ({
+        providerId: id,
+        status: u.status,
+        windows:
+          u.status === "ok"
+            ? u.windows.map((w) => ({ label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt ? Date.parse(w.resetsAt) || null : null }))
+            : [],
+      }));
+    },
+    appUrl() {
+      return bb.server.experimental_appUrl ?? null;
     },
     log(level, message) {
       bb.log[level](message);

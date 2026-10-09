@@ -5,9 +5,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Engine } from "../src/engine.ts";
 import * as ops from "../src/host/ops.ts";
-import { LocalHostRunner } from "../src/host/runner.ts";
 import type { SpawnWorkerArgs } from "../src/ports.ts";
-import { DETERMINISTIC_SPEC, makeCtx } from "./helpers.ts";
+import { DETERMINISTIC_SPEC, localRunner, makeCtx } from "./helpers.ts";
 
 function sh(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
@@ -100,7 +99,7 @@ describe("host ops against real git", () => {
 
 describe("end to end with real git (LocalHostRunner)", () => {
   it("calibrates, spawns a worker on studies/<slug>/best, measures, and promotes a squashed win", async () => {
-    const runner = new LocalHostRunner(join(root, "data"), "host_test");
+    const runner = localRunner(join(root, "data"), "host_test");
     const { ctx, store, port } = makeCtx(runner);
     port.projectCheckout = async () => repo;
     // Real managed-worktree stand-in: a git worktree on a new branch from the base branch.
@@ -147,6 +146,9 @@ describe("end to end with real git (LocalHostRunner)", () => {
     writeFileSync(join(wt, "bench/measure.sh"), "echo METRIC size=1\n");
     const rejected = await engine.submit("thr_w1", "Edit the benchmark (should be rejected)");
     expect(rejected).toContain("REJECTED (scope)");
+    // Hermetic: every health check used the injected readings, never the machine's load.
+    expect(runner.probes).toBeGreaterThan(0);
+    expect(store.healthChecks(study.id).every((h) => h.ok === 1)).toBe(true);
     await engine.archiveStudy("toy-size", "human");
     expect(sh(repo, "branch", "--list", "bb/thr_w1")).toBe("");
     expect(sh(repo, "rev-parse", "refs/studies/toy-size/c/1")).toBe(c.sha);

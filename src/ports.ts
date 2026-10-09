@@ -7,6 +7,8 @@ export interface ThreadInfo {
   archivedAt: number | null;
   deletedAt: number | null;
   environmentId: string | null;
+  /** The agent provider running the thread (when BB reports it). */
+  providerId?: string | null;
 }
 
 export interface EnvironmentInfo {
@@ -33,6 +35,13 @@ export interface HostInfo {
   id: string;
   name: string;
   status: "connected" | "disconnected";
+}
+
+/** One provider's subscription/usage windows (bb.sdk.system.usageLimits). */
+export interface ProviderUsage {
+  providerId: string;
+  status: "ok" | "not_installed" | "unauthenticated" | "expired" | "error";
+  windows: Array<{ label: string; usedPercent: number; resetsAt: number | null }>;
 }
 
 export interface BbPort {
@@ -64,6 +73,12 @@ export interface BbPort {
   /** Retry a rate-limited turn at `sendAt`. */
   retryTurn(threadId: string, turnRequestId: string, sendAt: number | null): Promise<void>;
   hostRunner(hostId: string): HostRunner;
+  /** Total tokens a thread has reported (latest thread/tokenUsage/updated), or null when it reported none. */
+  threadTokens(threadId: string): Promise<number | null>;
+  /** Provider usage windows; empty when BB can't say. */
+  usageLimits(providerId?: string): Promise<ProviderUsage[]>;
+  /** The configured public app URL (for links in PR bodies and reports), if any. */
+  appUrl(): string | null;
   log(level: "info" | "warn" | "error", message: string): void;
   publish(channel: string, payload: unknown): void;
 }

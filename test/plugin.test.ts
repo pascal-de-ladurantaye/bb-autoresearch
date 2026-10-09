@@ -2,7 +2,7 @@ import { createFakePluginHost, makePluginAgentConfigurationContext } from "@get-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
 import { CREATOR_TOOLS, STRATEGIST_TOOLS, WORKER_TOOLS } from "../src/tools.ts";
-import { FakeHost, FakePort, fakeHostSpec } from "./helpers.ts";
+import { FakeHost, FakePort, fakeHostSpec, waitFor } from "./helpers.ts";
 
 type Harness = ReturnType<typeof createFakePluginHost>["harness"];
 
@@ -48,6 +48,8 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     expect((await harness.behavior.runCli(["calibrate", "toy-size", "--wait"])).stdout).toContain("Calibration ready");
     expect((await harness.behavior.runCli(["ideas", "add", "toy-size", "Shrink the output", "--theme", "size"])).stdout).toContain("Idea #1 queued (pinned)");
     expect((await harness.behavior.runCli(["start", "toy-size"])).stdout).toContain("is running");
+    // Spawning runs in the background control loop: wait for it instead of relying on timing.
+    await waitFor(() => port.threads.has("thr_w1") && port.spawned.length >= 1);
   }
 
   it("ordinary threads get only study_propose and the creation skills; side chats get nothing", async () => {
@@ -96,7 +98,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     host.metric.set("T1", 800);
     const ticket = await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
     expect(text(ticket)).toContain("Submitted as c/1");
-    for (let i = 0; i < 20 && !port.sent.some((m) => m.threadId === "thr_w1"); i++) await new Promise((r) => setTimeout(r, 5));
+    await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1"));
     expect(port.sent.find((m) => m.threadId === "thr_w1")?.text).toContain("WIN");
     const early = await harness.behavior.callAgentTool("study_finish", {}, { threadId: "thr_w1" });
     expect(isError(early)).toBe(true);

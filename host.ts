@@ -62,6 +62,10 @@ export default experimental_defineHostEntry({
     bundleWrite: ({ id, offset, data }, ctx) => bundle.bundleWrite(ctx.experimental_paths.dataDir, id, offset, data),
     bundleApply: async ({ repoPath, id, sha, ref, sha256 }, ctx) => await bundle.bundleApply(ctx.experimental_paths.dataDir, repoPath, id, sha, ref, sha256),
     bundleDiscard: ({ id }, ctx) => bundle.bundleDiscard(ctx.experimental_paths.dataDir, id),
+    commitLog: async ({ repoPath, from, to }) => await ops.commitLog(repoPath, from, to),
+    composeCommits: async (input) => await ops.composeCommits(input),
+    gitRemotes: async ({ repoPath }) => await ops.gitRemotes(repoPath),
+    writeExport: ({ key, files }, ctx) => ops.writeExport(ctx.experimental_paths.dataDir, key, files),
   },
   dispose: () => jobs.cancelAll(),
 });

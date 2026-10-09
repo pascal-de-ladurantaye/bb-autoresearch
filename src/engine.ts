@@ -5,11 +5,15 @@ import { randomUUID } from "node:crypto";
 import { resolveBenchHosts } from "./bench.ts";
 import { recordCalibration, runCalibration, type CalibrationReport } from "./calibration.ts";
 import type { Ctx } from "./context.ts";
-import type { BenchHostRow, CandidateRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
+import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
+import { applyProposal, type Promotion } from "./harvest-math.ts";
+import { Harvester, harvestReadyText } from "./harvest.ts";
 import { checkHealth } from "./health.ts";
+import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
+import { studyReport } from "./report.ts";
 import { BENCH_BOUND_STAGES, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
-import { clip, formatDuration, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
-import { budgetExhausted, idleAction, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
+import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
+import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
 
 export type Role = "worker" | "strategist" | "creator";
@@ -40,8 +44,14 @@ export class EngineError extends Error {
 
 const LIVE_WORKER_STATES = ["spawning", "active", "finishing"] as const;
 
+/** The last provider usage reading stored on the study. */
+export interface UsageReading {
+  providers: Array<{ providerId: string; windows: Array<{ label: string; usedPercent: number; resetsAt: number | null }> }>;
+}
+
 export class Engine {
   readonly pipeline: Pipeline;
+  readonly harvester: Harvester;
   private currentTick: Promise<void> | null = null;
   private tickAgain = false;
   private calibrations = new Map<string, Promise<void>>();
@@ -53,6 +63,11 @@ export class Engine {
       maxWorkers: (study) => this.maxWorkers(study),
       bestMoved: (study, winner, promoted) => void this.notifyBestMoved(study, winner, promoted).catch((e) => this.ctx.bb.log("warn", `best-moved notice: ${errText(e)}`)),
       notify: (study, kind, text) => this.notify(study.id, kind, text),
+    });
+    this.harvester = new Harvester(ctx, this.pipeline, {
+      notify: (study, kind, text, opts) => this.notify(study.id, kind, text, opts),
+      sendGroupingRound: (study, harvest, promotions) => this.sendGroupingRound(study, harvest, promotions),
+      publish: (studyId) => this.publish(studyId),
     });
   }
 
@@ -397,6 +412,16 @@ export class Engine {
 
   resume(slug: string, actor: string): string {
     const study = this.study(slug);
+    if (study.state === "harvesting") {
+      // "Keep exploring": back to Running. A harvest still in progress is cancelled; a ready one stays for review.
+      const h = this.store.latestHarvest(study.id);
+      const cancelled = h && !["ready", "failed", "cancelled"].includes(h.state);
+      if (h && cancelled) this.harvester.cancel(h.id);
+      this.pipeline.resetAttempts(study.id);
+      this.store.setStudyState(study.id, "running", actor, { from_harvest: h?.id ?? null });
+      this.kick();
+      return `${slug} is running again (keep exploring)${cancelled ? `; harvest h${h!.id} was cancelled` : h?.state === "ready" ? `; harvest h${h.id} stays available for review (a new \`bb study harvest\` starts a fresh one)` : ""}.`;
+    }
     if (study.state !== "paused") throw new EngineError(`${slug} is ${study.state}, not paused`);
     this.pipeline.resetAttempts(study.id);
     this.store.setStudyState(study.id, "running", actor);
@@ -404,9 +429,117 @@ export class Engine {
     return `${slug} resumed.`;
   }
 
+  // ------------------------------------------------------------ harvest
+
+  /**
+   * Start a harvest (Running/Paused → Harvesting), or report the current
+   * one. Dry-run: local branches and files only; publishing is a separate,
+   * explicit step (`publishHarvest`).
+   */
+  startHarvest(slug: string, actor: string, opts: { restart?: boolean; measureStandalone?: boolean; onePerPromotion?: boolean } = {}): { harvest: HarvestRow; text: string } {
+    const study = this.study(slug);
+    const latest = this.store.latestHarvest(study.id);
+    if (study.state === "harvesting" && latest) {
+      const active = !["ready", "failed", "cancelled"].includes(latest.state);
+      if (!opts.restart || active) {
+        if (active && !this.harvester.running(latest.id)) this.harvester.start(latest.id);
+        return { harvest: latest, text: `${slug} is harvesting: harvest h${latest.id} is ${latest.state}${latest.phase_detail ? ` (${latest.phase_detail})` : ""}.${active && opts.restart ? " It is still running; wait for it or `bb study resume` to cancel it." : ""}` };
+      }
+    } else if (!["running", "paused"].includes(study.state)) {
+      throw new EngineError(`${slug} is ${study.state}; harvest starts from Running or Paused`);
+    }
+    if (!study.best_sha || !study.base_sha) throw new EngineError(`${slug} has no best commit yet`);
+    const spec = this.store.spec(study);
+    const from = study.state === "harvesting" ? (latest?.from_state ?? "paused") : (study.state as "running" | "paused");
+    const h = this.store.insertHarvest({ study_id: study.id, from_state: from, measure_standalone: opts.measureStandalone === false ? 0 : 1, grouping_source: opts.onePerPromotion ? "fallback" : null }, actor);
+    if (study.state !== "harvesting") this.store.setStudyState(study.id, "harvesting", actor, { harvest: h.id });
+    this.harvester.start(h.id);
+    this.publish(study.id);
+    const inFlight = this.store.candidates(study.id, { stages: [...IN_FLIGHT_STAGES] }).length;
+    const live = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length;
+    return {
+      harvest: h,
+      text: [
+        `${slug} is harvesting (h${h.id}, dry run). No new workers start and submissions are closed${live ? `; ${live} live worker(s) finish their current idea` : ""}.`,
+        inFlight ? `First, ${inFlight} in-flight candidate(s) finish so best is final.` : "",
+        `Then: ${opts.onePerPromotion ? "one changeset per promotion (no strategist round)" : "the strategist groups the promotions into changesets (or one per promotion)"}, each changeset is ablated from best and measured (${spec.oracle.noise} protocol), checked alone on its PR base${spec.harvest.measure_standalone && opts.measureStandalone !== false ? " and measured" : ""}, and drafted as a local branch with a PR body. Nothing is pushed.`,
+        `Follow it on the Harvest tab or with \`bb study harvest ${slug}\`.`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    };
+  }
+
+  async waitForHarvest(slug: string, timeoutMs: number): Promise<void> {
+    const h = this.store.latestHarvest(this.study(slug).id);
+    if (h) await this.harvester.wait(h.id, timeoutMs);
+  }
+
+  /** Publish a ready harvest as DRAFT PRs on GitHub. Only behind an explicit `--publish`; refuses without a GitHub remote. */
+  async publishHarvest(slug: string, actor: string, confirmed: boolean): Promise<string> {
+    const study = this.study(slug);
+    const h = this.store.latestHarvest(study.id);
+    if (!h || h.state !== "ready") throw new EngineError(`${slug} has no ready harvest to publish; run \`bb study harvest ${slug}\` (a dry run) first and review it`);
+    if (h.publish_state === "published") throw new EngineError(`harvest h${h.id} was already published`);
+    const spec = this.store.spec(study);
+    const runner = this.ctx.bb.hostRunner(study.host_id!);
+    const publisher = new GithubPublisher(runner, study.repo_path!, spec.harvest.remote, confirmed);
+    try {
+      await publisher.preflight();
+    } catch (e) {
+      if (e instanceof PublishRefused) throw new EngineError(`publish refused: ${e.message}`);
+      throw e;
+    }
+    const changesets = this.store.changesets(h.id);
+    const drafts: PrDraft[] = changesets.map((c) => {
+      const base = c.pr_base && c.pr_base !== "base" ? changesets.find((x) => `#${x.k}` === c.pr_base) : undefined;
+      return { changesetId: c.id, k: c.k, branch: c.branch ?? `studies/${study.slug}/harvest/h${h.id}/${c.k}`, baseBranch: base?.branch ?? spec.study.base, title: c.pr_title ?? c.title, body: c.pr_body ?? "", sha: c.branch ? c.standalone_sha : null, stacked: Boolean(base) };
+    });
+    this.store.updateHarvest(h.id, { publisher: "github", publish_state: "publishing" });
+    this.store.event(study.id, "harvest.publishing", actor, { harvest: h.id, prs: drafts.length });
+    try {
+      const out = await publisher.publish({ key: `${study.slug}-harvest-h${h.id}`, drafts, report: studyReport(this.ctx, study, spec, h) });
+      for (const p of out.prs) {
+        this.store.updateChangeset(p.changesetId, { pr_url: p.url, pr_status: p.status === "opened" ? "opened" : p.status === "pushed" ? "pushed" : p.status === "failed" ? "failed" : this.store.changeset(p.changesetId)!.pr_status });
+      }
+      const opened = out.prs.filter((p) => p.status === "opened");
+      this.store.updateHarvest(h.id, { publish_state: opened.length === out.prs.filter((p) => p.status !== "skipped").length ? "published" : "failed", publish_json: JSON.stringify(out) });
+      this.store.event(study.id, "harvest.published", actor, { harvest: h.id, opened: opened.length, prs: out.prs.length });
+      this.publish(study.id);
+      return [`Harvest h${h.id}: ${opened.length} draft PR(s) opened.`, ...out.prs.map((p) => `#${p.k} ${p.branch} → ${p.baseBranch}: ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 200)})` : ""}`)].join("\n");
+    } catch (e) {
+      this.store.updateHarvest(h.id, { publish_state: "failed", error: clip(errText(e), 500) });
+      throw e;
+    }
+  }
+
+  /** The grouping round: one strategist turn asking for study_propose_harvest. */
+  private async sendGroupingRound(study: StudyRow, harvest: HarvestRow, promotions: Promotion[]): Promise<boolean> {
+    const fresh = this.store.study(study.id)!;
+    if (!fresh.study_thread_id) return false;
+    const strategist = this.store.threadById(fresh.study_thread_id);
+    if (!strategist || strategist.role !== "strategist" || strategist.state !== "active") return false;
+    const spec = this.store.spec(fresh);
+    const candidates = new Map(promotions.filter((p) => p.n !== null).map((p) => [p.n!, this.store.candidateByN(study.id, p.n!)] as const));
+    const text = harvestRoundPrompt({ study: fresh, spec, harvest, promotions, candidates, dossier: this.store.dossier(study.id) });
+    this.store.tx(() => {
+      this.store.updateStudy(study.id, { round_in_flight: 1, rounds: fresh.rounds + 1, last_round_at: this.ctx.now(), last_round_event_id: this.store.lastEventId() });
+      this.store.event(study.id, "strategist.round", "plugin", { round: fresh.rounds + 1, trigger: "harvest", harvest: harvest.id, promotions: promotions.length });
+    });
+    try {
+      await this.ctx.bb.send(fresh.study_thread_id, text);
+    } catch (e) {
+      this.store.updateStudy(study.id, { round_in_flight: 0 });
+      throw e;
+    }
+    return true;
+  }
+
   async archiveStudy(slug: string, actor: string): Promise<string> {
     const study = this.study(slug);
     if (study.state === "archived") return `${slug} is already archived.`;
+    const harvest = this.store.latestHarvest(study.id);
+    if (harvest) this.harvester.cancel(harvest.id);
     let stopped = 0;
     for (const w of this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] })) {
       await this.endWorker(w, "abandoned", "study archived");
@@ -676,8 +809,17 @@ export class Engine {
 
   async proposeHarvest(threadId: string, groups: Array<{ title: string; candidates: number[]; rationale: string }>): Promise<string> {
     const { study } = await this.requireRole(threadId, "strategist");
-    const id = this.store.addHarvestProposal(study!.id, groups, threadId);
-    return `Harvest proposal #${id} recorded (${groups.length} changesets). Ablation and PR drafting arrive in M3.`;
+    const h = this.store.latestHarvest(study!.id);
+    if (!h || h.state !== "grouping" || !h.promotions_json) {
+      const id = this.store.addHarvestProposal(study!.id, groups, threadId);
+      return `Harvest proposal #${id} recorded (${groups.length} changesets), but no harvest is waiting for a grouping right now. When the human runs \`bb study harvest\`, you will be asked again with the final list of promotions.`;
+    }
+    const promotions = JSON.parse(h.promotions_json) as Promotion[];
+    const r = applyProposal(promotions, groups);
+    if (!r.ok) throw new EngineError(`Grouping not accepted; fix it and call study_propose_harvest again:\n${r.errors.map((e) => `- ${e}`).join("\n")}`);
+    const id = this.store.addHarvestProposal(study!.id, groups, threadId, h.id);
+    this.publish(study!.id);
+    return [`Harvest grouping #${id} accepted for harvest h${h.id}: ${r.changesets.length} changeset(s).`, ...r.notes.map((n) => `Note: ${n}.`), "The plugin now ablates and measures each changeset; end your turn."].join("\n");
   }
 
   // -------------------------------------------------------- thread events
@@ -742,12 +884,43 @@ export class Engine {
     }
   }
 
-  async onTurnFailed(event: { threadId: string; requestId: string; attemptNumber: number; errorInfo: { category?: string | null } | null; rateLimits: { windows: Array<{ resetsAtMs: number | null }> } | null }): Promise<void> {
+  /**
+   * A turn failed. Rate-limited turns of the study's threads (workers and the
+   * study thread) are retried at the provider window's reset, at most
+   * agents.max_rate_limit_retries times per thread; meanwhile the study holds
+   * new spawns until that reset.
+   */
+  async onTurnFailed(event: { threadId: string; requestId: string; attemptNumber: number; errorInfo: { category?: string | null } | null; rateLimits: { status?: string; windows: Array<{ resetsAtMs: number | null; status?: string }> } | null }): Promise<void> {
     const row = this.store.threadById(event.threadId);
-    if (!row || event.errorInfo?.category !== "rate-limit" || event.attemptNumber >= 4) return;
-    const reset = event.rateLimits?.windows.find((w) => w.resetsAtMs !== null)?.resetsAtMs ?? null;
-    await this.ctx.bb.retryTurn(event.threadId, event.requestId, reset === null ? this.ctx.now() + 60_000 : reset + 15_000);
-    this.store.event(row.study_id, "turn.retry", "plugin", { thread: event.threadId, attempt: event.attemptNumber, sendAt: reset });
+    if (!row || event.errorInfo?.category !== "rate-limit") return;
+    const study = this.store.study(row.study_id);
+    if (!study) return;
+    let max = 3;
+    try {
+      max = this.store.spec(study).agents.max_rate_limit_retries;
+    } catch {
+      /* default */
+    }
+    const now = this.ctx.now();
+    const windows = event.rateLimits?.windows ?? [];
+    const blocked = windows.filter((w) => w.status === "blocked" && w.resetsAtMs !== null).map((w) => w.resetsAtMs!);
+    const any = windows.filter((w) => w.resetsAtMs !== null).map((w) => w.resetsAtMs!);
+    const reset = blocked.length ? Math.max(...blocked) : any.length ? Math.min(...any) : null;
+    const sendAt = reset !== null && reset > now ? reset + 15_000 : now + 60_000 * Math.max(1, event.attemptNumber);
+    const wasBlocked = study.rate_limited_until !== null && study.rate_limited_until > now;
+    this.store.updateStudy(study.id, { rate_limited_until: Math.max(study.rate_limited_until ?? 0, sendAt) });
+    if (row.rate_limit_retries >= max || event.attemptNumber > max) {
+      this.store.event(study.id, "turn.rate_limit_gave_up", "plugin", { thread: event.threadId, attempt: event.attemptNumber, retries: row.rate_limit_retries });
+      await this.notify(study.id, "rate_limit", `A ${row.role === "worker" ? "worker" : "study thread"} turn of \`${study.slug}\` stayed rate limited after ${row.rate_limit_retries} retries; it is left idle (${row.role === "worker" ? "the idle timeout abandons it" : "send it a message to retry"}). New workers wait until ${new Date(sendAt).toISOString().slice(11, 16)} UTC.`);
+      return;
+    }
+    await this.ctx.bb.retryTurn(event.threadId, event.requestId, sendAt);
+    this.store.updateThread(row.id, { rate_limit_retries: row.rate_limit_retries + 1 });
+    this.store.event(study.id, "turn.retry", "plugin", { thread: event.threadId, attempt: event.attemptNumber, sendAt, reset });
+    if (!wasBlocked) {
+      await this.notify(study.id, "rate_limit", `Provider rate limit on \`${study.slug}\`: the ${row.role === "worker" ? "worker" : "study thread"} turn is retried at ${new Date(sendAt).toISOString().slice(11, 16)} UTC, and no new worker starts until then.`, { quiet: true });
+    }
+    this.publish(study.id);
   }
 
   // --------------------------------------------------------- control loop
@@ -767,7 +940,7 @@ export class Engine {
       try {
         do {
           this.tickAgain = false;
-          for (const study of this.store.studies(["running", "paused"])) {
+          for (const study of this.store.studies(["running", "paused", "harvesting"])) {
             try {
               await this.tickStudy(study.id);
             } catch (e) {
@@ -812,17 +985,104 @@ export class Engine {
   }
 
   /** Adaptive W, learned from think and eval times; records changes as events. */
-  workerTarget(study: StudyRow): { w: number; tThink: number | null; tEval: number | null } {
+  workerTarget(study: StudyRow): { w: number; tThink: number | null; tEval: number | null; hold: boolean; limit: string | null } {
     const tEval = this.pipeline.recentEvalSeconds(study);
     const tThink = this.thinkSeconds(study);
-    const w = targetWorkers({ maxWorkers: this.maxWorkers(study), tThink, tEval, ceiling: this.ctx.config.workerCeiling });
+    const base = targetWorkers({ maxWorkers: this.maxWorkers(study), tThink, tEval, ceiling: this.ctx.config.workerCeiling });
+    const usage = this.usageState(study);
+    const limited = rateLimitedTarget(base, { blocked: usage.blocked, tight: usage.tight });
+    const w = limited.w;
     if (study.target_workers !== w) {
       this.store.tx(() => {
         this.store.updateStudy(study.id, { target_workers: w });
-        this.store.event(study.id, "scheduler.target", "plugin", { w, t_think: tThink, t_eval: tEval, max_workers: this.maxWorkers(study) });
+        this.store.event(study.id, "scheduler.target", "plugin", { w, t_think: tThink, t_eval: tEval, max_workers: this.maxWorkers(study), ...(limited.reason ? { unlimited_w: base, limit: limited.reason } : {}) });
       });
     }
-    return { w, tThink, tEval };
+    return { w, tThink, tEval, hold: limited.hold, limit: limited.reason };
+  }
+
+  /** Provider limits for the scheduler: blocked by a rate-limited turn (until its reset), or a usage window at or above usage_tight_percent. */
+  usageState(study: StudyRow): { blocked: boolean; blockedUntil: number | null; tight: boolean; maxPercent: number | null; providers: UsageReading["providers"]; checkedAt: number | null } {
+    const now = this.ctx.now();
+    const reading = safeJson<UsageReading>(study.usage_json);
+    const blocked = study.rate_limited_until !== null && study.rate_limited_until > now;
+    let tightPct = 90;
+    try {
+      tightPct = this.store.spec(study).agents.usage_tight_percent;
+    } catch {
+      /* no spec yet */
+    }
+    const maxPercent = reading?.providers.length ? Math.max(...reading.providers.flatMap((p) => p.windows.map((w) => w.usedPercent)), 0) : null;
+    return { blocked, blockedUntil: blocked ? study.rate_limited_until : null, tight: maxPercent !== null && maxPercent >= tightPct, maxPercent, providers: reading?.providers ?? [], checkedAt: study.usage_at };
+  }
+
+  /** Read provider usage windows for the providers this study's threads use (cached for usagePollMs). */
+  private async refreshUsage(study: StudyRow, spec: StudySpec): Promise<void> {
+    const now = this.ctx.now();
+    if (study.usage_at !== null && now - study.usage_at < this.ctx.config.usagePollMs) return;
+    const ids = new Set<string>();
+    for (const p of [spec.agents.worker.provider, spec.agents.strategist.provider]) if (p) ids.add(p);
+    for (const t of this.store.threads(study.id)) if (t.provider_id && (t.role === "strategist" || ["spawning", "active", "finishing"].includes(t.state))) ids.add(t.provider_id);
+    let all: Awaited<ReturnType<Ctx["bb"]["usageLimits"]>> = [];
+    try {
+      all = await this.ctx.bb.usageLimits();
+    } catch (e) {
+      this.ctx.bb.log("warn", `usage limits: ${errText(e)}`);
+    }
+    const providers = all.filter((p) => p.status === "ok" && (ids.size === 0 || ids.has(p.providerId))).map((p) => ({ providerId: p.providerId, windows: p.windows.slice(0, 8) }));
+    const before = this.usageState(study);
+    this.store.updateStudy(study.id, { usage_json: JSON.stringify({ providers } satisfies UsageReading), usage_at: now });
+    const after = this.usageState(this.store.study(study.id)!);
+    if (after.tight && !before.tight) {
+      this.store.event(study.id, "usage.tight", "plugin", { max_percent: after.maxPercent });
+      await this.notify(study.id, "usage.tight", `Provider usage for \`${study.slug}\` is at ${after.maxPercent?.toFixed(0)}% of a window (limit ${spec.agents.usage_tight_percent}%): the scheduler halves W until it eases.`, { quiet: true });
+    }
+  }
+
+  /** Read token usage for live threads (and the study thread), throttled per thread. */
+  private async refreshTokens(study: StudyRow, force = false): Promise<void> {
+    const now = this.ctx.now();
+    const rows = this.store.threads(study.id).filter((t) => t.thread_id && (t.role === "strategist" ? t.state === "active" : ["active", "finishing"].includes(t.state)));
+    for (const t of rows) {
+      if (!force && t.tokens_at !== null && now - t.tokens_at < this.ctx.config.tokenPollMs) continue;
+      await this.readTokens(t);
+    }
+  }
+
+  private async readTokens(t: ThreadRow): Promise<void> {
+    if (!t.thread_id) return;
+    const tokens = await this.ctx.bb.threadTokens(t.thread_id).catch(() => null);
+    this.store.updateThread(t.id, { tokens_at: this.ctx.now(), ...(tokens !== null ? { tokens, ...(t.tokens_base === null && t.role === "strategist" ? { tokens_base: t.tokens ?? tokens } : {}) } : {}) });
+  }
+
+  /** Budget shares crossing spec.budget.notify_at thresholds raise one notice each. */
+  private async budgetNotices(study: StudyRow, spec: StudySpec): Promise<void> {
+    const shares = budgetShares({
+      candidates: this.store.candidateCount(study.id),
+      maxCandidates: spec.budget.max_candidates,
+      benchSeconds: this.store.budget(study).bench_seconds,
+      maxBenchHours: spec.budget.max_bench_hours,
+      deadline: spec.budget.deadline,
+      now: this.ctx.now(),
+      tokens: this.store.studyTokens(study.id),
+      maxTokens: spec.budget.max_tokens,
+      startedAt: this.firstRunningAt(study.id),
+    });
+    const announced = new Set(safeJson<string[]>(study.budget_notices_json) ?? []);
+    const crossed = newBudgetThresholds(shares, spec.budget.notify_at, announced);
+    if (!crossed.length) return;
+    for (const c of crossed) announced.add(c.key);
+    this.store.updateStudy(study.id, { budget_notices_json: JSON.stringify([...announced]) });
+    const names: Record<string, string> = { candidates: "candidates", bench: "bench hours", tokens: "tokens", deadline: "time to the deadline" };
+    for (const c of crossed) {
+      this.store.event(study.id, "budget.threshold", "plugin", { dim: c.dim, pct: c.pct, share: c.share });
+      await this.notify(study.id, "budget.threshold", `\`${study.slug}\` has used ${(c.share * 100).toFixed(0)}% of its ${names[c.dim]} budget (${this.budgetLine(study, spec)}). At 100% it pauses and proposes a harvest.`);
+    }
+  }
+
+  private firstRunningAt(studyId: string): number | null {
+    const r = this.store.db.prepare(`SELECT at FROM events WHERE study_id = ? AND kind = 'study.state' AND data_json LIKE '%"to":"running"%' ORDER BY id LIMIT 1`).get(studyId) as { at: number } | undefined;
+    return r?.at ?? null;
   }
 
   /** Candidates gating, queued, or on the bench: the backpressure signal. */
@@ -864,7 +1124,12 @@ export class Engine {
     }
 
     await this.refreshBenchHosts(study);
-    const { w } = this.workerTarget(this.store.study(study.id)!);
+    await this.refreshTokens(study);
+    if (study.state !== "harvesting") {
+      await this.refreshUsage(this.store.study(study.id)!, spec);
+      await this.budgetNotices(this.store.study(study.id)!, spec);
+    }
+    const { w, hold } = this.workerTarget(this.store.study(study.id)!);
     if (study.state === "running") {
       const exhausted = budgetExhausted({
         candidates: this.store.candidateCount(study.id),
@@ -873,12 +1138,16 @@ export class Engine {
         maxBenchHours: spec.budget.max_bench_hours,
         deadline: spec.budget.deadline,
         now,
+        tokens: this.store.studyTokens(study.id),
+        maxTokens: spec.budget.max_tokens,
       });
       // Finishing workers still count: a new worker never starts while the previous one is wrapping up.
       const live = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length;
       if (exhausted) {
         const inFlight = this.store.candidates(study.id, { stages: [...IN_FLIGHT_STAGES] });
-        if (!live && !inFlight.length) await this.systemPause(study.id, `budget exhausted: ${exhausted}. Harvest arrives in M3; review results with \`bb study show ${study.slug}\`.`);
+        if (!live && !inFlight.length) await this.systemPause(study.id, `budget exhausted: ${exhausted}. Review the results and harvest them with \`bb study harvest ${study.slug}\` (or raise the budget with a spec change)`);
+      } else if (hold) {
+        // Rate limited: no new worker until the provider window resets.
       } else {
         let slots = spawnSlots({ live, w, benchDepth: this.benchDepth(study.id), candidates: this.store.candidateCount(study.id), maxCandidates: spec.budget.max_candidates });
         const lostTitles = this.lostTitles(study.id);
@@ -892,8 +1161,9 @@ export class Engine {
       }
     }
 
-    // Strategist rounds.
+    // Strategist rounds (not while harvesting: the harvest sends its own grouping round).
     const fresh = this.store.study(study.id)!;
+    if (fresh.state === "harvesting") return;
     if (fresh.round_in_flight && fresh.study_thread_id && fresh.last_round_at && now - fresh.last_round_at > 5 * 60_000) {
       const t = await this.ctx.bb.getThread(fresh.study_thread_id).catch(() => null);
       if (!t || t.status === "idle" || t.status === "error") this.store.updateStudy(study.id, { round_in_flight: 0 });
@@ -911,7 +1181,10 @@ export class Engine {
       totalVerdicts: this.store.candidates(study.id, { stages: ["decided"] }).length,
       rounds: fresh.rounds,
     });
-    if (trigger && fresh.study_thread_id) await this.sendRound(fresh, trigger);
+    if (trigger === "stall") {
+      await this.notify(study.id, "stall", `\`${study.slug}\` has had no win in the last ${spec.agents.stall_after} verdicts; the strategist is asked for structurally different directions. Consider steering the idea board, or harvesting what was found.`, { quiet: true });
+    }
+    if (trigger && fresh.study_thread_id) await this.sendRound(this.store.study(study.id)!, trigger);
   }
 
   /** Spawn one worker for `idea`; false when the spawn failed (the study is paused). */
@@ -970,6 +1243,8 @@ export class Engine {
         state: current.state === "spawning" ? "active" : current.state,
         last_active_at: this.ctx.now(),
       });
+      const info = await this.ctx.bb.getThread(spawned.threadId).catch(() => null);
+      if (info?.providerId) this.store.updateThread(row.id, { provider_id: info.providerId });
       this.store.event(study.id, "worker.spawned", "plugin", { thread: spawned.threadId, idea: idea.id, base: baseBranch, theme: idea.theme });
       this.publish(study.id);
       return true;
@@ -1010,6 +1285,7 @@ export class Engine {
     // and only a submission resolves it otherwise: look it up before archiving.
     let environmentId = fresh.environment_id;
     if (!environmentId && fresh.thread_id) environmentId = (await this.ctx.bb.getThread(fresh.thread_id).catch(() => null))?.environmentId ?? null;
+    await this.readTokens(fresh);
     if (fresh.thread_id) {
       await this.ctx.bb.archive(fresh.thread_id).catch((e) => this.ctx.bb.log("warn", `archive ${fresh.thread_id}: ${errText(e)}`));
       await this.ctx.bb.stop(fresh.thread_id).catch(() => undefined);
@@ -1038,6 +1314,9 @@ export class Engine {
    * or submission ticket). Their next submission is rebased automatically.
    */
   private async notifyBestMoved(study: StudyRow, winner: CandidateRow, promoted: string): Promise<void> {
+    const cum = this.cumulative(this.store.study(study.id)!);
+    const idea = winner.idea_id ? this.store.idea(winner.idea_id) : undefined;
+    await this.notify(study.id, "best.new", `New best for \`${study.slug}\`: c/${winner.n}${idea ? ` (${clip(idea.title, 100)})` : ""} ${formatPct(winner.effect)}${winner.ci_lo !== null && winner.ci_hi !== null ? ` (CI ${formatPct(winner.ci_lo)}..${formatPct(winner.ci_hi)})` : ""}; best vs base now ${formatPct(cum)}.`);
     const text = `[autoresearch] FYI: best moved to ${promoted.slice(0, 10)} (c/${winner.n}, ${formatPct(winner.effect)}). Your next submission is rebased onto it automatically; only a CONFLICT verdict needs you to \`git rebase studies/${study.slug}/best\`.`;
     for (const w of this.store.threads(study.id, { role: "worker", states: ["active"] })) {
       if (!w.thread_id || w.thread_id === winner.thread_id) continue;
@@ -1164,7 +1443,15 @@ export class Engine {
     if (!study || study.state !== "running") return;
     this.store.setStudyState(studyId, "paused", "plugin", { reason, system: true });
     this.publish(studyId);
-    await this.notify(studyId, "study.paused", `Study \`${study.slug}\` paused by the system: ${reason}. The human decides what happens next (\`bb study resume ${study.slug}\`).`);
+    // One notice kind per milestone the human cares about.
+    const kind = /^oracle broken|could not send best|holdout check failed on best/u.test(reason)
+      ? "oracle.broken"
+      : /^noise drift/u.test(reason)
+        ? "drift"
+        : /^budget exhausted/u.test(reason)
+          ? "budget.exhausted"
+          : "study.paused";
+    await this.notify(studyId, kind, `Study \`${study.slug}\` paused by the system: ${reason}. The human decides what happens next (\`bb study resume ${study.slug}\`${kind === "budget.exhausted" ? ` or \`bb study harvest ${study.slug}\`` : ""}).`);
   }
 
   cumulative(study: StudyRow): number | null {
@@ -1223,7 +1510,18 @@ export class Engine {
         if (!t || t.status === "idle" || t.status === "error") this.store.updateStudy(study.id, { round_in_flight: 0 });
       }
     }
-    this.store.event(null, "plugin.reconciled", "plugin", { requeued, workers, calibrations });
+    let harvests = 0;
+    for (const h of this.store.activeHarvests()) {
+      const s = this.store.study(h.study_id);
+      if (s?.state !== "harvesting") {
+        this.store.updateHarvest(h.id, { state: "cancelled", finished_at: this.ctx.now() });
+        continue;
+      }
+      this.store.event(h.study_id, "harvest.resumed", "plugin", { harvest: h.id, state: h.state, reason: "reconcile" });
+      this.harvester.start(h.id);
+      harvests += 1;
+    }
+    this.store.event(null, "plugin.reconciled", "plugin", { requeued, workers, calibrations, harvests });
     this.kick();
     return { requeued, workers, calibrations };
   }

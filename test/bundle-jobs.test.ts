@@ -11,6 +11,7 @@ import { BUNDLE_CHUNK_BYTES, HOST_RPC_INPUT_LIMIT, HOST_RPC_OUTPUT_LIMIT } from 
 import * as ops from "../src/host/ops.ts";
 import { HostJobLostError, LocalHostRunner, RunAbortedError, type HostRunner } from "../src/host/runner.ts";
 import { ensureCommit, TransferError } from "../src/transfer.ts";
+import { localRunner } from "./helpers.ts";
 
 function sh(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
@@ -52,8 +53,8 @@ beforeEach(() => {
   writeFileSync(join(repo, "src/data.txt"), "hello world\n");
   sh(repo, "add", "-A");
   sh(repo, "commit", "-qm", "base");
-  edit = new LocalHostRunner(join(root, "edit-data"), "host_edit");
-  bench = new LocalHostRunner(join(root, "bench-data"), "host_bench", { pollMs: 50, progressMs: 20 });
+  edit = localRunner(join(root, "edit-data"), "host_edit");
+  bench = localRunner(join(root, "bench-data"), "host_bench", { pollMs: 50, progressMs: 20 });
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
@@ -156,10 +157,10 @@ describe("long commands as host background jobs", () => {
   it("cancellation kills the job's process group", async () => {
     const marker = join(root, "still-running");
     const ac = new AbortController();
-    const run = bench.run({ cwd: repo, command: `sleep 0.4; touch ${marker}`, timeoutMs: 10_000 }, { signal: ac.signal });
+    const run = bench.run({ cwd: repo, command: `sleep 1.5; touch ${marker}`, timeoutMs: 10_000 }, { signal: ac.signal });
     setTimeout(() => ac.abort(), 100);
     await expect(run).rejects.toBeInstanceOf(RunAbortedError);
-    await new Promise((r) => setTimeout(r, 600));
+    await new Promise((r) => setTimeout(r, 2_000));
     expect(existsSync(marker)).toBe(false);
   });
 

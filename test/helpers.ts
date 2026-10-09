@@ -4,14 +4,24 @@ import { MIGRATIONS } from "../src/db/schema.ts";
 import { Store } from "../src/db/store.ts";
 import { createHash, randomBytes } from "node:crypto";
 import type { BundleInfo, DiffSummary, ExecInput, ExecResult, HealthReport, JobInput, PrepareInput, PrepareResult, SnapshotInput, SnapshotResult } from "../src/host/contract.ts";
-import { HostJobLostError, RunAbortedError, type HostRunner, type RunOptions } from "../src/host/runner.ts";
-import type { BbPort, EnvironmentInfo, HostInfo, SpawnWorkerArgs, ThreadInfo } from "../src/ports.ts";
+import { HostJobLostError, LocalHostRunner, RunAbortedError, type HostRunner, type RunOptions } from "../src/host/runner.ts";
+import type { BbPort, EnvironmentInfo, HostInfo, ProviderUsage, SpawnWorkerArgs, ThreadInfo } from "../src/ports.ts";
 import { seededRng } from "../src/stats.ts";
 
 export function makeDb(): Database.Database {
   const db = new Database(":memory:");
   for (const sql of MIGRATIONS) db.exec(sql);
   return db;
+}
+
+/** Poll `cond` until it holds (real time). Generous by default so a loaded machine never flakes. */
+export async function waitFor(cond: () => boolean, timeoutMs = 10_000, stepMs = 5): Promise<boolean> {
+  const end = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > end) return false;
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+  return true;
 }
 
 export class Clock {
@@ -46,6 +56,24 @@ export function healthyReport(over: Partial<HealthReport> = {}): HealthReport {
     at: 0,
     ...over,
   };
+}
+
+/**
+ * A real in-process host (real git, real jobs) whose health probe returns
+ * fixed healthy readings: tests must never depend on the load of the machine
+ * running them (other vitest workers, a busy laptop). `probes` counts calls.
+ */
+export function localRunner(dataDir: string, hostId = "host_test", opts: { progressMs?: number; pollMs?: number; report?: () => HealthReport } = {}): LocalHostRunner & { probes: number } {
+  const holder = { probes: 0 };
+  const runner = new LocalHostRunner(dataDir, hostId, {
+    ...(opts.progressMs !== undefined ? { progressMs: opts.progressMs } : {}),
+    ...(opts.pollMs !== undefined ? { pollMs: opts.pollMs } : {}),
+    health: async () => {
+      holder.probes += 1;
+      return { ...(opts.report ? opts.report() : healthyReport()), at: Date.now() };
+    },
+  });
+  return Object.defineProperty(runner, "probes", { get: () => holder.probes }) as LocalHostRunner & { probes: number };
 }
 
 /**
@@ -331,6 +359,21 @@ export class FakeHost implements HostRunner {
     this.maybeFail("diffSummary");
     return { files: [{ path: "src/a.ts", added: 3, deleted: 1 }], patch: `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-${from.slice(0, 6)}\n+${to.slice(0, 6)}\n`, truncated: false };
   }
+  async commitLog(): Promise<never> {
+    throw new Error("FakeHost: commitLog is real-git only (see harvest tests)");
+  }
+  async composeCommits(): Promise<never> {
+    throw new Error("FakeHost: composeCommits is real-git only (see harvest tests)");
+  }
+  remotes: Array<{ name: string; url: string }> = [];
+  async gitRemotes() {
+    return this.remotes;
+  }
+  exports = new Map<string, Array<{ path: string; content: string }>>();
+  async writeExport(key: string, files: Array<{ path: string; content: string }>) {
+    this.exports.set(key, files);
+    return `/exports/${key}`;
+  }
   async removeCheckouts(_repo: string, prefix: string) {
     let n = 0;
     for (const k of [...this.checkouts.keys()]) if (k.startsWith(this.coPath(prefix))) {
@@ -443,7 +486,24 @@ export class FakePort implements BbPort {
   async releaseEnvironment(id: string) {
     this.released.push(id);
   }
-  async retryTurn() {}
+  retries: Array<{ threadId: string; turnRequestId: string; sendAt: number | null }> = [];
+  async retryTurn(threadId: string, turnRequestId: string, sendAt: number | null) {
+    this.retries.push({ threadId, turnRequestId, sendAt });
+  }
+  /** Tokens per thread (thread/tokenUsage/updated); absent = the provider reports none. */
+  tokens = new Map<string, number>();
+  async threadTokens(threadId: string) {
+    return this.tokens.get(threadId) ?? null;
+  }
+  usage: ProviderUsage[] = [];
+  usageCalls = 0;
+  async usageLimits() {
+    this.usageCalls += 1;
+    return this.usage;
+  }
+  appUrl() {
+    return null;
+  }
   hostRunner(hostId?: string) {
     return (hostId && this.hosts.get(hostId)) || this.host;
   }
@@ -456,7 +516,7 @@ export class FakePort implements BbPort {
 export function makeCtx(host: HostRunner = new FakeHost(), clock = new Clock()): { ctx: Ctx; store: Store; port: FakePort; clock: Clock } {
   const store = new Store(makeDb(), clock.now);
   const port = new FakePort(host);
-  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0 } };
+  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, harvestGroupGraceMs: 0, harvestHealthTries: 2, usagePollMs: 0, tokenPollMs: 0 } };
   return { ctx, store, port, clock };
 }
 

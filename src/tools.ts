@@ -152,7 +152,7 @@ export function registerTools(bb: BbPluginApi, engine: Engine): void {
   });
   bb.agents.registerTool({
     name: "study_propose_harvest",
-    description: "Propose how to group promotions into reviewable changesets. Recorded now; ablation and PRs arrive in M3.",
+    description: "Group the promotions on best into reviewable changesets (one PR each) when a harvest asks for it. Every promoted candidate goes in exactly one group; invalid groupings are rejected with the reason.",
     parameters: z.object({
       groups: z.array(z.object({ title: z.string().min(3).max(200), candidates: z.array(z.number().int().positive()).min(1), rationale: z.string().max(2000) })).min(1).max(50),
     }),
