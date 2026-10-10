@@ -17,6 +17,8 @@ import { defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlerC
 import { z } from "zod";
 import { EngineError, type Caller, type Engine } from "./engine.ts";
 import { studyReport } from "./report.ts";
+import { liveView, threadStudy } from "./live.ts";
+import type { LiveView } from "./live-model.ts";
 import { attentionView, benchView, candidateDetail, candidatesView, findingsView, harvestView, ideasView, oracleView, overview, studySummary, threadBadge, type BenchView, type FindingsView, type HarvestView, type OracleView } from "./views.ts";
 
 type Overview = ReturnType<typeof overview>;
@@ -54,6 +56,10 @@ export const rpcContract = defineRpcContract({
   },
   "study.candidate": { input: z.object({ slug, n: z.number().int().positive() }).strict(), output: z.object({ candidate: trusted<CandidateDetail>().nullable() }) },
   "thread.badge": { input: z.object({ threadId: z.string().min(1).max(200) }).strict(), output: z.object({ badge: trusted<Badge>() }) },
+  /** The Live view of a study: worker lanes, candidate cards, bench, idea queue, feed. Read only. */
+  "study.live": { input: z.object({ slug }).strict(), output: trusted<LiveView>() },
+  /** Which study a thread belongs to (the study thread's Live panel resolves its study from the thread). */
+  "thread.study": { input: z.object({ threadId: z.string().min(1).max(200) }).strict(), output: z.object({ study: trusted<ReturnType<typeof threadStudy>>() }) },
   "study.findings": {
     input: z
       .object({
@@ -138,6 +144,8 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
     "study.candidates": ({ slug, ...f }) => ({ candidates: candidatesView(engine, engine.study(slug), f) }),
     "study.candidate": async ({ slug, n }) => ({ candidate: await candidateDetail(engine, engine.study(slug), n) }),
     "thread.badge": ({ threadId }) => ({ badge: threadBadge(engine, threadId) }),
+    "study.live": ({ slug }) => liveView(engine, engine.study(slug)),
+    "thread.study": ({ threadId }) => ({ study: threadStudy(engine, threadId) }),
     "study.findings": ({ slug, ...q }) => findingsView(engine, engine.study(slug), q),
     "study.oracle": ({ slug }) => oracleView(engine, engine.study(slug)),
     "study.bench": ({ slug }) => benchView(engine, engine.study(slug)),

@@ -9,6 +9,8 @@ import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost
 import { applyProposal, type Promotion } from "./harvest-math.ts";
 import { Harvester, harvestReadyText } from "./harvest.ts";
 import { checkHealth } from "./health.ts";
+import { LiveRecorder } from "./live.ts";
+import { classifyItem, type Activity } from "./live-model.ts";
 import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
 import { studyReport } from "./report.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
@@ -56,6 +58,10 @@ export class Engine {
   private currentTick: Promise<void> | null = null;
   private tickAgain = false;
   private calibrations = new Map<string, Promise<void>>();
+  /** Live view: records worker phases and sends throttled realtime deltas. */
+  readonly live: LiveRecorder;
+  private activityReads = new Map<string, Promise<void>>();
+  private activityAgain = new Set<string>();
 
   constructor(readonly ctx: Ctx) {
     this.pipeline = new Pipeline(ctx, {
@@ -70,6 +76,7 @@ export class Engine {
       sendGroupingRound: (study, harvest, promotions) => this.sendGroupingRound(study, harvest, promotions),
       publish: (studyId) => this.publish(studyId),
     });
+    this.live = new LiveRecorder(ctx);
   }
 
   private get store() {
@@ -829,6 +836,7 @@ export class Engine {
       }
       this.store.event(study!.id, "worker.finish_requested", threadId, { idea: row!.idea_id });
     });
+    this.publish(study!.id);
     return "Assignment finished. End your turn now; the plugin archives this thread and removes its worktree. Candidate refs are kept.";
   }
 
@@ -991,6 +999,52 @@ export class Engine {
     this.store.markNoticesDelivered(notices.map((n) => n.id), 0);
     const text = [`[autoresearch] Notices for study \`${study.slug}\` (for the human; relay briefly):`, ...notices.map((n) => `- [${n.kind}] ${clip(n.text, 1500)}`)].join("\n");
     await this.ctx.bb.steer(threadId, text).catch(() => this.ctx.bb.send(threadId, text));
+  }
+
+  /**
+   * A worker's thread appended events (coalesced to one call per second by
+   * BB): read the tool items it started since the last read and record what
+   * the agent is doing (reading, editing, testing) for the live view.
+   * Message text is never read.
+   */
+  onThreadEvents(threadId: string, sequence: number): void {
+    const row = this.store.threadById(threadId);
+    if (!row || row.role !== "worker" || !(row.state === "active" || row.state === "spawning")) return;
+    if (sequence <= row.activity_seq) return;
+    if (this.activityReads.has(threadId)) {
+      this.activityAgain.add(threadId);
+      return;
+    }
+    const run = (async () => {
+      try {
+        await this.readActivity(row.id);
+      } catch (e) {
+        this.ctx.bb.log("warn", `worker activity ${threadId}: ${errText(e)}`);
+      } finally {
+        this.activityReads.delete(threadId);
+        if (this.activityAgain.delete(threadId)) this.onThreadEvents(threadId, Number.MAX_SAFE_INTEGER);
+      }
+    })();
+    this.activityReads.set(threadId, run);
+  }
+
+  /** Read new tool items of a worker's thread and record its activity (tests await this). */
+  async readActivity(rowId: number): Promise<void> {
+    for (let page = 0; page < 5; page++) {
+      const w = this.store.threadRow(rowId);
+      if (!w?.thread_id) return;
+      const limit = 200;
+      const { seq, items } = await this.ctx.bb.threadActivity(w.thread_id, w.activity_seq, limit);
+      if (seq <= w.activity_seq) return;
+      let latest: { activity: Activity; at: number } | null = null;
+      for (let i = items.length - 1; i >= 0 && !latest; i--) {
+        const a = classifyItem(items[i]!);
+        if (a) latest = { activity: a, at: items[i]!.at };
+      }
+      this.store.updateThread(rowId, { activity_seq: seq, ...(latest ? { activity: latest.activity, activity_at: latest.at } : {}) });
+      if (latest) this.live.schedule(w.study_id);
+      if (items.length < limit) return;
+    }
   }
 
   onThreadFailed(threadId: string): void {
@@ -1220,6 +1274,8 @@ export class Engine {
 
   private async tickStudy(studyId: string): Promise<void> {
     const study = this.store.study(studyId)!;
+    // Safety net: worker phases follow plugin state even if no event announced a change.
+    this.live.schedule(studyId);
     const spec = this.store.spec(study);
     const now = this.ctx.now();
     const workers = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] });
@@ -1685,6 +1741,7 @@ export class Engine {
 
   private publish(studyId: string): void {
     this.ctx.bb.publish("study-changed", { study: studyId });
+    this.live.schedule(studyId);
   }
 }
 

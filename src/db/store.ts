@@ -118,6 +118,13 @@ export interface ThreadRow {
   tokens_at: number | null;
   provider_id: string | null;
   rate_limit_retries: number;
+  /** Live view: the recorded worker phase (see live-model.ts) and since when. */
+  phase: string | null;
+  phase_at: number | null;
+  /** What the agent is doing from its thread's tool items: reading, editing, testing. */
+  activity: string | null;
+  activity_at: number | null;
+  activity_seq: number;
 }
 
 export interface CandidateRow {
@@ -371,11 +378,30 @@ export interface Budget {
   bench_seconds: number;
 }
 
+/** An appended event, as listeners see it (the live view turns these into realtime deltas). */
+export interface AppendedEvent {
+  id: number;
+  studyId: string | null;
+  at: number;
+  kind: string;
+  data: Record<string, unknown>;
+}
+
 export class Store {
+  private listeners: Array<(e: AppendedEvent) => void> = [];
+
   constructor(
     readonly db: Database.Database,
     private readonly now: () => number = Date.now,
   ) {}
+
+  /** Observe every appended event (called synchronously, possibly inside a transaction). Returns an unsubscribe. */
+  onEvent(fn: (e: AppendedEvent) => void): () => void {
+    this.listeners.push(fn);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== fn);
+    };
+  }
 
   tx<T>(fn: () => T): T {
     return this.db.transaction(fn)();
@@ -383,16 +409,42 @@ export class Store {
 
   // ---- events (append-only audit) ----
   event(studyId: string | null, kind: string, actor: string, data: Record<string, unknown> = {}): number {
-    const r = this.db
-      .prepare(`INSERT INTO events (study_id, at, kind, actor, data_json) VALUES (?, ?, ?, ?, ?)`)
-      .run(studyId, this.now(), kind, actor, JSON.stringify(data));
-    return Number(r.lastInsertRowid);
+    const at = this.now();
+    const r = this.db.prepare(`INSERT INTO events (study_id, at, kind, actor, data_json) VALUES (?, ?, ?, ?, ?)`).run(studyId, at, kind, actor, JSON.stringify(data));
+    const id = Number(r.lastInsertRowid);
+    for (const l of this.listeners) {
+      try {
+        l({ id, studyId, at, kind, data });
+      } catch {
+        // A listener never breaks a state change.
+      }
+    }
+    return id;
+  }
+  /** Events of a study in id order, after `afterId`, optionally of some kinds (replay, the live view). */
+  eventsAsc(studyId: string, opts: { afterId?: number; limit?: number; kinds?: readonly string[]; untilAt?: number } = {}): EventRow[] {
+    const kinds = opts.kinds?.length ? ` AND kind IN (${opts.kinds.map(() => "?").join(",")})` : "";
+    const until = opts.untilAt !== undefined ? ` AND at <= ?` : "";
+    return this.db
+      .prepare(`SELECT * FROM events WHERE study_id = ? AND id > ?${kinds}${until} ORDER BY id ASC LIMIT ?`)
+      .all(studyId, opts.afterId ?? 0, ...(opts.kinds ?? []), ...(opts.untilAt !== undefined ? [opts.untilAt] : []), opts.limit ?? 100_000) as EventRow[];
+  }
+  /** The latest events of some kinds, oldest first (the live view's recent window). */
+  recentEvents(studyId: string, kinds: readonly string[], limit: number): EventRow[] {
+    return (
+      this.db
+        .prepare(`SELECT * FROM events WHERE study_id = ? AND kind IN (${kinds.map(() => "?").join(",")}) ORDER BY id DESC LIMIT ?`)
+        .all(studyId, ...kinds, limit) as EventRow[]
+    ).reverse();
   }
   events(studyId: string, opts: { afterId?: number; limit?: number; kinds?: string[] } = {}): EventRow[] {
     const kinds = opts.kinds?.length ? ` AND kind IN (${opts.kinds.map(() => "?").join(",")})` : "";
     return this.db
       .prepare(`SELECT * FROM events WHERE study_id = ? AND id > ?${kinds} ORDER BY id DESC LIMIT ?`)
       .all(studyId, opts.afterId ?? 0, ...(opts.kinds ?? []), opts.limit ?? 50) as EventRow[];
+  }
+  lastStudyEventId(studyId: string): number {
+    return (this.db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE study_id = ?`).get(studyId) as { id: number }).id;
   }
   lastEventId(): number {
     return (this.db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM events`).get() as { id: number }).id;
@@ -531,7 +583,7 @@ export class Store {
       const id = Number(r.lastInsertRowid);
       // A lineage is the root idea of a chain of explicit variations.
       this.db.prepare(`UPDATE ideas SET lineage = ? WHERE id = ?`).run(parent ? (parent.lineage ?? parent.id) : id, id);
-      this.event(studyId, "idea.added", actor, { idea: id, title: idea.title, source: idea.source, variation_of: parent?.id ?? null });
+      this.event(studyId, "idea.added", actor, { idea: id, title: idea.title, source: idea.source, variation_of: parent?.id ?? null, theme: idea.theme ?? "", priority: idea.priority ?? 0, pinned: Boolean(idea.pinned) });
       return this.idea(id)!;
     });
   }
@@ -613,7 +665,9 @@ export class Store {
          VALUES (@study_id, @n, @idea_id, @thread_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at, @lines_added, @lines_deleted)`,
       )
       .run({ lines_added: 0, lines_deleted: 0, ...row, submitted_at: this.now() });
-    return this.candidate(Number(r.lastInsertRowid))!;
+    const c = this.candidate(Number(r.lastInsertRowid))!;
+    this.event(c.study_id, "candidate.stage", "plugin", { candidate: c.id, n: c.n, from: null, to: c.stage, worker: c.thread_id });
+    return c;
   }
   candidate(id: number): CandidateRow | undefined {
     return this.db.prepare(`SELECT * FROM candidates WHERE id = ?`).get(id) as CandidateRow | undefined;
@@ -639,10 +693,15 @@ export class Store {
   candidateCount(studyId: string): number {
     return (this.db.prepare(`SELECT COUNT(*) AS c FROM candidates WHERE study_id = ?`).get(studyId) as { c: number }).c;
   }
+  /** Every stage change is also a `candidate.stage` event (the live view and its replay are built on them). */
   updateCandidate(id: number, patch: Partial<Omit<CandidateRow, "id">>): void {
     const keys = Object.keys(patch);
     if (!keys.length) return;
+    const before = patch.stage !== undefined ? this.candidate(id) : undefined;
     this.db.prepare(`UPDATE candidates SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+    if (before && patch.stage !== before.stage) {
+      this.event(before.study_id, "candidate.stage", "plugin", { candidate: id, n: before.n, from: before.stage, to: patch.stage, ...(patch.verdict ? { verdict: patch.verdict } : {}) });
+    }
   }
   /** Decided candidates in decision order (most recent last). */
   decided(studyId: string, limit = 1000): CandidateRow[] {

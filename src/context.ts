@@ -49,6 +49,8 @@ export interface EngineConfig {
   usagePollMs: number;
   /** How often a live thread's token usage is read. */
   tokenPollMs: number;
+  /** Live view: minimum time a worker stays in an activity phase (reading, editing, testing) before a flip is recorded. */
+  liveDwellMs?: number;
 }
 
 export interface Ctx {

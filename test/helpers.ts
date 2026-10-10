@@ -5,7 +5,7 @@ import { Store } from "../src/db/store.ts";
 import { createHash, randomBytes } from "node:crypto";
 import type { BundleInfo, DiffSummary, ExecInput, ExecResult, HealthReport, JobInput, PrepareInput, PrepareResult, SnapshotInput, SnapshotResult } from "../src/host/contract.ts";
 import { HostJobLostError, LocalHostRunner, RunAbortedError, type HostRunner, type RunOptions } from "../src/host/runner.ts";
-import type { BbPort, EnvironmentInfo, HostInfo, ProviderUsage, SpawnWorkerArgs, ThreadInfo } from "../src/ports.ts";
+import type { BbPort, EnvironmentInfo, HostInfo, ProviderUsage, SpawnWorkerArgs, ThreadActivityItem, ThreadInfo } from "../src/ports.ts";
 import { seededRng } from "../src/stats.ts";
 
 export function makeDb(): Database.Database {
@@ -502,6 +502,20 @@ export class FakePort implements BbPort {
   async threadTokens(threadId: string) {
     return this.tokens.get(threadId) ?? null;
   }
+  /** Tool items per thread (item/started), as the live view reads them. */
+  activity = new Map<string, ThreadActivityItem[]>();
+  activityCalls = 0;
+  async threadActivity(threadId: string, afterSeq: number, limit = 200) {
+    this.activityCalls += 1;
+    const items = (this.activity.get(threadId) ?? []).filter((i) => i.seq > afterSeq).slice(0, limit);
+    return { seq: items.length ? items[items.length - 1]!.seq : afterSeq, items };
+  }
+  /** Record a tool item on a fake thread (the live view classifies it). */
+  addActivity(threadId: string, kind: string, opts: { command?: string; tool?: string; at?: number } = {}) {
+    const list = this.activity.get(threadId) ?? [];
+    list.push({ seq: (list.at(-1)?.seq ?? 0) + 1, at: opts.at ?? Date.now(), kind, command: opts.command ?? null, tool: opts.tool ?? null });
+    this.activity.set(threadId, list);
+  }
   usage: ProviderUsage[] = [];
   usageCalls = 0;
   async usageLimits() {
@@ -520,13 +534,17 @@ export class FakePort implements BbPort {
   log(level: string, message: string) {
     this.logs.push(`${level}: ${message}`);
   }
-  publish() {}
+  /** Realtime signals the plugin published. */
+  published: Array<{ channel: string; payload: unknown; at: number }> = [];
+  publish(channel: string, payload: unknown) {
+    this.published.push({ channel, payload, at: Date.now() });
+  }
 }
 
 export function makeCtx(host: HostRunner = new FakeHost(), clock = new Clock()): { ctx: Ctx; store: Store; port: FakePort; clock: Clock } {
   const store = new Store(makeDb(), clock.now);
   const port = new FakePort(host);
-  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, harvestGroupGraceMs: 0, harvestHealthTries: 2, usagePollMs: 0, tokenPollMs: 0 } };
+  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, harvestGroupGraceMs: 0, harvestHealthTries: 2, usagePollMs: 0, tokenPollMs: 0, liveDwellMs: 0 } };
   return { ctx, store, port, clock };
 }
 

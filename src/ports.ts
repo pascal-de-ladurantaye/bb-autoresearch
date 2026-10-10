@@ -31,6 +31,15 @@ export interface SpawnWorkerArgs {
   permissionMode?: "accept-edits" | "auto" | "full";
 }
 
+/** One tool item a worker's agent started (item/started), without its content. */
+export interface ThreadActivityItem {
+  seq: number;
+  at: number;
+  kind: string;
+  command: string | null;
+  tool: string | null;
+}
+
 export interface HostInfo {
   id: string;
   name: string;
@@ -81,6 +90,13 @@ export interface BbPort {
   hostRunner(hostId: string): HostRunner;
   /** Total tokens a thread has reported (latest thread/tokenUsage/updated), or null when it reported none. */
   threadTokens(threadId: string): Promise<number | null>;
+  /**
+   * Tool items a thread started after event sequence `afterSeq` (item/started
+   * rows: kind, command, tool name, time), oldest first, at most `limit`.
+   * The live view classifies them into reading, editing and testing; message
+   * text is never read.
+   */
+  threadActivity(threadId: string, afterSeq: number, limit?: number): Promise<{ seq: number; items: ThreadActivityItem[] }>;
   /** Provider usage windows; empty when BB can't say. */
   usageLimits(providerId?: string): Promise<ProviderUsage[]>;
   /** This plugin's id (the package name minus `bb-plugin-`), used in app links. */
