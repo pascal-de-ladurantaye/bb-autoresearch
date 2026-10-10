@@ -37,7 +37,8 @@ import {
 } from "./harvest-math.ts";
 import { checkHealth } from "./health.ts";
 import { BenchError, strategyFor } from "./noise.ts";
-import { errText, IN_FLIGHT_STAGES, withBench, type Pipeline } from "./pipeline.ts";
+import type { GuardrailEstimate } from "./guardrails.ts";
+import { errText, IN_FLIGHT_STAGES, segmentGuardrailCalibration, withBench, type Pipeline } from "./pipeline.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { DryRunPublisher, type PrDraft } from "./publisher.ts";
 import { prBody, studyReport } from "./report.ts";
@@ -67,7 +68,29 @@ export interface StackRecord {
   detail: string | null;
 }
 
-type PairResult = { ok: true; effect: number; ciLo: number | null; ciHi: number | null; n: number; seconds: number } | { ok: false; reason: string };
+type PairResult = { ok: true; effect: number; ciLo: number | null; ciHi: number | null; n: number; seconds: number; guardrails: Record<string, GuardrailCost> } | { ok: false; reason: string };
+
+/**
+ * What a set of commits costs a guardrail, relative to best: measured with
+ * the commits removed ("candidate") against best ("reference"), so the cost
+ * is minus that regression (positive = the commits make the guardrail worse),
+ * the same sign flip as a contribution.
+ */
+export interface GuardrailCost {
+  value: number;
+  lo: number | null;
+  hi: number | null;
+  n: number;
+}
+
+function guardrailCosts(estimates: Record<string, GuardrailEstimate> | undefined): Record<string, GuardrailCost> {
+  const out: Record<string, GuardrailCost> = {};
+  for (const [name, e] of Object.entries(estimates ?? {})) {
+    if (!Number.isFinite(e.regression)) continue;
+    out[name] = { value: -e.regression, lo: e.hi === null ? null : -e.hi, hi: e.lo === null ? null : -e.lo, n: e.n };
+  }
+  return out;
+}
 
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -328,10 +351,11 @@ export class Harvester {
             bestCache: null,
             baseline: baseline?.sha === refSha ? baseline.runs : null,
             noiseFloor: row.noise_floor ?? segment?.noise_floor ?? null,
+            guardrailNoise: Object.fromEntries(segmentGuardrailCalibration(this.store, study).map((g) => [g.name, g.noise])),
             signal,
           });
           const seconds = (this.ctx.now() - started) / 1000;
-          return { ok: true, effect: outcome.effect, ciLo: outcome.ciLo, ciHi: outcome.ciHi, n: outcome.n, seconds };
+          return { ok: true, effect: outcome.effect, ciLo: outcome.ciLo, ciHi: outcome.ciHi, n: outcome.n, seconds, guardrails: guardrailCosts(outcome.guardrailEstimates) };
         } catch (e) {
           if (e instanceof BenchError && e.side === "candidate") return { ok: false, reason: `measure failed: ${e.message}` };
           if (e instanceof BenchTransferError && e.purpose === "candidate") return { ok: false, reason: `transfer failed: ${e.message}` };
@@ -373,7 +397,7 @@ export class Harvester {
     const e = contributionFromAblation(r.effect, r.ciLo, r.ciHi);
     // The same gain relative to base (the usual "best vs base"): t_rel_best / (1 + t_rel_best).
     const vsBase = e.value / (1 + e.value);
-    this.store.updateHarvest(harvestId, { total_effect: e.value, total_ci_lo: e.lo, total_ci_hi: e.hi, total_n: r.n, total_vs_base: Number.isFinite(vsBase) ? vsBase : null });
+    this.store.updateHarvest(harvestId, { total_effect: e.value, total_ci_lo: e.lo, total_ci_hi: e.hi, total_n: r.n, total_vs_base: Number.isFinite(vsBase) ? vsBase : null, total_guardrails_json: JSON.stringify(r.guardrails) });
     this.store.event(h.study_id, "harvest.total", "plugin", { harvest: harvestId, total: e.value, lo: e.lo, hi: e.hi, n: r.n });
   }
 
@@ -436,7 +460,7 @@ export class Harvester {
     }
     const e = contributionFromAblation(r.effect, r.ciLo, r.ciHi);
     const tolerance = spec.oracle.noise === "deterministic" ? spec.oracle.protocol.tolerance : 0;
-    this.store.updateChangeset(cs.id, { ablation_status: "measured", contribution: e.value, ci_lo: e.lo, ci_hi: e.hi, n: r.n, droppable: isDroppable(e, tolerance) ? 1 : 0, ablation_detail: null });
+    this.store.updateChangeset(cs.id, { ablation_status: "measured", contribution: e.value, ci_lo: e.lo, ci_hi: e.hi, n: r.n, droppable: isDroppable(e, tolerance) ? 1 : 0, ablation_detail: null, guardrails_json: JSON.stringify(r.guardrails) });
     this.store.event(h.study_id, "harvest.ablation", "plugin", { harvest: harvestId, changeset: cs.k, contribution: e.value, lo: e.lo, hi: e.hi, n: r.n });
   }
 

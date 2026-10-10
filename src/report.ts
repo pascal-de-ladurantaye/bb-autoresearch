@@ -5,7 +5,9 @@
 import type { Ctx } from "./context.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
 import { harvestAccounting, type Accounting, type Estimate } from "./harvest-math.ts";
-import type { StackRecord } from "./harvest.ts";
+import type { GuardrailCost, StackRecord } from "./harvest.ts";
+import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
+import { bestGuardrailPositions, segmentGuardrailCalibration } from "./pipeline.ts";
 import { amountText, ciText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
@@ -171,7 +173,7 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
     `- Base \`${study.base_sha?.slice(0, 10) ?? "?"}\` → best \`${study.best_sha?.slice(0, 10) ?? "?"}\` (branch \`studies/${study.slug}/best\`): ${wins.length ? `${improvementText(cumulative, metric)} (compounded from the promoted candidates)` : "no promotion"}`,
     `- Convention: every improvement is better-is-positive in the metric's own direction; "+10%" means 10% ${spec.metric.direction === "lower" ? "lower" : "higher"} ${spec.metric.name}.`,
     `- Candidates: ${decided.length} decided (${[...counts].map(([k, v]) => `${k} ${v}`).join(", ") || "none"}) · bench time ${formatDuration(budget.bench_seconds)} of ${spec.budget.max_bench_hours} h${tokens !== null ? ` · ${tokens.toLocaleString("en-US")} tokens${wins.length ? ` (${Math.round(tokens / wins.length).toLocaleString("en-US")} per win)` : ""}` : ""}`,
-    `- Guardrails: ${spec.guardrail.map((g) => `${g.name} at most ${magnitudePct(g.max_regression, 1)} worse per promotion`).join(", ") || "none"}${spec.oracle.holdout ? " · holdout: configured (results private)" : ""}`,
+    `- Guardrails: ${spec.guardrail.map((g) => `${g.name} at most ${magnitudePct(g.max_regression, 1)} worse per promotion and ${magnitudePct(g.max_total_regression ?? g.max_regression, 1)} in total against the segment base`).join(", ") || "none"}${spec.oracle.holdout ? " · holdout: configured (results private)" : ""}`,
     "",
     "## Trajectory",
     "",
@@ -198,6 +200,7 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
     const finding = store.findings(study.id, { limit: 200 }).find((f) => f.candidate_id === c.id);
     lines.push(`- c/${c.n} ${mdText(titles.get(c.idea_id ?? -1) ?? "", 100)}: **${c.verdict}** ${signedPct(c.effect)}${reasons[0] ? ` — ${mdText(reasons[0], 200)}` : ""}${finding ? `. Learned: ${mdText(finding.learned, 300)}` : ""}`);
   }
+  if (spec.guardrail.length) lines.push("", ...guardrailSection(ctx, study, spec));
   lines.push("", "## Dossier", "");
   const dossier = store.dossier(study.id);
   lines.push(dossier ? clip(dossier.text, 8000) : "No dossier was written.");
@@ -236,9 +239,80 @@ export function harvestSection(ctx: Ctx, study: StudyRow, spec: StudySpec, h: Ha
   const drop = cs.filter((c) => c.droppable);
   if (drop.length) lines.push("", `Droppable (no measurable contribution; the human decides): ${drop.map((c) => `#${c.k} ${mdText(c.title, 60)}`).join(", ")}.`);
   lines.push("", "### Sum of contributions vs total gain", "", ...accountingText(accountingFor(ctx, h), spec));
+  if (spec.guardrail.length) lines.push("", ...harvestGuardrailLines(ctx, study, spec, h, cs));
   const vb = vsBaseFromVsBest(h.total_effect, spec.metric.direction);
   if (vb !== null) lines.push(`- For the record: relative to best the total gain is ${pct(h.total_effect)}; relative to base it is ${improvementText(vb, metricOf(spec))}.`);
   lines.push(`- Harvest bench time: ${formatDuration(h.bench_seconds)}.`);
+  return lines;
+}
+
+/**
+ * The study's guardrails: each one's cumulative position (best vs the
+ * segment base, compounded over the promotion chain with a CI), the room
+ * left under its total limit, every promotion's step, the candidates it
+ * rejected or flagged, and its calibrated noise.
+ */
+export function guardrailSection(ctx: Ctx, study: StudyRow, spec: StudySpec): string[] {
+  const { store } = ctx;
+  const positions = bestGuardrailPositions(store, study, spec);
+  const seg = store.segment(study.id, study.segment);
+  const chain = promotionChain(store.candidates(study.id, { stages: ["decided"] }), seg?.baseline_sha ?? study.base_sha, study.best_sha);
+  const calibration = new Map(segmentGuardrailCalibration(store, study).map((g) => [g.name, g] as const));
+  const decided = store.decided(study.id, 5000);
+  const lines = [
+    `## Guardrails (segment ${study.segment})`,
+    "",
+    "Each win is checked twice: against the best before it (per-step limit) and, compounded with every promotion since the segment base, against that base (total limit). Both are judged on a CI: a guardrail breaks only when the whole CI is beyond a limit, and is flagged inconclusive when the CI straddles it.",
+    "",
+  ];
+  for (const g of spec.guardrail) {
+    const total = g.max_total_regression ?? g.max_regression;
+    const pos = positions[g.name] ?? null;
+    const cal = calibration.get(g.name);
+    lines.push(`### ${g.name} (${g.direction} is better; ${magnitudePct(g.max_regression, 1)} per step, ${magnitudePct(total, 1)} total)`, "");
+    lines.push(`- Best vs the segment base: ${pos && pos.steps ? `${changeWords(pos.regression)}${rangeWords(pos.lo, pos.hi) ? ` (${rangeWords(pos.lo, pos.hi)})` : ""}, compounded over ${pos.steps} promotion(s)${pos.missing ? `, ${pos.missing} without a measurement` : ""}` : "no promotion yet"}.`);
+    lines.push(`- Headroom: ${headroomWords(g.name, pos, total)}.`);
+    if (cal) lines.push(`- Calibration: ${cal.text}.`);
+    if (chain.length) {
+      lines.push("", "| Promotion | Step vs best | CI | Best vs base after |", "|---|---|---|---|");
+      for (const c of chain) {
+        const m = safeJson<StoredGuardrails>(c.metrics_json);
+        const e = storedEstimate(m, g.name);
+        const j = m?.guardrailJudgement?.[g.name];
+        lines.push(`| c/${c.n} | ${e ? changeWords(e.regression) : "not measured"} | ${e ? rangeWords(e.lo, e.hi) || "—" : "—"} | ${j?.total ? changeWords(j.total.regression) : "—"} |`);
+      }
+      lines.push("");
+    }
+    const judged = decided
+      .map((c) => ({ c, j: safeJson<StoredGuardrails>(c.metrics_json)?.guardrailJudgement?.[g.name] as GuardrailJudgement | undefined }))
+      .filter((x) => x.j && (x.j.state === "broken" || x.j.state === "inconclusive"));
+    const rejected = judged.filter((x) => x.j!.state === "broken" && x.c.verdict === "lose" && /^(initial )?primary metric improved/u.test((safeJson<string[]>(x.c.reasons_json) ?? [])[0] ?? ""));
+    const flagged = judged.filter((x) => x.j!.state === "inconclusive" && x.c.verdict === "win");
+    if (rejected.length) lines.push(`- Wins it rejected: ${rejected.map((x) => `c/${x.c.n} (${mdText(x.j!.text.replace(/^guardrail [^:]+: /u, ""), 220)})`).join("; ")}.`);
+    if (flagged.length) lines.push(`- Promotions flagged inconclusive on it: ${flagged.map((x) => `c/${x.c.n}`).join(", ")}.`);
+  }
+  return lines;
+}
+
+/** Harvest: what the whole study and each changeset cost each guardrail, measured by ablation (relative to best). */
+function harvestGuardrailLines(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow, cs: ChangesetRow[]): string[] {
+  const chain = bestGuardrailPositions(ctx.store, study, spec);
+  const total = safeJson<Record<string, GuardrailCost>>(h.total_guardrails_json);
+  const per = cs.map((c) => ({ c, g: safeJson<Record<string, GuardrailCost>>(c.guardrails_json) }));
+  if (!total && !per.some((x) => x.g)) return [];
+  const lines = ["### Guardrails at harvest", "", "Measured with the harvest's own pairs: the base against best, and best with each changeset reverted against best. A cost is relative to best; positive means the changes make the guardrail worse."];
+  for (const g of spec.guardrail) {
+    const t = total?.[g.name];
+    const vsBase = t ? invertRegression(-t.value, g.direction) : null;
+    // The cost's CI maps to best-vs-base monotonically (decreasing in the base's regression against best).
+    const vsBaseCi = t && t.lo !== null && t.hi !== null ? rangeWords(invertRegression(-t.lo, g.direction), invertRegression(-t.hi, g.direction)) : "";
+    const pos = chain[g.name];
+    const verdicts = pos && pos.steps ? `; the verdicts' compounded estimate was ${changeWords(pos.regression)}${rangeWords(pos.lo, pos.hi) ? ` (${rangeWords(pos.lo, pos.hi)})` : ""}` : "";
+    const parts = per.filter((x) => x.g?.[g.name]).map((x) => `#${x.c.k} ${changeWords(x.g![g.name]!.value)}${rangeWords(x.g![g.name]!.lo, x.g![g.name]!.hi) ? ` (${rangeWords(x.g![g.name]!.lo, x.g![g.name]!.hi)})` : ""}`);
+    lines.push(
+      `- ${g.name}: ${t && vsBase !== null ? `best: ${relativeWords(vsBase, "base")}${vsBaseCi ? ` (${vsBaseCi})` : ""}, measured directly (total limit ${magnitudePct(g.max_total_regression ?? g.max_regression, 1)})${verdicts}` : "base vs best not measured"}${parts.length ? `; per changeset: ${parts.join(", ")}` : ""}.`,
+    );
+  }
   return lines;
 }
 

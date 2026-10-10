@@ -320,10 +320,11 @@ describe("M2 remote bench (fake hosts)", () => {
     expect(c.verdict).toBe("lose");
     const reasons = JSON.parse(c.reasons_json!) as string[];
     expect(reasons[0]).toContain("primary metric improved");
-    expect(reasons.some((r) => /guardrail rss regressed 30\.00% \(limit 5\.00%\)/u.test(r))).toBe(true);
+    expect(reasons.some((r) => /guardrail rss: 30\.0% worse than best.*beyond the 5\.0% limit; 30\.0% worse than the segment base.*beyond the 5\.0% total limit/u.test(r))).toBe(true);
     const msg = port.sent.filter((m) => m.threadId === "thr_w1").at(-1)!.text;
     expect(msg).toContain("LOSE");
-    expect(msg).toContain("Guardrails vs best: rss 30.00% worse (limit 5.00% worse) BROKEN");
+    expect(msg).toContain("Broke guardrail rss.");
+    expect(msg).toMatch(/Guardrails \(per step vs best; in total vs the segment base, with this candidate\): rss 30\.0% worse than best \(limit 5\.0%\) BROKEN; 30\.0% worse than the segment base \(total limit 5\.0%\) BROKEN/u);
     // Within the limit it is a win.
     edit.rss.set("TB", 103);
     await submit("thr_w2", "TB", 700);

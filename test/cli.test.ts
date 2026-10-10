@@ -99,6 +99,10 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     expect(await json(["harvest", "toy-size"])).not.toHaveProperty("message");
     const archived = await json(["archive", "toy-size"]);
     expect(archived).toMatchObject({ ok: true, study: { state: "archived" } });
+    expect(port.threads.get("thr_study")!.archivedAt).toBeNull();
+    const withThread = await json(["archive", "toy-size", "--archive-thread"]);
+    expect(withThread.message).toContain("its study thread is archived now");
+    expect(port.threads.get("thr_study")!.archivedAt).not.toBeNull();
   });
 
   it("errors: the SDK envelope with --json, and a hint that says what to run next", async () => {
@@ -139,7 +143,8 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     const show = (await cli(["show", "toy-size"])).stdout;
     expect(show).toMatch(/Best vs base:\s+20\.0% lower size · 1,000 → 800 bytes/u);
     expect(show).toContain("c/1 win +20.0% · idea #1");
-    expect(show).toContain("rss (limit 5.0% worse)");
+    expect(show).toContain("rss (limit 5.0% worse per step, 5.0% in total)");
+    expect(show).toContain("rss: all of the 5.0% total limit left");
     expect(show).not.toContain("+20.00%");
     const list = (await cli(["list"])).stdout.split("\n");
     expect(list[0]).toMatch(/^SLUG\s+STATE\s+NEEDS YOU\s+BEST VS BASE\s+CANDIDATES\s+BENCH$/u);

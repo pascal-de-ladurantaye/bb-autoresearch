@@ -75,6 +75,11 @@ export const snapshotInput = z
      * diffed (and scope-checked) against that best, not its original fork.
      */
     bestSha: sha.optional(),
+    /**
+     * `[scope] ignore` patterns (gitignore-style): untracked files matching
+     * them are never committed. Changes to tracked files always are.
+     */
+    ignore: z.array(z.string().min(1).max(200)).max(64).optional(),
   })
   .strict();
 export const snapshotOutput = z
@@ -84,6 +89,10 @@ export const snapshotOutput = z
     forkSha: sha.optional(),
     committed: z.boolean(),
     changedPaths: z.array(z.string()),
+    /** Paths the candidate adds relative to the fork point (the scope check rejects ignored ones). */
+    addedPaths: z.array(z.string()).optional(),
+    /** Untracked files the snapshot left out because they match `ignore` (at most 200). */
+    ignoredPaths: z.array(z.string()).optional(),
     linesAdded: z.number().int(),
     linesDeleted: z.number().int(),
   })

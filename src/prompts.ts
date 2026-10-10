@@ -5,6 +5,7 @@ import type { CandidateRow, FindingRow, IdeaRow, StudyRow, ThreadRow } from "./d
 import { formatPct, type StudySpec } from "./spec.ts";
 import type { RoundTrigger } from "./scheduler.ts";
 import { ciText as ciRange, improvementText, type MetricInfo } from "./present.ts";
+import { changeWords, headroom, headroomWords, rangeWords, relativeWords, type GuardrailJudgement, type Position } from "./guardrails.ts";
 
 /**
  * A message for an agent thread: a short `summary` a human skimming the
@@ -54,6 +55,9 @@ function scopeBlock(spec: StudySpec): string {
     `- Editable: ${spec.scope.editable.map((g) => `\`${g}\``).join(", ")}`,
     `- Protected (never touch): ${spec.scope.protected.length ? spec.scope.protected.map((g) => `\`${g}\``).join(", ") : "none"}`,
     `- Diff limits: ${spec.scope.max_files} files, ${spec.scope.max_lines} changed lines vs best`,
+    ...(spec.scope.ignore?.length
+      ? [`- Never committed (build outputs and caches): ${spec.scope.ignore.slice(0, 16).map((g) => `\`${g}\``).join(", ")}. The snapshot leaves untracked files matching these out; a candidate that adds one anyway is rejected.`]
+      : []),
   ].join("\n");
 }
 
@@ -65,6 +69,14 @@ export interface BriefInput {
   bestDiag: string[];
   relatedFindings: Array<FindingRow & { title?: string | null }>;
   mde: number | null;
+  /** Best's position per guardrail against the segment base (remaining room under the total limit). */
+  guardrailPositions?: Record<string, Position>;
+}
+
+/** One line per guardrail: the room left under its total limit against the segment base. */
+export function headroomLines(spec: StudySpec, positions: Record<string, Position> | undefined): string[] {
+  if (!positions) return [];
+  return spec.guardrail.map((g) => headroomWords(g.name, positions[g.name] ?? null, g.max_total_regression ?? g.max_regression));
 }
 
 export function workerBrief(b: BriefInput): string {
@@ -79,7 +91,10 @@ export function workerBrief(b: BriefInput): string {
     quoted(spec.study.objective, 1500),
     "",
     `Primary metric: ${metric}.${b.mde !== null ? ` A win must clear about ${formatPct(b.mde)} with confidence.` : ""}`,
-    spec.guardrail.length ? `Guardrails (a win that breaks one is a lose): ${spec.guardrail.map((g) => `${g.name} max ${formatPct(g.max_regression)} worse`).join(", ")}.` : "",
+    spec.guardrail.length
+      ? `Guardrails (a win that breaks one is a lose): ${spec.guardrail.map((g) => `${g.name} at most ${pctAbs(g.max_regression)} worse than best per step and ${pctAbs(g.max_total_regression ?? g.max_regression)} worse than the segment base in total`).join("; ")}. Each is judged on a CI: it breaks only when the whole CI is beyond a limit.`
+      : "",
+    ...(b.guardrailPositions && spec.guardrail.length ? [`Guardrail headroom now: ${headroomLines(spec, b.guardrailPositions).join("; ")}.`] : []),
     spec.oracle.holdout ? "A win must also pass a hidden holdout workload on the bench host before it is promoted. You only learn pass or fail; do not special-case the benchmark input." : "",
     "",
     "## Scope (enforced at submission)",
@@ -119,9 +134,9 @@ export function workerBrief(b: BriefInput): string {
   return lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
 }
 
-export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number; spec: StudySpec }): AgentMessage {
+export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number; spec: StudySpec; guardrailPositions?: Record<string, Position> }): AgentMessage {
   const reasons = safeJson<string[]>(c.reasons_json) ?? [];
-  const metrics = safeJson<{ best?: Record<string, number>; candidate?: Record<string, number>; guardrails?: Record<string, number> }>(c.metrics_json);
+  const metrics = safeJson<{ best?: Record<string, number>; candidate?: Record<string, number>; guardrails?: Record<string, number>; guardrailJudgement?: Record<string, GuardrailJudgement> }>(c.metrics_json);
   const diag = safeJson<string[]>(c.diag_json) ?? [];
   const head: Record<string, string> = {
     win: "WIN: promoted to best",
@@ -133,7 +148,17 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
   };
   const metric = metricOf(opts.spec);
   const effect = c.effect === null ? "" : `, ${improvementText(c.effect, metric, { digits: 1, factor: false })} than best${c.ci_lo !== null && c.ci_hi !== null && c.ci_lo !== c.ci_hi ? ` (${ciRange(c.ci_lo, c.ci_hi)})` : ""}`;
-  const summary = `[autoresearch] Verdict for c/${c.n}: ${head[c.verdict ?? ""] ?? c.verdict}${effect}.${reasons[0] && c.verdict !== "win" ? ` ${clip(reasons[0], 160)}` : ""}`;
+  const judged = Object.values(metrics?.guardrailJudgement ?? {});
+  const flagged = judged.filter((g) => g.state === "inconclusive").map((g) => g.name);
+  const brokeOnly = judged.filter((g) => g.state === "broken" || g.state === "missing").map((g) => g.name);
+  // The human-visible line stays short: guardrail names only; the details are in the agent-only block.
+  const guardrailNote = brokeOnly.length && c.verdict === "lose" && /^(initial )?primary metric improved/u.test(reasons[0] ?? "")
+    ? ` Broke guardrail ${brokeOnly.join(", ")}.`
+    : flagged.length && c.verdict === "win"
+      ? ` Guardrail ${flagged.join(", ")} inconclusive (flagged).`
+      : "";
+  const firstReason = reasons[0] && c.verdict !== "win" && !guardrailNote ? ` ${clip(reasons[0], 160)}` : "";
+  const summary = `[autoresearch] Verdict for c/${c.n}: ${head[c.verdict ?? ""] ?? c.verdict}${effect}.${firstReason}${guardrailNote}`;
   const lines = [`Effect (better is positive): ${c.effect !== null ? ciText(c) : "not measured"}`];
   for (const r of reasons.slice(0, 8)) lines.push(`- ${clip(r, 400)}`);
   if (metrics?.best && metrics.candidate) {
@@ -143,13 +168,26 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
   }
   if (metrics?.guardrails && opts.spec.guardrail.length) {
     const parts = opts.spec.guardrail.map((g) => {
+      const j = metrics.guardrailJudgement?.[g.name];
       const r = metrics.guardrails?.[g.name];
       if (r === undefined || r === null || Number.isNaN(r)) return `${g.name} missing`;
-      const abs = `${(Math.abs(r) * 100).toFixed(2)}%`;
-      return `${g.name} ${r > 0 ? `${abs} worse` : `${abs} better`} (limit ${(g.max_regression * 100).toFixed(2)}% worse) ${r > g.max_regression ? "BROKEN" : "ok"}`;
+      if (!j?.step || !j.total) return `${g.name} ${changeWords(r)} (limit ${pctAbs(g.max_regression)} worse) ${r > g.max_regression ? "BROKEN" : "ok"}`;
+      const ci = (x: { lo: number | null; hi: number | null }) => {
+        const t = rangeWords(x.lo, x.hi);
+        return t ? `, ${t}` : "";
+      };
+      return (
+        `${g.name} ${relativeWords(j.step.regression, "best")}${ci(j.step)} (limit ${pctAbs(j.step.limit)}) ${STATE[j.step.state]}; ` +
+        `${relativeWords(j.total.regression, "the segment base")}${ci(j.total)} (total limit ${pctAbs(j.total.limit)}) ${STATE[j.total.state]}`
+      );
     });
-    lines.push(`Guardrails vs best: ${parts.join("; ")}`);
+    lines.push(`Guardrails (per step vs best; in total vs the segment base, with this candidate): ${parts.join(" · ")}`);
+    if (judged.some((g) => g.state === "inconclusive")) {
+      lines.push("An inconclusive guardrail is not a rejection: its CI straddles the limit. It is flagged so the strategist and the human see it; another change that adds to it may be rejected.");
+    }
   }
+  const room = headroomLines(opts.spec, opts.guardrailPositions);
+  if (room.length) lines.push(`Guardrail headroom now (best vs the segment base): ${room.join("; ")}.`);
   if (c.gate_output) lines.push("Gate output (tail):", "```", clip(c.gate_output, 2500), "```");
   if (diag.length) lines.push("Diagnostics:", "```", clip(diag.join("\n"), 1500), "```");
   if (c.verdict === "conflict") {
@@ -186,6 +224,8 @@ export interface DigestInput {
   budgetLine: string;
   ideaTitles: Map<number, string>;
   notices: Array<{ at: number; kind: string; text: string }>;
+  /** Best's position per guardrail against the segment base. */
+  guardrailPositions?: Record<string, Position>;
 }
 
 const TRIGGER_TEXT: Record<RoundTrigger, string> = {
@@ -203,19 +243,34 @@ export function strategistDigest(d: DigestInput): AgentMessage {
   for (const i of d.ideas) counts.set(i.status, (counts.get(i.status) ?? 0) + 1);
   const metric = metricOf(d.spec);
   const wins = d.verdicts.filter((c) => c.verdict === "win");
+  // Guardrails with less than a fifth of their total limit left (only these reach the human-visible line).
+  const tight = d.spec.guardrail
+    .filter((g) => {
+      const pos = d.guardrailPositions?.[g.name];
+      const limit = g.max_total_regression ?? g.max_regression;
+      return pos && pos.steps > 0 && headroom(pos, limit).point < 0.2 * limit;
+    })
+    .map((g) => g.name);
   const verdictSummary = d.verdicts.length
     ? `${d.verdicts.length} new verdict${d.verdicts.length === 1 ? "" : "s"} (${[...new Set(d.verdicts.map((c) => c.verdict))].map((v) => `${d.verdicts.filter((c) => c.verdict === v).length} ${v}`).join(", ")})`
     : "no new verdicts";
   const summary =
     `[autoresearch] Strategist round ${d.round} (${TRIGGER_TEXT[d.trigger]}): ${verdictSummary}` +
     `${wins.length ? `, best now ${improvementText(d.cumulative, metric)} vs base` : d.cumulative !== null ? `, best ${improvementText(d.cumulative, metric)} vs base` : ""}` +
-    ` · ${queued.length} idea${queued.length === 1 ? "" : "s"} queued · ${d.workers.length} worker${d.workers.length === 1 ? "" : "s"}${d.notices.length ? ` · ${d.notices.length} notice${d.notices.length === 1 ? "" : "s"} for you on the Studies page` : ""}.`;
+    ` · ${queued.length} idea${queued.length === 1 ? "" : "s"} queued · ${d.workers.length} worker${d.workers.length === 1 ? "" : "s"}${d.notices.length ? ` · ${d.notices.length} notice${d.notices.length === 1 ? "" : "s"} for you on the Studies page` : ""}` +
+    `${tight.length ? ` · guardrail ${tight.join(", ")} near its total limit` : ""}.`;
   const lines = [
     `Strategist round ${d.round} · study \`${d.study.slug}\` · trigger: ${TRIGGER_TEXT[d.trigger]}`,
     "",
     `Objective: ${quoted(d.spec.study.objective, 400)}`,
     `Metric: ${d.spec.metric.name} (${d.spec.metric.direction} is better) · best vs base: ${d.cumulative === null ? "no promotion yet" : formatPct(d.cumulative)} · state: ${d.study.state} · workers: ${d.workers.length}/${d.w}`,
     `Budget: ${d.budgetLine}`,
+    ...(d.spec.guardrail.length && d.guardrailPositions
+      ? [
+          `Guardrail headroom (total limit vs the segment base; a win that would push best beyond it is rejected): ${headroomLines(d.spec, d.guardrailPositions).join("; ")}.`,
+          ...(tight.length ? [`Little room left on ${tight.join(", ")}: prefer ideas that don't cost them, or that win some of it back.`] : []),
+        ]
+      : []),
     "",
   ];
   if (d.notices.length) {
@@ -266,6 +321,9 @@ export function safeJson<T>(text: string | null): T | null {
     return null;
   }
 }
+
+const STATE: Record<string, string> = { ok: "ok", inconclusive: "INCONCLUSIVE", broken: "BROKEN" };
+const pctAbs = (f: number) => `${(Math.abs(f) * 100).toFixed(1)}%`;
 
 function fmtNum(v: number | undefined): string {
   if (v === undefined) return "n/a";

@@ -6,10 +6,11 @@ import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type { NeedsYouItem, OverviewResult } from "../views.ts";
 import type { Rpc } from "./data.ts";
 import { ago, duration, frac } from "./format.ts";
-import { Callout, ConfirmDialog, Mono } from "./ui.tsx";
+import { Callout, ConfirmDialog, FOCUS_RING, Mono } from "./ui.tsx";
 
 type Tab = "overview" | "ideas" | "candidates" | "findings" | "oracle" | "bench" | "harvest";
 
@@ -124,6 +125,8 @@ export function HarvestDialog({ slug, promotions, restart, rpc, open, onOpenChan
 }
 
 export function ArchiveDialog({ slug, rpc, open, onOpenChange, onDone }: { slug: string; rpc: Rpc; open: boolean; onOpenChange: (v: boolean) => void; onDone: () => void }) {
+  // The study thread is the conversation that created the study; once the study ends it has nothing left to do.
+  const [archiveThread, setArchiveThread] = useState(true);
   return (
     <ConfirmDialog
       open={open}
@@ -133,7 +136,7 @@ export function ArchiveDialog({ slug, rpc, open, onOpenChange, onDone }: { slug:
       confirmLabel="Archive study"
       confirmVariant="destructive"
       onConfirm={async () => {
-        const r = await rpc.call("study.archive", { slug, confirm: true });
+        const r = await rpc.call("study.archive", { slug, confirm: true, archiveThread });
         toast.success(r.message.split("\n")[0] ?? r.message);
         onDone();
       }}
@@ -141,12 +144,17 @@ export function ArchiveDialog({ slug, rpc, open, onOpenChange, onDone }: { slug:
       <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
         <li>Live workers stop and their threads are archived; a running harvest is cancelled.</li>
         <li>Bench checkouts and bench clones are removed.</li>
+        <li>{archiveThread ? "The study thread is archived too." : "The study thread stays in the sidebar."}</li>
         <li>
           Kept: every candidate ref (<Mono>refs/studies/{slug}/c/*</Mono>), the best branch <Mono>studies/{slug}/best</Mono>, harvest branches and exports, and the study's history on this page.
         </li>
       </ul>
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" className={cn("size-4 rounded", FOCUS_RING)} checked={archiveThread} onChange={(e) => setArchiveThread(e.target.checked)} />
+        Also archive the study thread
+      </label>
       <p className="text-xs text-muted-foreground">
-        CLI equivalent: <Mono>bb study archive {slug}</Mono>
+        CLI equivalent: <Mono>bb study archive {slug}{archiveThread ? " --archive-thread" : ""}</Mono>
       </p>
     </ConfirmDialog>
   );

@@ -319,9 +319,13 @@ describe("operations on a running study (fake host)", () => {
     engine.harvester.cancel(h.id);
     store.updateChangeset(c1.id, { ablation_status: "measured", contribution: 0.05, ci_lo: 0.04, ci_hi: 0.06 });
     store.updateChangeset(c2.id, { ablation_status: "measured", contribution: 0.05, ci_lo: 0.04, ci_hi: 0.06 });
-    store.updateHarvest(h.id, { state: "ready", total_effect: 0.2, total_ci_lo: 0.19, total_ci_hi: 0.21 });
+    store.updateHarvest(h.id, { state: "ready", total_effect: 0.2, total_ci_lo: 0.19, total_ci_hi: 0.21, total_guardrails_json: JSON.stringify({ rss: { value: 0.04, lo: 0.03, hi: 0.05, n: 6 } }) });
+    store.updateChangeset(c1.id, { guardrails_json: JSON.stringify({ rss: { value: 0.03, lo: 0.02, hi: 0.04, n: 6 } }) });
     const text = harvestSection(engine.ctx, store.study(id)!, store.spec(store.study(id)!), store.harvest(h.id)!).join("\n");
     expect(text).toContain("Interaction warning");
+    // Guardrails at harvest: the whole study's cost (base vs best, measured directly) and each changeset's, relative to best.
+    expect(text).toContain("### Guardrails at harvest");
+    expect(text).toMatch(/- rss: best: 4\.2% worse than base \(CI 3\.1% to 5\.3% worse\), measured directly \(total limit 5\.0%\); per changeset: #1 3\.0% worse \(CI 2\.0% to 4\.0% worse\)\./u);
     // 0.1 of a 0.2 total: half the gain, in shares (the convention), not raw relative-to-best numbers.
     expect(text).toContain("Explained by the 2 measured term(s): 50.0% of the gain");
     expect(text).toContain("| 1 | One | c/1 | 25.0% of the gain (CI 20.0% to 30.0%)");

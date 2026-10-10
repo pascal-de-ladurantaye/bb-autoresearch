@@ -89,7 +89,7 @@ export const rpcContract = defineRpcContract({
   /** Human control: keep or drop a changeset when publishing. */
   "study.harvest.choice": { input: z.object({ slug, harvestId: z.number().int().positive(), k: z.number().int().positive(), choice: z.enum(["keep", "drop"]).nullable() }).strict(), output: ok },
   /** Human control (confirmed): archive the study (stop workers, remove bench checkouts; refs are kept). */
-  "study.archive": { input: z.object({ slug, confirm: z.boolean().optional() }).strict(), output: ok },
+  "study.archive": { input: z.object({ slug, confirm: z.boolean().optional(), archiveThread: z.boolean().optional() }).strict(), output: ok },
   "study.pause": { input: z.object({ slug }).strict(), output: ok },
   "study.resume": { input: z.object({ slug }).strict(), output: ok },
   "study.concurrency": { input: z.object({ slug, maxWorkers: z.number().int().min(1).max(64).nullable() }).strict(), output: ok },
@@ -188,11 +188,11 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
       await engine.auditControl(slug, "harvest_choice", caller, `harvest h${harvestId} #${k}: ${choice ?? "choice cleared"}`, { harvest: harvestId, changeset: k, choice });
       return { ok: true, message };
     },
-    "study.archive": async ({ slug, confirm }, ctx) => {
+    "study.archive": async ({ slug, confirm, archiveThread }, ctx) => {
       const caller = humanOnly(ctx);
-      requireConfirm(confirm, `archives ${slug}: live workers stop, their threads are archived, bench checkouts and clones are removed (git refs and the best branch are kept)`);
-      await engine.auditControl(slug, "archive", caller, "study archived");
-      return { ok: true, message: await engine.archiveStudy(slug, ACTOR) };
+      requireConfirm(confirm, `archives ${slug}: live workers stop, their threads are archived, bench checkouts and clones are removed${archiveThread ? ", and the study thread is archived" : ""} (git refs and the best branch are kept)`);
+      await engine.auditControl(slug, "archive", caller, `study archived${archiveThread ? " with its study thread" : ""}`, { archiveThread: Boolean(archiveThread) });
+      return { ok: true, message: await engine.archiveStudy(slug, ACTOR, { archiveThread: Boolean(archiveThread) }) };
     },
     "study.harvest.start": async ({ slug, restart, onePerPromotion }, ctx) => {
       const caller = humanOnly(ctx);

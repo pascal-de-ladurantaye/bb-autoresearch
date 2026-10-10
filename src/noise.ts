@@ -1,6 +1,16 @@
 // Noise-class strategies behind one interface. The pipeline hands a strategy
 // a Bench (two prepared checkouts on one bench host) and gets back a
 // decision with an effect estimate; verdict.ts then applies guardrails.
+import {
+  calibratePairedGuardrail,
+  calibrateRepeatGuardrail,
+  calibrateRunsGuardrail,
+  estimateBand,
+  estimatePaired,
+  estimateRuns,
+  type GuardrailCalibration,
+  type GuardrailEstimate,
+} from "./guardrails.ts";
 import type { NoiseClass, StudySpec } from "./spec.ts";
 import {
   calibrateNoisy,
@@ -55,6 +65,8 @@ export interface MeasureContext {
   baseline?: RunResult[] | null;
   /** Calibrated per-run noise (expensive: σ of one run, relative). */
   noiseFloor?: number | null;
+  /** Calibrated guardrail noise by name (expensive: σ of one run; deterministic: the repeat difference). */
+  guardrailNoise?: Record<string, number> | null;
   signal?: AbortSignal;
 }
 
@@ -67,8 +79,10 @@ export interface MeasureOutcome {
   ciLo: number | null;
   ciHi: number | null;
   n: number;
-  /** Per guardrail: median relative regression, positive = worse. */
+  /** Per guardrail: median relative regression, positive = worse (the point of `guardrailEstimates`). */
   guardrails: Record<string, number>;
+  /** Per guardrail: the regression with its CI (see guardrails.ts). Absent in outcomes built by hand (tests): the point is used. */
+  guardrailEstimates?: Record<string, GuardrailEstimate>;
   bestMetrics: Record<string, number>;
   candidateMetrics: Record<string, number>;
   bestDiag: string[];
@@ -102,6 +116,8 @@ export interface CalibrationOutcome {
   bestRun: RunResult | null;
   /** expensive: every baseline run (the bench host's baseline for the segment). */
   baselineRuns?: RunResult[];
+  /** Per guardrail: A/A noise and the CI half-width a typical evaluation gets. */
+  guardrails?: GuardrailCalibration[];
 }
 
 export interface NoiseStrategy {
@@ -116,8 +132,9 @@ function checkAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("measurement aborted");
 }
 
-function guardrailRegressions(spec: StudySpec, pairs: Array<{ best: Record<string, number>; candidate: Record<string, number> }>): Record<string, number> {
-  const out: Record<string, number> = {};
+/** Per-pair regressions of each guardrail (positive = worse). */
+function pairedRegressions(spec: StudySpec, pairs: Array<{ best: Record<string, number>; candidate: Record<string, number> }>): Record<string, number[]> {
+  const out: Record<string, number[]> = {};
   for (const g of spec.guardrail) {
     const values: number[] = [];
     for (const p of pairs) {
@@ -126,9 +143,13 @@ function guardrailRegressions(spec: StudySpec, pairs: Array<{ best: Record<strin
       if (b === undefined || c === undefined) continue;
       values.push(-improvement(b, c, g.direction));
     }
-    out[g.name] = values.length ? median(values) : Number.NaN;
+    out[g.name] = values;
   }
   return out;
+}
+
+function points(estimates: Record<string, GuardrailEstimate>): Record<string, number> {
+  return Object.fromEntries(Object.entries(estimates).map(([k, e]) => [k, e.regression]));
 }
 
 function medianMetrics(runs: Array<Record<string, number>>): Record<string, number> {
@@ -155,6 +176,7 @@ export const noisyStrategy: NoiseStrategy = {
       await ctx.bench.run("candidate");
     }
     const improvements: number[] = [];
+    const aaPairs: Array<{ best: Record<string, number>; candidate: Record<string, number> }> = [];
     let pairMs = 0;
     let bestRun: RunResult | null = null;
     for (let i = 0; i < p.calibration_pairs; i++) {
@@ -168,8 +190,13 @@ export const noisyStrategy: NoiseStrategy = {
         ctx.record({ pair: i, side, metrics: r.metrics });
       }
       bestRun = runs.best!;
+      aaPairs.push({ best: runs.best!.metrics, candidate: runs.candidate!.metrics });
       improvements.push(improvement(runs.best!.metrics[metric.name]!, runs.candidate!.metrics[metric.name]!, metric.direction));
     }
+    const aaGuardrails = pairedRegressions(ctx.spec, aaPairs);
+    const guardrails = ctx.spec.guardrail
+      .map((g) => calibratePairedGuardrail(g, aaGuardrails[g.name] ?? [], { nMax: p.n_max, confidence: p.confidence, iterations: p.bootstrap, rng: ctx.rng }))
+      .filter((x): x is GuardrailCalibration => x !== null);
     const stats = calibrateNoisy(improvements, {
       nMax: p.n_max,
       confidence: p.confidence,
@@ -203,6 +230,7 @@ export const noisyStrategy: NoiseStrategy = {
         secondsPerPair,
       },
       bestRun,
+      guardrails,
     };
   },
   async measure(ctx) {
@@ -238,13 +266,16 @@ export const noisyStrategy: NoiseStrategy = {
       if (last.decision !== "continue") break;
     }
     const decision = last && last.decision !== "continue" ? last.decision : "inconclusive";
+    const perPair = pairedRegressions(ctx.spec, pairs.map((x) => ({ best: x.best.metrics, candidate: x.candidate.metrics })));
+    const guardrailEstimates = Object.fromEntries(ctx.spec.guardrail.map((g) => [g.name, estimatePaired(perPair[g.name] ?? [], p.confidence, p.bootstrap, ctx.rng)]));
     return {
       decision,
       effect: last?.ci.median ?? Number.NaN,
       ciLo: last && Number.isFinite(last.ci.lo) ? last.ci.lo : null,
       ciHi: last && Number.isFinite(last.ci.hi) ? last.ci.hi : null,
       n: pairs.length,
-      guardrails: guardrailRegressions(ctx.spec, pairs.map((x) => ({ best: x.best.metrics, candidate: x.candidate.metrics }))),
+      guardrails: points(guardrailEstimates),
+      guardrailEstimates,
       bestMetrics: medianMetrics(pairs.map((x) => x.best.metrics)),
       candidateMetrics: medianMetrics(pairs.map((x) => x.candidate.metrics)),
       bestDiag: pairs.at(-1)?.best.diag ?? [],
@@ -267,6 +298,9 @@ export const deterministicStrategy: NoiseStrategy = {
     const diff = Math.abs(improvement(a.metrics[metric.name]!, b.metrics[metric.name]!, metric.direction));
     const problems = diff > tol ? [`two runs of the baseline differ by ${fmt(diff)} (> tolerance ${fmt(tol)}): the metric is not deterministic; use noise = "noisy"`] : [];
     const evalSeconds = (a.durationMs + b.durationMs) / 2 / 1000;
+    const guardrails = ctx.spec.guardrail
+      .map((g) => calibrateRepeatGuardrail(g, a.metrics[g.name], b.metrics[g.name], tol))
+      .filter((x): x is GuardrailCalibration => x !== null);
     return {
       ok: problems.length === 0,
       problems,
@@ -276,6 +310,7 @@ export const deterministicStrategy: NoiseStrategy = {
       report: `Deterministic: baseline ${metric.name}=${a.metrics[metric.name]}${ctx.spec.metric.unit ? ` ${ctx.spec.metric.unit}` : ""}, repeat differs by ${fmt(diff)}. A candidate wins when it is better by more than ${fmt(tol)}. About ${duration(evalSeconds)} per evaluation.`,
       details: { baseline: a.metrics[metric.name]!, repeatDiff: diff },
       bestRun: a,
+      guardrails,
     };
   },
   async measure(ctx) {
@@ -284,14 +319,20 @@ export const deterministicStrategy: NoiseStrategy = {
     ctx.record({ pair: 0, side: "best", metrics: best.metrics });
     const cand = await ctx.bench.run("candidate");
     ctx.record({ pair: 0, side: "candidate", metrics: cand.metrics });
-    const { decision, effect } = deterministicDecision(best.metrics[metric.name]!, cand.metrics[metric.name]!, metric.direction, ctx.spec.oracle.protocol.tolerance);
+    const tol = ctx.spec.oracle.protocol.tolerance;
+    const { decision, effect } = deterministicDecision(best.metrics[metric.name]!, cand.metrics[metric.name]!, metric.direction, tol);
+    const perRun = pairedRegressions(ctx.spec, [{ best: best.metrics, candidate: cand.metrics }]);
+    const guardrailEstimates = Object.fromEntries(
+      ctx.spec.guardrail.map((g) => [g.name, estimateBand(perRun[g.name]?.[0] ?? Number.NaN, Math.max(tol, ctx.guardrailNoise?.[g.name] ?? 0))]),
+    );
     return {
       decision,
       effect,
       ciLo: effect,
       ciHi: effect,
       n: 1,
-      guardrails: guardrailRegressions(ctx.spec, [{ best: best.metrics, candidate: cand.metrics }]),
+      guardrails: points(guardrailEstimates),
+      guardrailEstimates,
       bestMetrics: best.metrics,
       candidateMetrics: cand.metrics,
       bestDiag: best.diag,
@@ -347,12 +388,16 @@ export const expensiveStrategy: NoiseStrategy = {
     const mde = Math.max(p.min_effect, z * noiseFloor * Math.sqrt(1 / k + 1 / runs.length));
     const evalSeconds = median(runs.map((r) => r.durationMs)) / 1000;
     const problems = mde > p.max_mde ? [`minimum detectable effect ${fmt(mde)} exceeds max_mde ${fmt(p.max_mde)}: the oracle is too noisy`] : [];
+    const guardrails = ctx.spec.guardrail
+      .map((g) => calibrateRunsGuardrail(g, runs.map((r) => r.metrics[g.name]).filter((v): v is number => v !== undefined), { k, t: z }))
+      .filter((x): x is GuardrailCalibration => x !== null);
     return {
       ok: problems.length === 0,
       problems,
       noiseFloor,
       mde,
       evalSeconds,
+      guardrails,
       report:
         `Expensive: ${runs.length} baseline runs, per-run noise ${fmt(noiseFloor)}. One screening run per candidate; a promising run is confirmed with ${k} more, ` +
         `and a win needs the confirmed mean above ${fmt(mde)}. About ${duration(evalSeconds)} per run (${duration(evalSeconds * (1 + k))} for a confirmed win).`,
@@ -400,13 +445,20 @@ export const expensiveStrategy: NoiseStrategy = {
     }
     const judged = confirmRuns.length ? confirmRuns : [screen];
     const candidateMetrics = medianMetrics(judged.map((r) => r.metrics));
+    const guardrailEstimates = Object.fromEntries(
+      ctx.spec.guardrail.map((g) => {
+        const of = (runs: RunResult[]) => runs.map((r) => r.metrics[g.name]).filter((v): v is number => v !== undefined);
+        return [g.name, estimateRuns(of(baseline), of(judged), g.direction, ctx.guardrailNoise?.[g.name] ?? null, z)];
+      }),
+    );
     return {
       decision,
       effect,
       ciLo: effect - half,
       ciHi: effect + half,
       n: 1 + confirmRuns.length,
-      guardrails: guardrailRegressions(ctx.spec, [{ best: bestMetrics, candidate: candidateMetrics }]),
+      guardrails: points(guardrailEstimates),
+      guardrailEstimates,
       bestMetrics,
       candidateMetrics,
       bestDiag: baseline.at(-1)!.diag,

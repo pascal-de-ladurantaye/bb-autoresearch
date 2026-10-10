@@ -182,6 +182,21 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(study().state).toBe("archived");
     expect(events("control.archive")).toHaveLength(1);
     expect(needsYou(engine, study())).toEqual([]);
+    // Without archiveThread the study thread stays.
+    expect(port.threads.get("thr_study")!.archivedAt).toBeNull();
+    // Asking again with archiveThread archives just the thread.
+    expect((await call("study.archive", { slug: "toy-size", confirm: true, archiveThread: true })).message).toBe("toy-size is already archived; its study thread is archived now.");
+    expect(port.threads.get("thr_study")!.archivedAt).not.toBeNull();
+  });
+
+  it("archive with the study thread: the confirmation says so, the thread is archived and stopped, and it is audited", async () => {
+    await expect(call("study.archive", { slug: "toy-size", archiveThread: true })).rejects.toThrow(/and the study thread is archived/u);
+    const r = await call("study.archive", { slug: "toy-size", confirm: true, archiveThread: true });
+    expect(r.message).toMatch(/archived: 0 worker\(s\) stopped, bench checkouts removed, study thread archived\./u);
+    expect(port.threads.get("thr_study")!.archivedAt).not.toBeNull();
+    expect(port.stopped).toContain("thr_study");
+    expect(events("study_thread.archived")).toHaveLength(1);
+    expect(JSON.parse(events("control.archive")[0]!.data_json)).toMatchObject({ archiveThread: true });
   });
 
   it("notices: new until seen, audit notices don't count, each kind names its action", async () => {

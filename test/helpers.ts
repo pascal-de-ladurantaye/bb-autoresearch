@@ -97,6 +97,8 @@ export class FakeHost implements HostRunner {
   /** Guardrail metric rss by tree id (default 100). */
   rss = new Map<string, number>();
   noise: () => number = () => 0;
+  /** Relative noise on the rss guardrail of every run. */
+  rssNoise: () => number = () => 0;
   gateFailures = new Map<string, number>(); // tree -> how many times the gate fails
   conflicts = new Set<string>();
   worktreeHead = new Map<string, string>();
@@ -292,7 +294,7 @@ export class FakeHost implements HostRunner {
     if (input.command.startsWith("measure")) {
       const v = this.metric.get(tree);
       if (v === undefined) return { exitCode: 2, timedOut: false, durationMs: 5, stdout: "", stderr: "no such tree" };
-      const rss = this.rss.get(tree) ?? 100;
+      const rss = (this.rss.get(tree) ?? 100) * (1 + this.rssNoise());
       return { exitCode: 0, timedOut: false, durationMs: 1000, stdout: `METRIC size=${v * (1 + this.noise())}\nMETRIC rss=${rss}\nDIAG tree=${tree}\n`, stderr: "" };
     }
     if (input.command.startsWith("holdout")) {
@@ -321,8 +323,11 @@ export class FakeHost implements HostRunner {
     this.maybeFail("deleteRef");
     return this.refs.delete(ref);
   }
+  /** Every snapshot call's input. */
+  snapshotInputs: SnapshotInput[] = [];
   async snapshot(input: SnapshotInput): Promise<SnapshotResult> {
     this.maybeFail("snapshot");
+    this.snapshotInputs.push(input);
     const next = this.nextSnapshotFor.get(input.worktreePath) ?? this.nextSnapshot;
     this.nextSnapshotFor.delete(input.worktreePath);
     const tree = next.tree ?? fakeSha();

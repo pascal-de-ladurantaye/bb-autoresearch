@@ -402,4 +402,7 @@ export const MIGRATIONS: string[] = [
   /** Human interface: the human's keep/drop choice on a changeset, and when the human last looked at the notices. */
   `ALTER TABLE changesets ADD COLUMN human_choice TEXT`,
   `ALTER TABLE studies ADD COLUMN notices_seen_at INTEGER`,
+  /** Guardrails at harvest: per guardrail, the cost of the whole study (base vs best) and of each changeset (ablation), relative to best. */
+  `ALTER TABLE harvests ADD COLUMN total_guardrails_json TEXT`,
+  `ALTER TABLE changesets ADD COLUMN guardrails_json TEXT`,
 ];

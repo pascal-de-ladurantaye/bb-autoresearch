@@ -120,11 +120,12 @@ describe("views: guardrail status (the one place the UI decides it)", () => {
   it("the verdict's recorded regression wins over the two medians", () => {
     expect(guardrailStatus({ ...base, reference: 100, value: 100, regression: 0.049 })).toMatchObject({ state: "warn" });
   });
-  it("has room for the follow-up's cumulative limit and CI", () => {
-    const s = guardrailStatus({ ...base, against: "base", reference: 100, value: 102, ci: { lo: 0.01, hi: 0.03 }, cumulative: { regression: 0.02, limit: 0.1 } });
-    expect(s.text).toContain("per promotion");
+  it("against the segment base: judged on the total limit with its CI", () => {
+    const s = guardrailStatus({ ...base, against: "base", totalLimit: 0.1, reference: 100, value: 102, ci: { lo: 0.01, hi: 0.03 } });
+    expect(s.text).toBe("2.0% worse vs the segment base (CI 1.0% to 3.0% worse; total limit 10.0% worse) · 5.0% per step");
     expect(s.ci).toEqual({ lo: 0.01, hi: 0.03 });
-    expect(s.cumulative).toEqual({ regression: 0.02, limit: 0.1 });
+    expect(s.cumulative).toMatchObject({ regression: 0.02, limit: 0.1, state: "ok", headroom: expect.closeTo(0.08, 9) });
+    expect(s).toMatchObject({ state: "pass", used: expect.closeTo(0.2, 9) });
   });
   it("worst state first", () => {
     expect(worstGuardrail([])).toBeNull();

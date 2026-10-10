@@ -11,7 +11,7 @@ import { Harvester, harvestReadyText } from "./harvest.ts";
 import { checkHealth } from "./health.ts";
 import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
 import { studyReport } from "./report.ts";
-import { BENCH_BOUND_STAGES, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
+import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
 import { ciText, compound, improvementText, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
 import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
@@ -635,9 +635,21 @@ export class Engine {
     return true;
   }
 
-  async archiveStudy(slug: string, actor: string): Promise<string> {
+  /**
+   * End a study: stop and archive its workers, cancel a harvest and in-flight
+   * measurements, remove bench checkouts and clones. With `archiveThread`, the
+   * study thread (the conversation that created it) is archived too; on an
+   * already archived study that is all it does.
+   */
+  async archiveStudy(slug: string, actor: string, opts: { archiveThread?: boolean } = {}): Promise<string> {
     const study = this.study(slug);
-    if (study.state === "archived") return `${slug} is already archived.`;
+    if (study.state === "archived") {
+      if (opts.archiveThread && study.study_thread_id) {
+        const archived = await this.archiveStudyThread(study);
+        return `${slug} is already archived${archived ? "; its study thread is archived now" : ""}.`;
+      }
+      return `${slug} is already archived.`;
+    }
     const harvest = this.store.latestHarvest(study.id);
     if (harvest) this.harvester.cancel(harvest.id);
     let stopped = 0;
@@ -670,8 +682,24 @@ export class Engine {
       for (const t of this.store.threads(study.id, { role: "strategist", states: ["active"] })) this.store.updateThread(t.id, { state: "finished", ended_at: this.ctx.now(), end_reason: "study archived" });
       this.store.setStudyState(study.id, "archived", actor);
     });
+    const threadArchived = opts.archiveThread ? await this.archiveStudyThread(s) : false;
     this.publish(study.id);
-    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed${clones ? `, ${clones} bench clone(s) deleted` : ""}. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
+    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed${clones ? `, ${clones} bench clone(s) deleted` : ""}${threadArchived ? ", study thread archived" : ""}. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
+  }
+
+  /** Archive (and stop) the study thread of an archived study; false when there is none or BB refused. */
+  private async archiveStudyThread(study: StudyRow): Promise<boolean> {
+    const id = study.study_thread_id;
+    if (!id) return false;
+    try {
+      await this.ctx.bb.archive(id);
+      await this.ctx.bb.stop(id).catch(() => undefined);
+      this.store.event(study.id, "study_thread.archived", "plugin", { thread: id });
+      return true;
+    } catch (e) {
+      this.ctx.bb.log("warn", `archive study thread ${id}: ${errText(e)}`);
+      return false;
+    }
   }
 
   addIdea(slug: string, idea: { title: string; rationale?: string; theme?: string; priority?: number; pinned?: boolean; startRef?: string | null; variationOf?: number | null }, actor: string, source: IdeaRow["source"] = "human"): IdeaRow {
@@ -1322,6 +1350,7 @@ export class Engine {
       bestDiag: bestRun?.diag ?? [],
       relatedFindings: related,
       mde: this.store.segment(study.id, study.segment)?.mde ?? null,
+      guardrailPositions: bestGuardrailPositions(this.store, study, spec),
     });
     try {
       const spawned = await this.ctx.bb.spawnWorker({
@@ -1479,6 +1508,7 @@ export class Engine {
       budgetLine: this.budgetLine(study, spec),
       ideaTitles: titles,
       notices,
+      guardrailPositions: bestGuardrailPositions(this.store, study, spec),
     });
     this.store.tx(() => {
       this.store.updateStudy(study.id, {
@@ -1670,5 +1700,6 @@ function calibrationNotice(study: StudyRow, report: CalibrationReport): string {
   if (!report.ok) {
     return `Calibration of \`${study.slug}\` failed; the study is back in Draft. Next: ask the study thread to revise the spec, then approve the new version on the Oracle tab (\`bb study calibrate ${study.slug}\`).\n${report.problems.map((p) => `- ${clip(p, 500)}`).join("\n")}`;
   }
-  return `Calibration of \`${study.slug}\` is ready. Next: review it and start the study on the Oracle tab (\`bb study start ${study.slug}\`).\n${report.report}`;
+  const warnings = (report.warnings ?? []).map((w) => `- Warning: ${clip(w, 500)}`).join("\n");
+  return `Calibration of \`${study.slug}\` is ready. Next: review it and start the study on the Oracle tab (\`bb study start ${study.slug}\`).\n${report.report}${warnings ? `\n${warnings}` : ""}`;
 }

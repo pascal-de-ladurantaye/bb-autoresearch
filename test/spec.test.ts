@@ -54,8 +54,8 @@ describe("parseSpec", () => {
     if (!r.ok) throw new Error(r.errors.join("\n"));
     expect(r.spec.study.slug).toBe("routing-p99");
     expect(r.spec.guardrail).toEqual([
-      { name: "rss_mb", max_regression: 0.05, direction: "lower" },
-      { name: "throughput_rps", max_regression: 0.02, direction: "higher" },
+      { name: "rss_mb", max_regression: 0.05, max_total_regression: 0.05, direction: "lower" },
+      { name: "throughput_rps", max_regression: 0.02, max_total_regression: 0.02, direction: "higher" },
     ]);
     expect(r.spec.oracle.gate).toEqual(["bazel test //test/filters/routing/... -c opt"]);
     expect(r.spec.oracle.protocol).toMatchObject({ n_min: 6, n_max: 20, confidence: 0.95, min_effect: 0.01, confirm: true });

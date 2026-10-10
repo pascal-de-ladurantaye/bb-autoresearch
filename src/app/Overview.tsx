@@ -249,7 +249,7 @@ export function SecondaryMetrics({ o }: { o: OverviewResult }) {
               <th className="px-3 py-2 font-medium">Metric</th>
               <th className="px-3 py-2 text-right font-medium">Base → best</th>
               <th className="px-3 py-2 font-medium">Change vs base</th>
-              <th className="px-3 py-2 font-medium">Against the limit</th>
+              <th className="px-3 py-2 font-medium">Against the total limit</th>
               <th className="px-3 py-2 font-medium">Trend</th>
             </tr>
           </thead>
@@ -268,9 +268,13 @@ export function SecondaryMetrics({ o }: { o: OverviewResult }) {
                     <GuardrailBadge state={g.state} text={g.label} />
                     {g.worstStep !== null ? <span className="ml-2 text-xs text-muted-foreground">worst single promotion {frac(Math.max(0, g.worstStep), 1)} worse</span> : null}
                   </div>
-                  {/* Room for the follow-up: cumulative vs segment base with its own limit, and a CI. */}
-                  {g.cumulative ? <div className="text-xs text-muted-foreground">cumulative limit {frac(g.cumulative.limit, 1)}</div> : null}
-                  {g.ci ? <div className="text-xs text-muted-foreground">CI {frac(g.ci.lo, 1)} to {frac(g.ci.hi, 1)} worse</div> : null}
+                  <div className="text-xs text-muted-foreground">{g.headroomText}</div>
+                  {g.promotions ? (
+                    <div className="text-xs text-muted-foreground">
+                      compounded over {g.promotions} promotion{g.promotions === 1 ? "" : "s"}
+                      {g.missingSteps ? ` (${g.missingSteps} without a measurement)` : ""}
+                    </div>
+                  ) : null}
                 </td>
                 <td className="px-3 py-2">
                   <Sparkline points={g.trend} label={`${g.name} of best after each promotion`} />
@@ -304,7 +308,7 @@ function LimitBar({ used, state }: { used: number | null; state: string }) {
   const pct = used === null ? 0 : Math.min(1, used) * 100;
   return (
     <div className="relative h-1.5 w-32 rounded-full bg-muted" role="img" aria-label={used === null ? "not measured" : `${Math.round((used ?? 0) * 100)}% of the limit used`}>
-      <div className={cn("h-1.5 rounded-full", state === "broken" ? "bg-destructive" : state === "warn" ? "bg-warning" : "bg-success")} style={{ width: `${pct}%` }} />
+      <div className={cn("h-1.5 rounded-full", state === "broken" ? "bg-destructive" : state === "warn" || state === "inconclusive" ? "bg-warning" : "bg-success")} style={{ width: `${pct}%` }} />
       <div className="absolute top-[-2px] h-2.5 w-px bg-foreground/50" style={{ left: "80%" }} aria-hidden />
     </div>
   );

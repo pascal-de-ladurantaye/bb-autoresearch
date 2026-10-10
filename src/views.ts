@@ -4,7 +4,8 @@ import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
 import type { StackRecord } from "./harvest.ts";
-import { BENCH_BOUND_STAGES } from "./pipeline.ts";
+import { checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
+import { BENCH_BOUND_STAGES, bestGuardrailPositions } from "./pipeline.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { accountingFor, standaloneText } from "./report.ts";
 import { oracleHash, type StudySpec } from "./spec.ts";
@@ -30,6 +31,8 @@ import {
 
 export interface StudySummary {
   slug: string;
+  /** The BB project the study runs in (the new-study composer preselects the latest one). */
+  projectId: string;
   state: string;
   pauseReason: string | null;
   metric: { name: string; unit: string; direction: "lower" | "higher" };
@@ -65,6 +68,7 @@ export function studySummary(engine: Engine, s: StudyRow): StudySummary {
   const spec = specOf(engine, s);
   return {
     slug: s.slug,
+    projectId: s.project_id,
     state: s.state,
     pauseReason: s.pause_reason,
     metric: { name: spec?.metric.name ?? "?", unit: spec?.metric.unit ?? "", direction: spec?.metric.direction ?? "lower" },
@@ -645,6 +649,11 @@ function lineDiff(a: string, b: string): Array<{ op: "same" | "add" | "del"; tex
   return out;
 }
 
+/** Calibrated guardrail noise as table rows (Oracle tab, CLI, report). */
+export function guardrailCalibrationRows(list: readonly GuardrailCalibration[]) {
+  return list.map((g) => ({ name: g.name, noise: g.noise, halfWidth: g.halfWidth, limit: g.limit, totalLimit: g.totalLimit, judgeable: g.judgeable, text: g.text }));
+}
+
 /** Oracle tab: the active spec (holdout hidden), version history, segments, calibration reports, and a pending spec with its diff. Approval stays CLI-only. */
 export function oracleView(engine: Engine, s: StudyRow) {
   const { store } = engine.ctx;
@@ -666,7 +675,7 @@ export function oracleView(engine: Engine, s: StudyRow) {
       diff: lineDiff(active!.toml, p.toml).slice(0, 2000),
     };
   }
-  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number; report: string }>; finishedAt?: number }>(s.calibration_json);
+  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; warnings?: string[]; guardrails?: GuardrailCalibration[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number; report: string }>; finishedAt?: number }>(s.calibration_json);
   return {
     slug: s.slug,
     state: s.state,
@@ -689,6 +698,10 @@ export function oracleView(engine: Engine, s: StudyRow) {
       ok: report?.ok ?? null,
       report: report?.report ?? null,
       problems: report?.problems ?? [],
+      /** Don't fail calibration, but the human should know (a guardrail too noisy to be judged within its limit). */
+      warnings: report?.warnings ?? [],
+      /** Per guardrail: A/A noise, the CI half-width an evaluation gets, and whether it can be judged within its limit. */
+      guardrails: guardrailCalibrationRows(report?.guardrails ?? []),
       baselineSha: report?.baselineSha ?? null,
       oracleHash: report?.oracleHash ?? null,
       hosts: (report?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: h.noiseFloor, mde: h.mde, evalSeconds: h.evalSeconds, report: clip(h.report, 600) })),
@@ -721,6 +734,7 @@ export function oracleView(engine: Engine, s: StudyRow) {
       gateSeconds: g.gate_seconds,
       report: g.report ? clip(g.report, 1500) : null,
       hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: h.noiseFloor, mde: h.mde, evalSeconds: h.evalSeconds })),
+      guardrails: guardrailCalibrationRows(safeJson<{ guardrails?: GuardrailCalibration[] }>(g.details_json)?.guardrails ?? []),
       ref: `refs/studies/${s.slug}/segment/${g.k}`,
       createdAt: g.created_at,
     })),
@@ -1005,11 +1019,9 @@ export type UsageView = ReturnType<typeof usageView>;
 // better is positive, in the metric's own terms.
 
 type Metrics = Record<string, number>;
-interface CandidateMetrics {
+interface CandidateMetrics extends StoredGuardrails {
   best?: Metrics;
   candidate?: Metrics;
-  /** Per guardrail: median relative regression vs best, positive = worse (from the verdict). */
-  guardrails?: Record<string, number | null>;
 }
 
 /** Raw metric values of the active segment's baseline and of the current best (medians as measured). */
@@ -1038,58 +1050,106 @@ export function metricSnapshot(engine: Engine, s: StudyRow): { baselineSha: stri
   return { baselineSha, bestSha: s.best_sha, baseline, best };
 }
 
-export type GuardrailState = "pass" | "warn" | "broken" | "missing";
+export type GuardrailState = "pass" | "warn" | "inconclusive" | "broken" | "missing";
+
+/** A regression with an optional CI against one limit. */
+export interface GuardrailCheckInput {
+  regression: number | null;
+  lo?: number | null;
+  hi?: number | null;
+  limit: number | null;
+}
 
 export interface GuardrailInput {
   name: string;
   direction: Direction;
-  /** The spec's max_regression (fraction, positive = worse allowed). */
+  /** Per step: the spec's max_regression (fraction, positive = worse allowed). */
   limit: number;
+  /** In total against the segment base: the spec's max_total_regression (defaults to `limit`). */
+  totalLimit?: number | null;
   /** Value of the reference side (best for a verdict, the segment base for the Overview). */
   reference: number | null;
   value: number | null;
   /** The regression the verdict computed (per-pair medians for noisy); preferred over the two values when present. */
   regression?: number | null;
-  /** What the limit applies to: "best" today. The follow-up adds a cumulative limit against the segment base. */
+  /**
+   * What the numbers are against: "best" (a candidate's verdict: the step
+   * limit applies to `regression`, the total limit to `cumulative`), or
+   * "base" (the Overview: best's position against the segment base, judged
+   * against the total limit).
+   */
   against: "best" | "base";
-  /** Reserved for the follow-up: a CI of the regression (positive = worse). */
-  ci?: { lo: number; hi: number } | null;
-  /** Reserved for the follow-up: the cumulative regression vs the segment base and its limit. */
-  cumulative?: { regression: number | null; limit: number | null } | null;
+  /** CI of `regression` (positive = worse). */
+  ci?: { lo: number | null; hi: number | null } | null;
+  /** "best": where best would stand against the segment base with this candidate, and the total limit. */
+  cumulative?: GuardrailCheckInput | null;
+}
+
+export interface GuardrailCheck {
+  regression: number;
+  lo: number | null;
+  hi: number | null;
+  limit: number;
+  /** regression / limit (null when no regression is allowed). */
+  used: number | null;
+  /** ok: the CI is within the limit; inconclusive: it straddles the limit; broken: it is entirely beyond. Without a CI, the point decides. */
+  state: "ok" | "inconclusive" | "broken";
+  /** Room left under the limit (limit − regression). */
+  headroom: number;
 }
 
 export interface GuardrailStatus {
   name: string;
   direction: Direction;
   limit: number;
+  totalLimit: number;
   /** Relative regression, positive = worse (null when not measured). */
   regression: number | null;
   /** The same change, better is positive. */
   improvement: number | null;
-  /** How much of the limit is used (regression / limit); null when not measured or no regression allowed. */
+  /** How much of the binding limit is used (the larger of the step and total shares); null when not measured or no regression allowed. */
   used: number | null;
   state: GuardrailState;
-  /** "ok", "near limit", "BROKEN", "not measured": text that carries the state without color. */
+  /** "ok", "near limit", "inconclusive", "BROKEN", "not measured": text that carries the state without color. */
   label: string;
-  /** One sentence: "0.4% worse vs best (limit 5.0% worse)". */
+  /** One sentence: "0.4% worse vs best (limit 5.0% worse) · 3.1% worse vs the segment base (total limit 10.0% worse)". */
   text: string;
   against: "best" | "base";
   ci: { lo: number; hi: number } | null;
-  cumulative: { regression: number | null; limit: number | null } | null;
+  /** The check against the limit `regression` is judged on (the step for "best", the total for "base"). */
+  check: GuardrailCheck | null;
+  /** Against the segment base: for "best" where best would stand with this candidate; for "base" the same as `check`. */
+  cumulative: GuardrailCheck | null;
 }
 
 /** Warn when a guardrail has used more than this share of its limit. */
 export const GUARDRAIL_WARN_SHARE = 0.8;
 
+const finiteNum = (v: number | null | undefined): v is number => v !== null && v !== undefined && Number.isFinite(v);
+
+function guardrailCheck(regression: number, lo: number | null | undefined, hi: number | null | undefined, limit: number): GuardrailCheck {
+  const c = checkLimit({ regression, lo: finiteNum(lo) ? lo : null, hi: finiteNum(hi) ? hi : null }, limit);
+  const used = limit > 0 ? Math.max(0, regression) / limit : regression > 0 ? Infinity : 0;
+  return { regression, lo: c.lo, hi: c.hi, limit, used: Number.isFinite(used) ? used : null, state: c.state, headroom: limit - regression };
+}
+
+function checkText(c: GuardrailCheck, where: string, limitWord: string): string {
+  const change = Math.abs(c.regression) < 0.00005 ? "no change" : `${magnitudePct(c.regression, 1)} ${c.regression > 0 ? "worse" : "better"}`;
+  const ci = rangeWords(c.lo, c.hi);
+  return `${change} ${where} (${ci ? `${ci}; ` : ""}${limitWord} ${magnitudePct(c.limit, 1)} worse)`;
+}
+
 /**
- * The one place the UI decides a guardrail's status (pass, warn within 20% of
- * the limit, broken, missing). It only reads values and limits, so the
- * follow-up can add CIs and a cumulative limit here without touching
- * components. Verdict semantics live in verdict.ts and are not changed.
+ * The one place the UI decides a guardrail's status: pass, warn (more than
+ * 80% of a limit used), inconclusive (a CI straddles a limit: flagged, not a
+ * rejection), broken (a CI entirely beyond a limit), or missing. It checks the
+ * per-step limit and the cumulative limit against the segment base with the
+ * same rule as the verdict (guardrails.ts), so components only display it.
  */
 export function guardrailStatus(g: GuardrailInput): GuardrailStatus {
+  const totalLimit = finiteNum(g.totalLimit) ? g.totalLimit : g.limit;
   const regression =
-    g.regression !== undefined && g.regression !== null && Number.isFinite(g.regression)
+    finiteNum(g.regression)
       ? g.regression
       : g.reference !== null && g.value !== null
         ? (() => {
@@ -1097,34 +1157,45 @@ export function guardrailStatus(g: GuardrailInput): GuardrailStatus {
             return imp === null ? null : -imp;
           })()
         : null;
-  const where = g.against === "best" ? "vs best" : "vs the segment base";
-  const limitText = `limit ${magnitudePct(g.limit, 1)} worse${g.against === "base" ? " per promotion" : ""}`;
+  const ci = g.ci && finiteNum(g.ci.lo) && finiteNum(g.ci.hi) && g.ci.lo !== g.ci.hi ? { lo: g.ci.lo, hi: g.ci.hi } : null;
+  const common = { name: g.name, direction: g.direction, limit: g.limit, totalLimit, against: g.against, ci };
   if (regression === null) {
-    return { name: g.name, direction: g.direction, limit: g.limit, regression: null, improvement: null, used: null, state: "missing", label: "not measured", text: `not measured (${limitText})`, against: g.against, ci: g.ci ?? null, cumulative: g.cumulative ?? null };
+    const limitText = g.against === "base" ? `total limit ${magnitudePct(totalLimit, 1)} worse` : `limit ${magnitudePct(g.limit, 1)} worse`;
+    return { ...common, regression: null, improvement: null, used: null, state: "missing", label: "not measured", text: `not measured (${limitText})`, check: null, cumulative: null };
   }
-  const used = g.limit > 0 ? Math.max(0, regression) / g.limit : regression > 0 ? Infinity : 0;
-  const state: GuardrailState = regression > g.limit ? "broken" : g.limit > 0 && used > GUARDRAIL_WARN_SHARE ? "warn" : "pass";
-  const change = Math.abs(regression) < 0.00005 ? "no change" : `${magnitudePct(regression, 1)} ${regression > 0 ? "worse" : "better"}`;
-  return {
-    name: g.name,
-    direction: g.direction,
-    limit: g.limit,
-    regression,
-    improvement: -regression,
-    used: Number.isFinite(used) ? used : null,
-    state,
-    label: state === "broken" ? "BROKEN" : state === "warn" ? "near limit" : "ok",
-    text: `${change} ${where} (${limitText})`,
-    against: g.against,
-    ci: g.ci ?? null,
-    cumulative: g.cumulative ?? null,
-  };
+  let check: GuardrailCheck;
+  let cumulative: GuardrailCheck | null = null;
+  let text: string;
+  if (g.against === "base") {
+    check = guardrailCheck(regression, ci?.lo, ci?.hi, totalLimit);
+    cumulative = check;
+    text = `${checkText(check, "vs the segment base", "total limit")}${totalLimit !== g.limit ? ` · ${magnitudePct(g.limit, 1)} per step` : ""}`;
+  } else {
+    check = guardrailCheck(regression, ci?.lo, ci?.hi, g.limit);
+    const cum = g.cumulative;
+    if (cum && finiteNum(cum.regression)) cumulative = guardrailCheck(cum.regression, cum.lo, cum.hi, finiteNum(cum.limit) ? cum.limit : totalLimit);
+    text = checkText(check, "vs best", "limit") + (cumulative ? ` · ${checkText(cumulative, "vs the segment base", "total limit")}` : "");
+  }
+  const checks = [check, ...(cumulative && cumulative !== check ? [cumulative] : [])];
+  const usedList = checks.map((c) => c.used).filter((u): u is number => u !== null);
+  const used = usedList.length ? Math.max(...usedList) : null;
+  const state: GuardrailState = checks.some((c) => c.state === "broken")
+    ? "broken"
+    : checks.some((c) => c.state === "inconclusive")
+      ? "inconclusive"
+      : checks.some((c) => c.limit > 0 && (c.used ?? 0) > GUARDRAIL_WARN_SHARE) || checks.some((c) => c.limit === 0 && c.regression > 0)
+        ? "warn"
+        : "pass";
+  // For a candidate, say when only the total against the segment base is what's broken or inconclusive.
+  const onlyTotal = g.against === "best" && cumulative !== null && (state === "broken" || state === "inconclusive") && check.state !== state && cumulative.state === state;
+  const label = (state === "broken" ? "BROKEN" : state === "inconclusive" ? "inconclusive" : state === "warn" ? "near limit" : "ok") + (onlyTotal ? " (total)" : "");
+  return { ...common, regression, improvement: -regression, used, state, label, text, check, cumulative };
 }
 
 /** Worst state first. */
 export function worstGuardrail(list: readonly GuardrailStatus[]): GuardrailState | null {
   if (!list.length) return null;
-  for (const st of ["broken", "warn", "missing", "pass"] as const) if (list.some((g) => g.state === st)) return st;
+  for (const st of ["broken", "inconclusive", "warn", "missing", "pass"] as const) if (list.some((g) => g.state === st)) return st;
   return null;
 }
 
@@ -1158,7 +1229,21 @@ export function metricsTable(spec: StudySpec | null, metricsJson: string | null)
   for (const g of spec?.guardrail ?? []) {
     const b = num(best[g.name]);
     const c = num(cand[g.name]);
-    const st = guardrailStatus({ name: g.name, direction: g.direction, limit: g.max_regression, reference: b, value: c, regression: m.guardrails?.[g.name] ?? null, against: "best" });
+    // The verdict's judgement (step CI, and where best would stand against the segment base) when it recorded one.
+    const j = m.guardrailJudgement?.[g.name];
+    const stored = m.guardrailCi?.[g.name];
+    const st = guardrailStatus({
+      name: g.name,
+      direction: g.direction,
+      limit: j?.step?.limit ?? g.max_regression,
+      totalLimit: j?.total?.limit ?? g.max_total_regression,
+      reference: b,
+      value: c,
+      regression: m.guardrails?.[g.name] ?? null,
+      against: "best",
+      ci: j?.step ? { lo: j.step.lo, hi: j.step.hi } : stored ? { lo: stored.lo, hi: stored.hi } : null,
+      cumulative: j?.total ? { regression: j.total.regression, lo: j.total.lo, hi: j.total.hi, limit: j.total.limit } : null,
+    });
     rows.push({ name: g.name, kind: "guardrail", unit: "", direction: g.direction, best: b, candidate: c, improvement: st.improvement, change: null, text: st.text, guardrail: st });
   }
   const known = new Set([primary.name, ...(spec?.guardrail ?? []).map((g) => g.name)]);
@@ -1180,10 +1265,12 @@ export function candidateGuardrails(spec: StudySpec | null, metricsJson: string 
 
 /**
  * Overview: secondary metrics of best against the segment base. Guardrails
- * get their position against the limit (today the limit applies per
- * promotion against the best before it; the follow-up adds a cumulative one
- * and CIs through guardrailStatus), plus the value of best after each
- * promotion for a small trend line.
+ * get best's cumulative position against the total limit: the promotion
+ * chain's per-step estimates compounded, with a CI (the same position the
+ * next verdict compounds onto), plus the worst single step and the value of
+ * best after each promotion for a small trend line. Raw values are shown
+ * next to it; they are medians measured at different times, so the position
+ * comes from the paired per-step estimates instead.
  */
 export function secondaryMetricsView(engine: Engine, s: StudyRow) {
   const spec = specOf(engine, s);
@@ -1200,17 +1287,37 @@ export function secondaryMetricsView(engine: Engine, s: StudyRow) {
     }
     return out.slice(-200);
   };
+  const positions: Record<string, Position> = spec ? bestGuardrailPositions(engine.ctx.store, s, spec) : {};
   const guardrails = (spec?.guardrail ?? []).map((g) => {
     const base = snap.baseline?.[g.name] ?? null;
     const best = snap.best?.[g.name] ?? null;
     // Per-promotion regressions as the verdicts recorded them (the limit each promotion was held to).
     const steps = wins.map((w) => ({ n: w.n, regression: safeJson<CandidateMetrics>(w.metrics_json)?.guardrails?.[g.name] ?? null }));
     const worstStep = steps.reduce<number | null>((a, x) => (x.regression === null ? a : a === null ? x.regression : Math.max(a, x.regression)), null);
+    const pos = positions[g.name];
+    // No recorded estimate on any promotion (older data): fall back to the raw values.
+    const usable = pos && Number.isFinite(pos.regression) && (pos.steps > 0 || !pos.missing);
+    const totalLimit = g.max_total_regression ?? g.max_regression;
     return {
-      ...guardrailStatus({ name: g.name, direction: g.direction, limit: g.max_regression, reference: base, value: best, against: "base" }),
+      ...guardrailStatus({
+        name: g.name,
+        direction: g.direction,
+        limit: g.max_regression,
+        totalLimit,
+        reference: base,
+        value: best,
+        regression: usable ? pos.regression : null,
+        ci: usable && pos.lo !== null && pos.hi !== null ? { lo: pos.lo, hi: pos.hi } : null,
+        against: "base",
+      }),
       base,
       best,
       raw: rawChange(base, best, ""),
+      /** Promotions compounded into the position (and how many lacked an estimate). */
+      promotions: pos?.steps ?? 0,
+      missingSteps: pos?.missing ?? 0,
+      /** Remaining room under the total limit, in words. */
+      headroomText: headroomWords(g.name, usable ? pos : null, totalLimit),
       /** Worst regression any single promotion had against the best before it. */
       worstStep,
       trend: trend(g.name),

@@ -31,16 +31,27 @@ also has a `bb study` command. Each page leads with what needs you
 and the sidebar entry and the study thread's header badge show how many items
 wait.
 
-1. **Create.** Studies → **New study** opens a thread with a prefilled
-   request for the `study-create` skill; pick the project and describe the
-   goal. The skill interviews you, drafts the spec (TOML: objective, metric,
+1. **Create.** Studies → **New study** opens bb's composer with a prefilled
+   request for the `study-create` skill and the current project selected
+   (the latest active study's when the page has none); describe the goal. The skill interviews you, drafts the spec (TOML: objective, metric,
    guardrails, scope, oracle commands, noise class, bench hosts, budget) and
    submits it with `study_propose`. That thread becomes the **study thread**:
    the conversation with the strategist.
+
+   Guardrails have two limits: how much worse one change may make a
+   secondary metric than the current best (`max_regression`), and how much
+   worse best may get than the segment base over all promotions
+   (`max_total_regression`). Both are judged on a CI: a guardrail breaks a
+   win only when its whole CI is beyond a limit, and is flagged
+   *inconclusive* when the CI straddles one. Worker snapshots never commit
+   untracked build outputs and caches (`[scope] ignore`, with defaults for
+   Python, Node, Rust/Java and coverage), so a repo without a `.gitignore`
+   works.
 2. **Approve and calibrate.** Needs you → *Approve spec v1 and calibrate*
    (review the spec on the Oracle tab first). Calibration runs the gates on the
    base commit and A/A measurements on every bench host, and reports the
-   smallest win it can detect (MDE) and the cost per evaluation. If it fails,
+   smallest win it can detect (MDE), each guardrail's noise (with a warning
+   when it exceeds the limit), and the cost per evaluation. If it fails,
    the page says why; ask the study thread for a revised spec and approve that.
    CLI: `bb study calibrate <slug> [--wait]`.
 3. **Start.** Seed ideas on the Ideas tab, then Needs you → *Approve and
@@ -50,11 +61,11 @@ wait.
    wins are confirmed (and checked against a hidden holdout when configured)
    before they are squashed onto best. CLI: `bb study start <slug>`.
 4. **Watch and steer.**
-   - Overview: Needs you; best vs base in words with raw values and CI; what's running; the trajectory; secondary metrics and guardrails against their limits; controls (pause, resume, max workers, harvest, archive); notices, each with the action it asks for.
+   - Overview: Needs you; best vs base in words with raw values and CI; what's running; the trajectory; secondary metrics, and each guardrail's cumulative position against its total limit with the CI and the room left; controls (pause, resume, max workers, harvest, archive); notices, each with the action it asks for.
    - Ideas: add, reorder, pin, veto (with a reason).
-   - Candidates: verdict, improvement, CI and guardrail status per row; each opens every recorded metric, samples, diffs, and the worker thread.
+   - Candidates: verdict, improvement, CI and guardrail status per row (ok, near limit, inconclusive, BROKEN, and whether the step or the total is the problem); each opens every recorded metric, samples, diffs, and the worker thread.
    - Findings: searchable, with counts per outcome, theme and verdict.
-   - Oracle: spec, versions, pending spec with its diff, calibration with its approval, segments.
+   - Oracle: spec, versions, pending spec with its diff, calibration with its approval and guardrail noise, segments.
    - Bench: hosts, queue, health (latest marked), drift, bundles.
    - Harvest: below.
 
@@ -102,7 +113,7 @@ next to it. Nothing is pushed before you publish. Every candidate stays under
 | `bb study harvest <slug> [--wait] [--restart] [--one-per-promotion] [--no-measure-standalone]` | Start or show a dry-run harvest |
 | `bb study harvest <slug> --publish` | Publish the ready harvest as DRAFT PRs on GitHub |
 | `bb study report <slug>` | The study report (Markdown) |
-| `bb study archive <slug>` | Stop for good: workers, bench checkouts and clones, a running harvest |
+| `bb study archive <slug> [--archive-thread]` | Stop for good: workers, bench checkouts and clones, a running harvest; `--archive-thread` also archives the study thread (the app's archive dialog does by default) |
 
 Every command takes `--json` (one JSON document from the same view models as
 the page; errors carry a hint with the next command). Approval and publishing

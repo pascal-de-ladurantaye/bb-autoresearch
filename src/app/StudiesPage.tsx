@@ -5,9 +5,10 @@
 // doing now; "Needs you" comes first on the Overview; then best vs base,
 // what's running, and the details. The study page is the primary surface;
 // the study thread is the conversation with the strategist.
-import { useBbNavigate } from "@get-bb/plugin-sdk/app";
+import { experimental_NewThreadComposer as NewThreadComposer, useBbContext, useBbNavigate, useSdk } from "@get-bb/plugin-sdk/app";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { BenchTab } from "./Bench.tsx";
@@ -41,7 +42,61 @@ export function StudiesPanel({ subPath }: { subPath: string }) {
   );
 }
 
-const NEW_STUDY_PROMPT =
+/**
+ * The project a new study starts in: the one BB's route selects, else the
+ * project of the most recently updated active study (the Studies panel isn't
+ * a project route), else none (the human picks it). With `known`, a project
+ * that no longer exists is never preselected.
+ */
+export function defaultProjectFor(contextProjectId: string | null, studies: ReadonlyArray<{ projectId: string; state: string; updatedAt: number }>, known?: ReadonlySet<string> | null): string | null {
+  const exists = (id: string | null | undefined): id is string => Boolean(id) && (!known || known.has(id!));
+  if (exists(contextProjectId)) return contextProjectId;
+  const latest = studies.filter((s) => s.state !== "archived" && exists(s.projectId)).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return latest?.projectId ?? null;
+}
+
+/**
+ * New study: bb's own new-thread composer, seeded with the study-create
+ * prompt and the current project (see defaultProjectFor). The thread it
+ * creates is an ordinary visible thread; the study-create skill takes it from
+ * there, and it becomes the study thread.
+ */
+function NewStudyDialog({ open, onOpenChange, projectId }: { open: boolean; onOpenChange: (v: boolean) => void; projectId: string | null }) {
+  const sdk = useSdk();
+  const nav = useBbNavigate();
+  const [focus, setFocus] = useState(1);
+  useEffect(() => {
+    if (open) setFocus((f) => f + 1);
+  }, [open]);
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>New study</DialogTitle>
+          <DialogDescription>
+            Starts a thread where the <code>study-create</code> skill interviews you, reads the code, drafts the spec and submits it. The study then shows up here for your approval.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="min-h-40" data-testid="new-study-composer" data-project={projectId ?? ""}>
+          <NewThreadComposer
+            {...(projectId ? { defaultProjectId: projectId } : {})}
+            initialPrompt={NEW_STUDY_PROMPT}
+            focusRequest={focus}
+            layout="document"
+            draftKey="autoresearch:new-study"
+            onSubmit={async (request) => {
+              const thread = await sdk.threads.spawn(request);
+              onOpenChange(false);
+              nav.toThread(thread.id);
+            }}
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export const NEW_STUDY_PROMPT =
   "Use the study-create skill to set up an autoresearch study for this project.\n\nGoal: <what number should move, and which way>\nScope: <directories workers may edit>\nBudget: <candidates, bench hours>";
 
 /** The nav panel's sidebar accessory: how many things need the human, across studies. */
@@ -58,8 +113,24 @@ export function StudiesAccessory() {
 
 function StudyList() {
   const nav = useBbNavigate();
+  const context = useBbContext();
   const list = useLive((rpc) => rpc.call("studies.list"), []);
   const [showArchived, setShowArchived] = useState(false);
+  const [composing, setComposing] = useState(false);
+  const sdk = useSdk();
+  // Projects that exist now (a study's project may have been deleted); null until known or when listing fails.
+  const [projects, setProjects] = useState<Set<string> | null>(null);
+  useEffect(() => {
+    if (!composing) return;
+    let live = true;
+    sdk.projects
+      .list()
+      .then((list) => live && setProjects(new Set(list.map((p) => p.id))))
+      .catch(() => live && setProjects(null));
+    return () => {
+      live = false;
+    };
+  }, [composing, sdk]);
   const studies = list.data?.studies ?? [];
   const active = studies.filter((s) => s.state !== "archived");
   const archived = studies.filter((s) => s.state === "archived");
@@ -94,11 +165,12 @@ function StudyList() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
         <p className="min-w-0 flex-1 text-sm text-muted-foreground">Measured optimization studies: agent workers propose changes, the plugin benchmarks each one and keeps only real wins.</p>
-        <Button size="sm" onClick={() => nav.toCompose({ initialPrompt: NEW_STUDY_PROMPT, focusPrompt: true })}>
+        <Button size="sm" onClick={() => setComposing(true)}>
           <Icon name="Plus" className="size-4" aria-hidden />
           New study
         </Button>
       </div>
+      {composing ? <NewStudyDialog open onOpenChange={setComposing} projectId={defaultProjectFor(context.projectId, studies, projects)} /> : null}
       <ErrorLine error={list.error} retry={list.refetch} />
       {list.loading && !list.data ? (
         <Skeleton lines={4} label="Loading studies…" />

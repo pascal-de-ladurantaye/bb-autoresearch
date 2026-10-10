@@ -5,7 +5,7 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: autoresearch
 brandSublabel: BB plugin design
-pills: Draft | M0-M3 built | Exit criteria partly validated
+pills: Draft | M0-M3 built | Guardrails and pre-release fixes | Exit criteria partly validated
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -25,6 +25,8 @@ All four milestones are built (BB 0.45, plugin SDK 0.6.14). Each was smoke-teste
 | M3: harvest and operations | A harvested PR set whose measured contributions add up to the total gain within the CI | **On a toy only.** Harvest h4 of `toy-m3b`: sum of contributions +290.7% ± 1.4% vs measured total +293.9% (CI half-width of the gap 3.7%). See the M3 notes. |
 
 After M3, a dedicated human interface pass reworked the Studies page, the study thread messages, notices and the CLI around one way of expressing improvement, and moved approval and publishing into the app (see "Implementation notes: human interface").
+
+The last pass before release closed two guardrail gaps and three usability issues (see "Implementation notes: guardrails and pre-release fixes"). Guardrails now have a cumulative limit against the segment base next to the per-step one, and both are judged on a confidence interval like the primary metric. In simulation that cut false rejections of real wins by a noisy guardrail from 13.3% to 0.0%, with real regressions still rejected. Worker snapshots no longer commit build outputs (`[scope] ignore`), the new-study composer opens on the current project, and archiving a study can archive its study thread too.
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
@@ -215,15 +217,18 @@ direction = "lower"
 
 [[guardrail]]
 name = "rss_mb"
-max_regression = "5%"
+max_regression = "5%"            # per step: a candidate vs the current best
+max_total_regression = "10%"     # in total: best vs the segment base (default: max_regression)
 
 [[guardrail]]
 name = "throughput_rps"
+direction = "higher"
 max_regression = "2%"
 
 [scope]
 editable = ["source/filters/routing/**", "source/common/matcher/**"]
 protected = ["bench/**", "test/**"]
+ignore = ["bazel-*/", "*.pyc"]   # untracked build outputs snapshots never commit (default: common ones)
 
 [oracle]
 build = "bazel build //source/exe:envoy-static -c opt"
@@ -283,7 +288,10 @@ During Running, a schedule repeats an A/A run on `best` every N evaluations. If 
 
 ### Guardrails and holdout
 
-- **Guardrails** are secondary metrics with limits relative to `best`. A candidate that wins on the primary metric but breaks a guardrail is a `lose`, and the reason is attached.
+- **Guardrails** are secondary metrics with two limits. **Per step**, a candidate may be at most `max_regression` worse than the current `best`. **In total**, `best` after the promotion may be at most `max_total_regression` (default: `max_regression`) worse than the segment base, so small regressions can't creep across many kept wins: ten promotions that each add 4.9% memory pass a 5% per-step limit and end 61% above the base. The total is the promotion chain base → best compounded, with the candidate's own step on top.
+- Guardrails get the primary metric's statistics. A guardrail **breaks** only when its whole CI is beyond a limit, and then a win is a `lose` with the reason in words ("rss 3.1% worse than best, within the 5.0% limit; 5.4% worse than the segment base, beyond the 5.0% total limit"). When the CI straddles a limit it is **inconclusive**: not a rejection, but flagged in the verdict, on the page (warn state) and in the strategist's digest. The same rule applies to every noise class: paired bootstrap CIs for `noisy`, the tolerance band for `deterministic`, and t·σ bands from calibrated per-run noise for `expensive`.
+- Calibration measures each guardrail's A/A noise and the CI half-width an evaluation gets, and warns when that exceeds the limit: such a guardrail can never be shown within it.
+- Workers and the strategist see each guardrail's remaining headroom under its total limit.
 - **Holdout** is a workload kept only on the bench host. It's evaluated on candidates about to be promoted. Workers never see its inputs or numbers, only pass or fail. It catches changes that special-case the benchmark input.
 
 ## Scheduling
@@ -1129,7 +1137,7 @@ The M2 end-to-end test failed on a loaded laptop because `LocalHostRunner` probe
 - **Exit criteria on real workloads.** Not run for any milestone (see Status). M3's criterion holds only on a toy with additive effects.
 - **GitHub publishing.** Never run against GitHub.
 - **Provider limits live.** Neither usage-window W-lowering nor rate-limit retries have been seen live.
-- **Snapshots commit build outputs.** `git add -A` in worker worktrees picks up untracked build outputs when the repo lacks a `.gitignore` (the `toy-m3` failure). Scope globs don't exclude them because they sit under `editable`.
+- **Snapshots commit build outputs.** `git add -A` in worker worktrees picks up untracked build outputs when the repo lacks a `.gitignore` (the `toy-m3` failure). Scope globs don't exclude them because they sit under `editable`. *(Fixed: `[scope] ignore`; see "Implementation notes: guardrails and pre-release fixes".)*
 - **Attribution limits.** Dependency attribution is pairwise. A failure that needs two later changesets together to explain it falls back to "all later", and a stack is linearized in best order, so a member can be stacked under another it doesn't depend on (#3 under #1 on the toy).
 - **Gate dependencies only.** A changeset that is semantically needed but doesn't break the gates when reverted (no test covers it) is not detected as a dependency.
 - **Interaction warnings.** They rely on bootstrap CIs that undercover at small n.
@@ -1159,7 +1167,7 @@ A pass after M3 over every human step, with no new engine features. Same platfor
 
 ### Secondary metrics and guardrails
 
-- **One status function.** `guardrailStatus` in views.ts is the only place the UI decides a guardrail's state: pass, warn (more than 80% of the limit used), broken, or missing, with a text that carries the state without color. It takes values and limits (and prefers the regression the verdict recorded), and already has slots for a CI and a cumulative limit against the segment base, so the follow-up that adds `max_total_regression` and CI-based guardrail decisions can fill them without touching components. Verdict semantics are unchanged.
+- **One status function.** `guardrailStatus` in views.ts is the only place the UI decides a guardrail's state: pass, warn (more than 80% of the limit used), broken, or missing, with a text that carries the state without color. It takes values and limits (and prefers the regression the verdict recorded), and already has slots for a CI and a cumulative limit against the segment base, so the follow-up that adds `max_total_regression` and CI-based guardrail decisions can fill them without touching components. Verdict semantics are unchanged. *(Filled by the guardrails pass: cumulative position, CI, an inconclusive state and headroom; see below.)*
 - **Where it shows.** The candidate detail has a metrics table (primary, guardrails with limit and status, informational metrics with a raw change and "no direction"); the candidates list has a guardrail column ("ok (1)", "rss near limit", "rss BROKEN"); the Overview shows each secondary metric of best against the segment base, the guardrail's position against its limit as a bar plus a word, the worst single promotion, and a small trend of best's value after each promotion.
 
 ### In-app actions (decision 1)
@@ -1222,10 +1230,87 @@ Main path after: 21 clicks and no trip to the CLI (before: five forced CLI trips
 
 ### Remaining friction and not done
 
-- **New study composer.** It opens with "No project" selected and placeholders to edit; `toCompose` takes no project, so the human picks it (2 clicks).
+- **New study composer.** It opens with "No project" selected and placeholders to edit; `toCompose` takes no project, so the human picks it (2 clicks). *(Fixed in the guardrails pass.)*
 - **Audit alarms for the human's own controls.** In-app controls used while workers run are flagged as "made while study agent turns were running", and the strategist relays that ("if that wasn't you…"). That is the threat model working (RPC can't identify the caller), but it reads as an alarm after ordinary steering.
 - **Old notices keep their old text.** Texts are stored; only notices raised after this pass follow the new wording.
-- **Archiving a study leaves its study thread** (the conversation) unarchived; the human archives it like any thread.
+- **Archiving a study leaves its study thread** (the conversation) unarchived; the human archives it like any thread. *(Fixed in the guardrails pass: an option, on by default in the app.)*
 - **Interaction warnings** still rest on bootstrap CIs that undercover at small n; the info callout only softens the wording.
 - **Light theme** was checked by switching the root class in the browser tab, not by changing BB's theme setting; real light-theme contrast with a custom palette is untested.
 - **The creating agent** in the live run still listed CLI next steps (from the old `study_propose` result text, fixed after the run) and the updated skill wasn't re-run live.
+
+## Implementation notes: guardrails and pre-release fixes
+
+The last pass before release. It fixes two guardrail correctness gaps and three usability issues the earlier smoke tests found. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+### Guardrails: a cumulative limit
+
+- **The gap.** Guardrails compared each candidate only with the current best. Ten promotions that each add 4.9% memory pass a 5% limit and leave best 61% above the segment base.
+- **Spec.** `[[guardrail]] max_total_regression` (a fraction like `max_regression`, default `max_regression`) limits how much worse best may get than the segment base over all promotions. A value below `max_regression` is accepted with a warning (the total limit then binds first). It is part of the guardrail entry, so it is in the oracle hash: changing it is an oracle change and starts a new segment. Spec versions stored before this pass are read with the default filled in (`normalizeSpec`), so their hashes stay comparable.
+- **Where best stands (decision).** Best's position against the segment base is the promotion chain base → best (followed through `promoted_sha` and `against_sha`), compounded from each promotion's recorded guardrail estimate, with the candidate's own step on top. Steps compound in the metric's own terms (values multiply by 1 + r for lower-is-better, by 1 − r for higher-is-better); CI half-widths combine as a root sum of squares in log space, the same independence assumption as harvest's gap. Alternatives rejected: measuring the segment base as a third side of every pair (a third checkout and 50% more bench time per candidate), or comparing unpaired medians of the base's calibration runs with today's candidate (machine drift between the two times is not paired away).
+- **Both limits on every win.** The verdict checks the step against `max_regression` and the total against `max_total_regression`; either one broken makes the win a `lose`. The reason says which, in words: "guardrail rss: 4.9% worse than best, within the 5.0% limit; 21.1% worse than the segment base, beyond the 20.0% total limit".
+- **Segments.** A new segment starts the chain again from its baseline (best at recalibration).
+
+### Guardrails: statistics
+
+- **The gap.** A guardrail was the median of the paired differences with no CI: a noisy secondary metric could reject a real win by chance.
+- **The rule (`src/guardrails.ts`).** Each guardrail gets a CI of its regression. **Broken** when the CI is entirely beyond a limit, **ok** when it is entirely within, **inconclusive** when it straddles. Inconclusive is not a rejection: the verdict lists it ("…inconclusive against the 5.0% limit (the CI straddles it; flagged, not a rejection)"), the worker's summary line says "Guardrail rss inconclusive (flagged)", and the page shows an inconclusive state with the warn tone.
+- **Per class.**
+  - `noisy`: a percentile bootstrap CI of the median of per-pair regressions, the primary metric's method and confidence. A confirmation measurement judges guardrails on the pairs of both measurements (decision: guardrails didn't select the candidate, so pooling isn't biased, and one test on more pairs replaces two separate chances to reject). The first measurement can already reject.
+  - `deterministic`: one run per side; the CI is ± max(`tolerance`, the calibrated repeat difference). With tolerance 0 the exact value decides, as before.
+  - `expensive`: the candidate's confirmation runs against the host's baseline runs, with a half-width t·σ_g·√(1/k + 1/m), σ_g the guardrail's calibrated per-run noise and t the same Student-t quantile as the primary metric. Without calibration it is estimated from the runs at hand when there are enough of them.
+  - Old candidates have point estimates only; the chain uses them as exact.
+- **Simulation** (test/guardrails.test.ts; noisy class, n_min 6, n_max 20, confirmation on, a 20% primary win, a 5% guardrail limit; "before" is the old rule applied to each measurement):
+
+  | True guardrail change | Per-run noise (per-pair SD) | Rejected before | Rejected after | Flagged inconclusive after |
+  |---|---|---|---|---|
+  | 0 (400 trials) | 5% (≈ 7%, above half the limit) | 13.3% | 0.0% | 46.5% |
+  | +12% (200 trials) | 5% | 100% | 82.0% | 18.0% |
+  | +15% (200 trials) | 2% | 100% | 100% | 0% |
+
+  The price is power: a noisy guardrail that really regresses is sometimes flagged instead of rejected, never silently passed.
+
+### Guardrails: calibration, views, messages, report
+
+- **Calibration.** Every strategy measures each guardrail: the A/A per-pair noise and CI half-width at `n_max` (noisy), the per-run σ and the half-width for k confirmation runs (expensive), the repeat difference (deterministic). The report gains a line per guardrail ("mem_kb: noise 1.99% per pair (A/A), CI half-width 0.76%: rejected beyond about 9.8% worse, ok below about 8.2% worse, inconclusive in between"). A guardrail whose half-width reaches its limit raises a calibration **warning** (not a failure): it can never be shown within the limit. The worst bench host decides, as for the MDE. Results are stored in the calibration report (`guardrails`, `warnings`) and the segment's `details_json`; verdicts read the segment's guardrail noise.
+- **Views.** `guardrailStatus` (views.ts) checks the step and the total with the same rule as the verdict and returns both checks with their headroom; the label says when only the total is the problem ("BROKEN (total)", "inconclusive (total)"). Components only display it: the candidate list's guardrail column, the candidate detail's metrics table (step and total with CIs), and the Overview's best-vs-base position against the total limit, with the room left and the number of promotions compounded. The Oracle tab shows each guardrail's noise and any warning.
+- **Messages.** Verdicts carry, in the agent-only detail, both checks with their CIs and the headroom left now; the human line names a broken or flagged guardrail only. Strategist digests and worker briefs carry the headroom per guardrail; the digest's summary line mentions a guardrail only when less than a fifth of its total limit is left.
+- **Report and harvest.** The study report has a Guardrails section: best's position with CI, headroom, every promotion's step, the wins a guardrail rejected and the promotions it flagged, and the calibrated noise. Harvest's base-vs-best and ablation measurements already had guardrail samples; they are now kept (`harvests.total_guardrails_json`, `changesets.guardrails_json`), so the report also gives best vs base measured directly next to the verdicts' compounded estimate, and each changeset's cost to each guardrail.
+
+### Pre-release fixes
+
+- **Snapshots and build outputs.** `[scope] ignore` lists untracked build outputs and caches the worker snapshot never commits, gitignore-style: a pattern without a slash matches at any depth, a leading or inner slash anchors it at the root, a trailing slash means a directory. Defaults: `__pycache__/`, `*.pyc`, `*.pyo`, `.pytest_cache/`, `node_modules/`, `dist/`, `build/`, `target/`, `.DS_Store`, `coverage/`, `.coverage`, `.nyc_output/`, `htmlcov/`; setting the key replaces them, `[]` turns it off. The snapshot stages tracked changes with `git add -u`, then untracked files with exclude pathspecs, and reports what it left out (the submission ticket says so). Changes to tracked files under a pattern always commit. A candidate that still adds a matching file (the worker committed it itself) is `rejected` with what to do (`git rm -r --cached`, or ask the human to change the list). Calibration warns when the base tracks files that match (a `build/` of sources, say), because new files next to them would be left out. Not part of the oracle hash.
+- **New study.** The Studies page opens bb's own new-thread composer (`experimental_NewThreadComposer`) in a dialog, seeded with the study-create prompt and a project: the route's project, else the project of the most recently updated active study (only if it still exists), else none. The plugin spawns the thread from the composer's request and opens it. Before, `toCompose` took no project and opened with "No project".
+- **Archive with the thread.** The archive dialog has "Also archive the study thread" (on by default); `study.archive` takes `archiveThread`, the CLI `--archive-thread`. The study thread is archived and stopped after the study, recorded as `study_thread.archived`; asking again on an archived study archives just the thread. Worker threads were already archived.
+
+### Data model
+
+Append-only migrations: `harvests.total_guardrails_json`, `changesets.guardrails_json`. A decided candidate's `metrics_json` gains `guardrailCi` (per guardrail: lo, hi, n) and `guardrailJudgement` (the step and total checks, best's prior position, the text). The calibration report and segment details gain `guardrails` and `warnings`. New event: `study_thread.archived`; `control.archive` records `archiveThread`; `candidate.submitted` records how many files the snapshot left out.
+
+### Smoke test (BB 0.45, one MacBook, toy repo under /tmp without a `.gitignore`)
+
+- **Toy.** `src/toy.py` with a naive `slow_sum`, recursive `fib`, and a `dedupe` built on a linear `contains()` and a `bubble_sort`; a gate test; the primary metric `ops` (opcodes of `toy.run()` counted with `sys.settrace`, 0.5% synthetic noise). The guardrail `mem_kb` is a synthetic memory model that creeps with every win: it grows by about 7% per halving of ops, plus 1.2% per-run noise. Limits: 9% per step, 12% in total. Noisy class, `max_workers = 2`, `max_candidates = 6`, local bench, default provider (pi).
+- **Calibration** (after one A/A attempt failed the existing equivalence check by chance: median 0.48%, CI 0.42% to 0.87%): ops noise floor 0.83% per pair, MDE 1.00%; "mem_kb: noise 1.99% per pair (A/A), CI half-width 0.76%: rejected beyond about 9.8% worse, ok below about 8.2% worse, inconclusive in between".
+- **Verdicts.** Five wins and one guardrail rejection, 68.5% fewer ops (3.2×) in a few minutes of Running:
+
+  | Candidate | Primary | mem_kb step vs best (CI) | mem_kb vs segment base (CI) | Outcome |
+  |---|---|---|---|---|
+  | c/1 set-based dedupe | +38.8% | 5.1% worse (4.4 to 5.8) | 5.1% | win |
+  | c/2 `sorted()` | +61.1% | 9.8% worse (8.4 to 10.9): inconclusive | 15.4% (13.7 to 16.9): beyond 12% | **lose on the total limit** |
+  | c/3 closed-form sum | +9.3% | 0.1% better | 5.0% | win |
+  | c/4 iterative fib | +28.5% | 3.0% worse | 8.1% | win |
+  | c/5 data as a constant | +2.8% | no change | 8.1% | win |
+  | c/6 guardrail-aware sort | +18.4% | 1.9% worse (0.6 to 2.6) | 10.1% (8.0 to 13.0): inconclusive | **win, flagged** |
+
+  The c/6 worker read the headroom in its brief ("only ~3.5% headroom left") and kept a cheaper bubble sort instead of `sorted()`. After c/2 the strategist, whose digest carried the headroom line, queued micro-optimizations rather than more `sorted()` variants.
+- **No build outputs.** Every submission left one or two `__pycache__/*.pyc` files out (recorded on `candidate.submitted`); no candidate ref and no commit on best contained one.
+- **Harvest h7** (`--one-per-promotion`): best measured directly 12.1% worse than base on mem_kb (CI 10.6% to 12.9%), against the chain's 10.1% (CI 8.0% to 13.0%); per changeset 6.8%, 1.1%, 5.0%, 1.0%, 2.7%. The model's true value is 12.2%, inside both CIs. The chain underestimated it because noisy small steps were recorded as "no change" (the price of compounding estimates).
+- **App.** Screenshots of the calibration's guardrail noise (Oracle tab), the Overview's cumulative position and headroom, the candidate list's guardrail column, the c/2 and c/6 details, the new-study composer with the project preselected, and the archive dialog are in the building thread's storage (`shots/`).
+- **Cleanup.** The study was archived from the dialog with its study thread (all eight threads archived); the temporary project, `/tmp` files and the harvest export were deleted. The plugin is left installed from this pass's worktree, disabled.
+
+### Not done, and known issues
+
+- **Power with noisy guardrails.** The chain's CI grows about with √(promotions), so a noisy guardrail's total can stay inconclusive long after the point estimate passed the limit. Flagged, but not rejected.
+- **No extra pairs for an inconclusive guardrail.** The sequential test stops on the primary metric; it doesn't keep measuring to settle a straddling guardrail.
+- **The chain is an estimate.** It compounds per-step estimates; harvest's direct base-vs-best measurement is the better number when it exists, and the report shows both.
+- **Reconciliation** re-checks scope for a crashed submission from its recorded paths, without the added-files list, so the ignore rule isn't applied there.
+- **The composer's "current project"** falls back to the latest active study's project because the Studies panel isn't a project route; with no active study the human picks it.

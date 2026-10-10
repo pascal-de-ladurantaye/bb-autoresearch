@@ -198,6 +198,57 @@ describe("frontend: human interface", () => {
     expect(metrics.textContent).toMatch(/wall_msinformational1012\+20\.0% \(informational, no direction\)/u);
   });
 
+  it("guardrail inconclusive and cumulative position render with words; the Oracle tab shows guardrail noise", async () => {
+    await runningWithWin();
+    const { store } = engine.ctx;
+    const s = engine.study("toy-size");
+    const c = store.candidateByN(s.id, 1)!;
+    const { judgeGuardrail } = await import("../src/guardrails.ts");
+    const spec = store.spec(s);
+    const j = judgeGuardrail(spec.guardrail[0]!, { regression: 0.03, lo: -0.01, hi: 0.07, n: 6 }, null);
+    store.updateCandidate(c.id, {
+      metrics_json: JSON.stringify({ best: { size: 1000, rss: 100 }, candidate: { size: 800, rss: 103 }, guardrails: { rss: 0.03 }, guardrailCi: { rss: { lo: -0.01, hi: 0.07, n: 6 } }, guardrailJudgement: { rss: j } }),
+    });
+    const list = await open("toy-size/candidates/1");
+    expect((await list.findByLabelText("Candidates")).textContent).toContain("rss inconclusive");
+    const metrics = await list.findByLabelText("Metrics");
+    expect(metrics.textContent).toMatch(/3\.0% worse vs best \(CI 1\.0% better to 7\.0% worse; limit 5\.0% worse\) · 3\.0% worse vs the segment base \(CI 1\.0% better to 7\.0% worse; total limit 5\.0% worse\).*inconclusive/u);
+    const ov = await open("toy-size/overview");
+    const sec = await ov.findByLabelText("Secondary metrics");
+    // c/1 is best: its step is the cumulative position (one promotion), straddling the 5% total limit.
+    expect(sec.textContent).toMatch(/3\.0% worse vs the segment base \(CI 1\.0% better to 7\.0% worse; total limit 5\.0% worse\).*inconclusive.*rss: 2\.0% of the 5\.0% total limit left \(best: 3\.0% worse than the segment base, CI 1\.0% better to 7\.0% worse\).*compounded over 1 promotion/u);
+    // Oracle tab: calibrated guardrail noise, and a warning when it exceeds the limit.
+    const cal = JSON.parse(s.calibration_json!) as Record<string, unknown>;
+    store.updateStudy(s.id, {
+      calibration_json: JSON.stringify({
+        ...cal,
+        guardrails: [{ name: "rss", noise: 0.08, halfWidth: 0.06, limit: 0.05, totalLimit: 0.05, judgeable: false, text: "rss: noise 8.00% between two runs, CI half-width 6.00%, more than its 5.0% limit" }],
+        warnings: ["guardrail rss: noise 8.00% between two runs, CI half-width 6.00%, more than its 5.0% limit: it can never be shown within the limit"],
+      }),
+    });
+    const oracle = await open("toy-size/oracle");
+    const table = await oracle.findByLabelText("Guardrail noise");
+    expect(table.textContent).toMatch(/rss8\.00%6\.00%5\.0% \/ 5\.0%too noisy to show within its limit/u);
+    expect((await oracle.findByLabelText("Calibration warnings")).textContent).toContain("Warning: guardrail rss: noise 8.00%");
+  });
+
+  it("the archive dialog offers to archive the study thread too (on by default)", async () => {
+    const page = await open("toy-size/overview");
+    fireEvent.click(await page.findByRole("button", { name: /Archive…/u }));
+    const box = (await page.findByLabelText("Also archive the study thread")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    expect(page.getByText("The study thread is archived too.")).toBeTruthy();
+    expect(page.getByText(/bb study archive toy-size --archive-thread/u)).toBeTruthy();
+    fireEvent.click(box);
+    expect(page.getByText("The study thread stays in the sidebar.")).toBeTruthy();
+    fireEvent.click(box);
+    fireEvent.click(page.getByRole("button", { name: "Archive study" }));
+    await waitFor(() => expect(page.inspection.rpcCalls.some((c) => c.method === "study.archive")).toBe(true));
+    expect(page.inspection.rpcCalls.find((c) => c.method === "study.archive")!.input).toMatchObject({ slug: "toy-size", confirm: true, archiveThread: true });
+    await waitUntil(() => port.threads.get("thr_study")!.archivedAt !== null);
+    expect(engine.study("toy-size").state).toBe("archived");
+  });
+
   it("no secondary metrics: the section is absent", async () => {
     await harness.lifecycle.dispose();
     host = new FakeHost();
@@ -224,8 +275,38 @@ describe("frontend: human interface", () => {
     const list = await open("");
     await list.findByText(/needs you/u);
     expect(list.getByRole("button", { name: "New study" })).toBeTruthy();
-    fireEvent.click(list.getByRole("button", { name: "New study" }));
-    expect(list.inspection.navigateCalls.at(-1)).toMatchObject({ method: "toCompose" });
+  });
+
+  it("New study opens bb's composer with the current project preselected, and opens the thread it creates", async () => {
+    const app = await loadPluginApp(() => import("../app.tsx"));
+    // No project in the route: the project of the latest study.
+    const list = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc(), sdk: { threads: { spawn: async (args: unknown) => ({ id: "thr_new", ...(args as object) }) }, projects: { list: async () => [{ id: "proj_1" }] } } as never });
+    pages.push(list);
+    fireEvent.click(await list.findByRole("button", { name: "New study" }));
+    const composer = await list.findByTestId("bb-new-thread-composer");
+    expect(composer.getAttribute("data-default-project-id")).toBe("proj_1");
+    expect((list.getByTestId("bb-new-thread-composer-input") as HTMLTextAreaElement).value).toContain("Use the study-create skill");
+    fireEvent.click(list.getByTestId("bb-new-thread-composer-submit"));
+    await waitFor(() => expect(list.inspection.navigateCalls.at(-1)).toMatchObject({ method: "toThread" }));
+    expect(list.inspection.sdkCalls.map((c) => c.method)).toContain("threads.spawn");
+    expect(list.inspection.navigateCalls.some((c) => c.method === "toCompose")).toBe(false);
+    list.lifecycle.unmount();
+    pages.splice(pages.indexOf(list), 1);
+    // A project in the route wins.
+    const inProject = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: rpc(), context: { projectId: "proj_ctx" }, sdk: { projects: { list: async () => [{ id: "proj_1" }, { id: "proj_ctx" }] } } as never });
+    pages.push(inProject);
+    fireEvent.click(await inProject.findByRole("button", { name: "New study" }));
+    expect((await inProject.findByTestId("bb-new-thread-composer")).getAttribute("data-default-project-id")).toBe("proj_ctx");
+    inProject.lifecycle.unmount();
+    pages.splice(pages.indexOf(inProject), 1);
+    // No study and no project: nothing preselected (the human picks it).
+    const { defaultProjectFor } = await import("../src/app/StudiesPage.tsx");
+    expect(defaultProjectFor(null, [])).toBeNull();
+    expect(defaultProjectFor(null, [{ projectId: "old", state: "archived", updatedAt: 9 }, { projectId: "new", state: "running", updatedAt: 1 }])).toBe("new");
+    // Only archived studies, or a deleted project: nothing preselected.
+    expect(defaultProjectFor(null, [{ projectId: "old", state: "archived", updatedAt: 9 }])).toBeNull();
+    expect(defaultProjectFor(null, [{ projectId: "gone", state: "running", updatedAt: 9 }], new Set(["other"]))).toBeNull();
+    expect(defaultProjectFor("gone", [], new Set(["other"]))).toBeNull();
   });
 
   it("publish dialog shows the plan and why it can't run yet", async () => {

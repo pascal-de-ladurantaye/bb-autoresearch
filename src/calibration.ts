@@ -7,11 +7,14 @@ import { createHash } from "node:crypto";
 import { BenchTransferError } from "./bench.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, StudyRow } from "./db/store.ts";
+import { guardrailWarnings, worstGuardrailCalibration, type GuardrailCalibration } from "./guardrails.ts";
 import { checkHealth } from "./health.ts";
 import { parseMeasureOutput } from "./metrics.ts";
 import { strategyFor, BenchError, type CalibrationOutcome } from "./noise.ts";
 import { withBench, type Pipeline } from "./pipeline.ts";
 import { clip } from "./prompts.ts";
+import { ignoreIncludePathspecs } from "./scope.ts";
+import type { HostRunner } from "./host/runner.ts";
 import { bestBranch, oracleHash, segmentRef } from "./spec.ts";
 
 export interface CalibrationReport {
@@ -26,7 +29,11 @@ export interface CalibrationReport {
   oracleHash: string;
   details: Record<string, number | string | boolean>;
   /** Per bench host results (noise floor, MDE, eval cost). */
-  hosts: Array<{ hostId: string; name: string; mode: string; noiseFloor: number; mde: number; evalSeconds: number; report: string }>;
+  hosts: Array<{ hostId: string; name: string; mode: string; noiseFloor: number; mde: number; evalSeconds: number; report: string; guardrails?: GuardrailCalibration[] }>;
+  /** Per guardrail: A/A noise and CI half-width (worst host). */
+  guardrails: GuardrailCalibration[];
+  /** Things the human should know that don't fail calibration (a guardrail too noisy to be judged). */
+  warnings: string[];
   finishedAt: number;
 }
 
@@ -53,6 +60,8 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     evalSeconds: null,
     details: {},
     hosts: [],
+    guardrails: [],
+    warnings: [],
     finishedAt: ctx.now(),
     ...partial,
   });
@@ -76,6 +85,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     protectedHash = createHash("sha256").update(ls.stdout).digest("hex").slice(0, 16);
   }
   const hash = oracleHash(spec, protectedHash);
+  const scopeWarnings = await trackedIgnoredWarning(runner, repo, baseSha, spec.scope.ignore ?? []);
 
   // 3. Gates on the baseline.
   const gateStarted = ctx.now();
@@ -125,6 +135,8 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   const gateLine = spec.oracle.gate.length ? ` Gates take ${gateSeconds.toFixed(1)} s on the edit host.` : "";
   const hostLines = ok.length > 1 ? ` Per host: ${ok.map((r) => `${r.h.name} MDE ${(r.outcome.mde * 100).toFixed(2)}%`).join(", ")}.` : "";
   const holdoutLine = spec.oracle.holdout ? " Holdout runs on every bench host." : "";
+  const guardrails = worstGuardrailCalibration(ok.map((r) => r.outcome.guardrails ?? []));
+  const guardrailLine = guardrails.length ? ` Guardrails: ${guardrails.map((g) => g.text).join("; ")}.` : "";
   return finish({
     baselineSha: baseSha,
     oracleHash: hash,
@@ -132,13 +144,31 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     noiseFloor,
     mde,
     evalSeconds,
-    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine,
+    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine,
     details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length },
-    hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report })),
+    hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [] })),
+    guardrails,
+    warnings: [...guardrailWarnings(guardrails), ...scopeWarnings],
   });
 }
 
 class HealthError extends Error {}
+
+/**
+ * A repo that tracks files under an ignore pattern (a `build/` directory of
+ * sources, say) would have new files there left out of every candidate: warn
+ * so the human can narrow `[scope] ignore`.
+ */
+export async function trackedIgnoredWarning(runner: { exec: HostRunner["exec"] }, repo: string, sha: string, ignore: readonly string[]): Promise<string[]> {
+  if (!ignore.length) return [];
+  const specs = ignoreIncludePathspecs(ignore).map((p) => `'${p}'`).join(" ");
+  const r = await runner.exec({ cwd: repo, command: `git diff --name-only --no-renames $(git hash-object -t tree /dev/null) ${sha} -- ${specs} | head -n 20`, timeoutMs: 60_000 }).catch(() => null);
+  const paths = r && r.exitCode === 0 ? r.stdout.split("\n").map((l) => l.trim()).filter(Boolean) : [];
+  if (!paths.length) return [];
+  return [
+    `the baseline tracks file(s) matching [scope] ignore (${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ", …" : ""}): changes to them are submitted, but new files next to them are left out of candidates. If they are sources, set [scope] ignore without the pattern that matches them.`,
+  ];
+}
 
 /** Calibrate one bench host: health, transfer, two baseline checkouts, build, A/A, a holdout smoke run. */
 async function calibrateHost(ctx: Ctx, pipeline: Pipeline, study: StudyRow, h: BenchHostRow, baseSha: string, timeoutMs: number): Promise<CalibrationOutcome> {
@@ -226,7 +256,7 @@ export async function recordCalibration(ctx: Ctx, study: StudyRow, report: Calib
       gate_seconds: report.gateSeconds,
       report: report.report,
       spec_version: study.spec_version,
-      details_json: JSON.stringify({ hosts: report.hosts }),
+      details_json: JSON.stringify({ hosts: report.hosts, guardrails: report.guardrails ?? [], warnings: report.warnings ?? [] }),
     });
     store.updateStudy(study.id, {
       calibration_status: "ready",
@@ -235,7 +265,7 @@ export async function recordCalibration(ctx: Ctx, study: StudyRow, report: Calib
       best_sha: report.baselineSha,
       segment: k,
     });
-    store.event(study.id, "calibration.ready", "plugin", { segment: k, mde: report.mde, noise_floor: report.noiseFloor, eval_seconds: report.evalSeconds, oracle: report.oracleHash, hosts: report.hosts.length });
+    store.event(study.id, "calibration.ready", "plugin", { segment: k, mde: report.mde, noise_floor: report.noiseFloor, eval_seconds: report.evalSeconds, oracle: report.oracleHash, hosts: report.hosts.length, warnings: (report.warnings ?? []).length });
     if (k > Math.max(1, study.segment)) store.event(study.id, "segment.started", "plugin", { segment: k, baseline: report.baselineSha, oracle: report.oracleHash, spec_version: study.spec_version });
   });
 }

@@ -183,7 +183,7 @@ export const GLOSSARY = {
   standalone: "Standalone check: the changeset applied alone on its PR base (the study base, or the PR below it in a stack), gated and measured.",
   droppable: "Droppable: the contribution's CI reaches zero, so there's no evidence it helps. You decide whether to keep it (for example as a simplification).",
   unexplained: "Unexplained: the measured total gain minus the sum of the contributions. Within its CI the changes add up; beyond it they interact.",
-  guardrail: "Guardrail: a secondary metric that may not regress beyond its limit. Today each promotion is checked against the best before it.",
+  guardrail: "Guardrail: a secondary metric that may not regress beyond its limits: per step against the best before it, and in total against the segment base. Judged on a CI: broken only when the whole CI is beyond a limit; inconclusive (flagged, not a rejection) when it straddles one.",
   drift: "Drift check: an A/A run on best while the study runs. Noise above the limit pauses the study, because verdicts would be random.",
   holdout: "Holdout: a hidden workload on the bench host. Wins must not regress on it; agents only learn pass or fail.",
   segment: "Segment: a period with one fixed oracle version. Changing the oracle starts a new segment with a new calibration.",

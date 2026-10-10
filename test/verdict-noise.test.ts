@@ -23,7 +23,7 @@ describe("decideVerdict", () => {
   it("turns a win that breaks a guardrail into a lose with the reason", () => {
     const v = decideVerdict(outcome({ guardrails: { rss: 0.08 } }), s);
     expect(v.verdict).toBe("lose");
-    expect(v.reasons.join()).toContain("guardrail rss regressed 8.00% (limit 5.00%)");
+    expect(v.reasons.join()).toContain("guardrail rss: 8.0% worse than best, beyond the 5.0% limit; 8.0% worse than the segment base, beyond the 5.0% total limit");
   });
   it("treats a missing guardrail metric as broken", () => {
     expect(decideVerdict(outcome({ guardrails: { rss: Number.NaN } }), s).verdict).toBe("lose");

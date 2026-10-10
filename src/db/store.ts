@@ -1,7 +1,7 @@
 // Typed repository over the plugin database. All writes that change study
 // state also append an audit event in the same transaction.
 import type Database from "better-sqlite3";
-import type { StudySpec } from "../spec.ts";
+import { normalizeSpec, type StudySpec } from "../spec.ts";
 import type { CandidateStage, IdeaStatus, StudyState, ThreadRole, ThreadState } from "./schema.ts";
 import type { Verdict } from "../verdict.ts";
 
@@ -305,6 +305,8 @@ export interface HarvestRow {
   total_ci_lo: number | null;
   total_ci_hi: number | null;
   total_n: number | null;
+  /** Per guardrail: what base → best cost it, relative to best (positive = best is worse), with a CI. */
+  total_guardrails_json: string | null;
   /** The same gain normalized by base (the usual "best vs base"). */
   total_vs_base: number | null;
   stacks_json: string | null;
@@ -361,6 +363,8 @@ export interface ChangesetRow {
   pr_status: "drafted" | "branch" | "pushed" | "opened" | "failed" | null;
   /** The human's choice for a droppable changeset: "keep", "drop", or null (undecided). */
   human_choice: "keep" | "drop" | null;
+  /** Per guardrail: what this changeset costs it (best vs best without it), relative to best, positive = worse. */
+  guardrails_json: string | null;
 }
 
 export interface Budget {
@@ -473,7 +477,7 @@ export class Store {
   specOfVersion(studyId: string, version: number): StudySpec {
     const row = this.specVersion(studyId, version);
     if (!row) throw new Error(`spec v${version} not found`);
-    return JSON.parse(row.spec_json) as StudySpec;
+    return normalizeSpec(JSON.parse(row.spec_json) as StudySpec);
   }
   resolvedBench(studyId: string, version: number): ResolvedBenchHost[] {
     const row = this.specVersion(studyId, version);
@@ -485,7 +489,7 @@ export class Store {
   spec(study: StudyRow): StudySpec {
     const row = this.specVersion(study.id, study.spec_version);
     if (!row) throw new Error(`study ${study.slug} has no spec`);
-    return JSON.parse(row.spec_json) as StudySpec;
+    return normalizeSpec(JSON.parse(row.spec_json) as StudySpec);
   }
   approveSpec(studyId: string, version: number, actor: string): void {
     this.tx(() => {

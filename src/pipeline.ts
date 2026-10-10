@@ -20,8 +20,9 @@
 // next free slot every `oracle.drift.every` evaluations.
 import { BenchSite, BenchTransferError, makeBench as makeBenchOn, tail } from "./bench.ts";
 import { HostMutex, type Ctx } from "./context.ts";
-import type { BenchHostRow, CandidateRow, StudyRow, ThreadRow } from "./db/store.ts";
+import type { BenchHostRow, CandidateRow, Store, StudyRow, ThreadRow } from "./db/store.ts";
 import { driftExpensive, driftNoisy, type DriftResult } from "./drift.ts";
+import { poolPaired, positionsFromChain, promotionChain, type GuardrailCalibration, type GuardrailEstimate, type Position } from "./guardrails.ts";
 import { checkHealth } from "./health.ts";
 import { HOLDOUT_FAIL, runHoldout } from "./holdout.ts";
 import { HostJobLostError, RunAbortedError, type HostRunner } from "./host/runner.ts";
@@ -29,7 +30,7 @@ import { BenchError, strategyFor, type Bench, type MeasureOutcome, type RunResul
 import { clip, formatDuration, messageText, safeJson, verdictMessage, type AgentMessage } from "./prompts.ts";
 import { checkScope } from "./scope.ts";
 import { bestBranch, candidateRef, formatPct, type StudySpec } from "./spec.ts";
-import { applyConfirmation, decideVerdict, type VerdictResult } from "./verdict.ts";
+import { applyConfirmation, decideVerdict, outcomeEstimates, type VerdictResult } from "./verdict.ts";
 
 export type SubmitResult = { ok: true; candidate: CandidateRow; text: string } | { ok: false; text: string };
 
@@ -60,6 +61,21 @@ const MAX_RESTARTS = 6;
 /** The bench lock key a study's measurements on `hostId` serialize on. */
 export function benchLockKey(study: StudyRow, spec: StudySpec, hostId: string): string {
   return strategyFor(spec.oracle.noise).benchLock ? hostId : `${hostId}:${study.slug}`;
+}
+
+/**
+ * Best's position per guardrail against the active segment's base: the
+ * promotion chain base → best, compounded (see guardrails.ts).
+ */
+export function bestGuardrailPositions(store: Store, study: StudyRow, spec: StudySpec): Record<string, Position> {
+  const seg = store.segment(study.id, study.segment);
+  const chain = promotionChain(store.candidates(study.id, { stages: ["decided"] }), seg?.baseline_sha ?? study.base_sha, study.best_sha);
+  return positionsFromChain(spec, chain, (m) => safeJson(m));
+}
+
+/** The active segment's calibrated guardrail noise (worst bench host), by guardrail name. */
+export function segmentGuardrailCalibration(store: Store, study: StudyRow): GuardrailCalibration[] {
+  return safeJson<{ guardrails?: GuardrailCalibration[] }>(store.segment(study.id, study.segment)?.details_json ?? null)?.guardrails ?? [];
 }
 
 /** Hold the bench lock of `hostId` for `fn` and record the busy interval (bench utilization, overlap audits). */
@@ -166,6 +182,7 @@ export class Pipeline {
       candidateRef: candidateRef(study.slug, n),
       baseSha: worker.fork_sha,
       bestSha: study.best_sha,
+      ignore: [...(spec.scope.ignore ?? [])],
     });
     // A worker that rebased onto a newer best forks from there now.
     const forkSha = snap.forkSha ?? worker.fork_sha;
@@ -185,14 +202,17 @@ export class Pipeline {
         lines_deleted: snap.linesDeleted,
       });
       store.updateThread(worker.id, { submissions: worker.submissions + 1, nudged_at: null, fork_sha: forkSha, pending_notice: null });
-      store.event(study.id, "candidate.submitted", worker.thread_id!, { candidate: c.id, n, sha: snap.sha, fork: forkSha, files: snap.changedPaths.length });
+      store.event(study.id, "candidate.submitted", worker.thread_id!, { candidate: c.id, n, sha: snap.sha, fork: forkSha, files: snap.changedPaths.length, ignored: snap.ignoredPaths?.length ?? 0 });
       return c;
     });
     const scope = checkScope(spec.scope, snap);
+    const ignoredNote = snap.ignoredPaths?.length
+      ? ` Left out ${snap.ignoredPaths.length}${snap.ignoredPaths.length >= 200 ? "+" : ""} untracked build output(s) or cache file(s) matching [scope] ignore (e.g. ${snap.ignoredPaths.slice(0, 3).join(", ")}); they are never committed.`
+      : "";
     if (!scope.ok) {
       const decided = this.decide(candidate, { verdict: "rejected", reasons: scope.reasons }, { reported: true });
       const left = spec.agents.max_submissions_per_worker - worker.submissions - 1;
-      return { ok: true, candidate: decided, text: messageText(withNotice(notice, verdictMessage(decided, { submissionsLeft: left, spec }))) };
+      return { ok: true, candidate: decided, text: messageText(withNotice(notice, verdictMessage(decided, { submissionsLeft: left, spec, guardrailPositions: bestGuardrailPositions(store, study, spec) }))) };
     }
     store.updateCandidate(candidate.id, { stage: "gating" });
     this.changed(study.id);
@@ -206,7 +226,7 @@ export class Pipeline {
       text: withNotice(
         notice,
         `Submitted as c/${n} (${snap.sha.slice(0, 10)}, ${snap.changedPaths.length} files, +${snap.linesAdded}/-${snap.linesDeleted}). ` +
-          `Scope check passed. Rebase onto best and gates run now, then the bench queue: ${ahead} candidate(s) ahead of you.${eta} ` +
+          `Scope check passed.${ignoredNote} Rebase onto best and gates run now, then the bench queue: ${ahead} candidate(s) ahead of you.${eta} ` +
           "END YOUR TURN NOW. The verdict arrives as a message.",
       ),
     };
@@ -550,6 +570,9 @@ export class Pipeline {
     const baseline = safeJson<{ sha: string; runs: RunResult[] }>(store.benchHost(study.id, host.host_id)?.baseline_json ?? null);
     const mde = Math.max(segment?.mde ?? spec.oracle.protocol.min_effect, host.mde ?? 0);
     const noiseFloor = host.noise_floor ?? segment?.noise_floor ?? null;
+    const guardrailNoise = Object.fromEntries(segmentGuardrailCalibration(store, study).map((g) => [g.name, g.noise]));
+    // Guardrails: the step is judged against best, the total against the segment base (best's position so far).
+    const prior = bestGuardrailPositions(store, study, spec);
     const outcome = await strategy.measure({
       bench,
       spec,
@@ -559,14 +582,25 @@ export class Pipeline {
       bestCache,
       baseline: baseline?.sha === against ? baseline.runs : null,
       noiseFloor,
+      guardrailNoise,
       signal,
     });
-    let result = decideVerdict(outcome, spec);
+    let result = decideVerdict(outcome, spec, { prior });
+    let estimates: Record<string, GuardrailEstimate> = outcomeEstimates(outcome);
     if (result.verdict === "win" && spec.oracle.protocol.confirm && strategy.kind === "noisy") {
       store.updateCandidate(c.id, { stage: "confirming" });
       this.changed(study.id);
-      const confirmation = await strategy.measure({ bench, spec, mde, rng: this.ctx.rng, record: record("confirm"), bestCache: null, signal });
-      result = applyConfirmation(result, decideVerdict(confirmation, spec));
+      const confirmation = await strategy.measure({ bench, spec, mde, rng: this.ctx.rng, record: record("confirm"), bestCache: null, guardrailNoise, signal });
+      // Guardrails didn't select the candidate, so the confirmation judges them on both measurements' pairs.
+      const p = spec.oracle.protocol;
+      const second = outcomeEstimates(confirmation);
+      const pooled: Record<string, GuardrailEstimate> = {};
+      for (const g of spec.guardrail) {
+        const e = poolPaired(estimates[g.name], second[g.name], p.confidence, p.bootstrap, this.ctx.rng);
+        if (e) pooled[g.name] = e;
+      }
+      estimates = pooled;
+      result = applyConfirmation(result, decideVerdict({ ...confirmation, guardrails: Object.fromEntries(Object.entries(pooled).map(([k, e]) => [k, e.regression])), guardrailEstimates: pooled }, spec, { prior }));
     }
     if (result.verdict === "win" && spec.oracle.holdout) {
       store.updateCandidate(c.id, { stage: "confirming" });
@@ -600,7 +634,15 @@ export class Pipeline {
       effect: Number.isFinite(outcome.effect) ? outcome.effect : null,
       ci_lo: outcome.ciLo,
       ci_hi: outcome.ciHi,
-      metrics_json: JSON.stringify({ best: outcome.bestMetrics, candidate: outcome.candidateMetrics, guardrails: outcome.guardrails, n: outcome.n, mde }),
+      metrics_json: JSON.stringify({
+        best: outcome.bestMetrics,
+        candidate: outcome.candidateMetrics,
+        guardrails: Object.fromEntries(Object.entries(estimates).map(([k, e]) => [k, Number.isFinite(e.regression) ? e.regression : null])),
+        guardrailCi: Object.fromEntries(Object.entries(estimates).map(([k, e]) => [k, { lo: e.lo, hi: e.hi, n: e.n }])),
+        ...(result.guardrails ? { guardrailJudgement: result.guardrails } : {}),
+        n: outcome.n,
+        mde,
+      }),
       diag_json: JSON.stringify(outcome.candidateDiag.slice(0, 40)),
       bench_seconds: c.bench_seconds + seconds,
     });
@@ -892,7 +934,7 @@ export class Pipeline {
     const spec = store.spec(study);
     const left = spec.agents.max_submissions_per_worker - worker.submissions;
     try {
-      await this.ctx.bb.send(c.thread_id!, withNotice(worker.pending_notice, verdictMessage(c, { submissionsLeft: left, spec })));
+      await this.ctx.bb.send(c.thread_id!, withNotice(worker.pending_notice, verdictMessage(c, { submissionsLeft: left, spec, guardrailPositions: bestGuardrailPositions(store, study, spec) })));
       store.tx(() => {
         store.updateCandidate(c.id, { reported_at: this.ctx.now() });
         store.updateThread(worker.id, { pending_notice: null });

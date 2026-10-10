@@ -24,7 +24,7 @@ A **study** improves one metric of a codebase over hours or days. The plugin run
 | `bb study ideas add <slug> "<title>" [--rationale --theme --priority --start-ref c/N --variation-of ID --no-pin]` | Queue (and pin) an idea |
 | `bb study ideas list <slug>` | The idea board |
 | `bb study workers <slug>` | Worker threads and their state |
-| `bb study archive <slug>` | Stop workers, archive their threads, remove bench checkouts (git refs kept) |
+| `bb study archive <slug> [--archive-thread]` | Stop workers, archive their threads, remove bench checkouts (git refs kept); `--archive-thread` also archives the study thread |
 | `bb study harvest <slug> [--wait] [--restart] [--no-measure-standalone]` | Harvest (dry run): group the wins into changesets, measure each one's contribution by ablation, check each alone, draft local branches and PR bodies. Shows progress when one is running |
 | `bb study harvest <slug> --publish` | Push the ready harvest's branches and open DRAFT PRs with `gh` (refuses without a GitHub remote) |
 | `bb study report <slug>` | The study report in Markdown |
@@ -43,7 +43,7 @@ Draft (spec proposed with `study_propose`) → Calibrating (`bb study calibrate`
 
 ## Verdicts
 
-`win` (promoted: squashed onto `studies/<slug>/best`; it passed confirmation and, when configured, the hidden holdout), `lose` (worse, broke a guardrail relative to best, or failed the holdout), `inconclusive` (did not clear the minimum detectable effect), `gate_failed`, `conflict` (no longer applies onto best; the worker rebases and resubmits, and the first two conflicts don't count against its submission limit), `rejected` (touched protected or out-of-scope paths, or too large). Candidates are rebased onto best automatically when best moves; a win measured against a best that moved is measured again before promotion. Every candidate is kept as `refs/studies/<slug>/c/<n>`. Nothing is pushed.
+`win` (promoted: squashed onto `studies/<slug>/best`; it passed confirmation and, when configured, the hidden holdout), `lose` (worse, broke a guardrail, or failed the holdout; a guardrail breaks when its CI is entirely beyond its per-step limit against best or its total limit against the segment base; a CI that straddles a limit is flagged inconclusive, not a rejection), `inconclusive` (did not clear the minimum detectable effect), `gate_failed`, `conflict` (no longer applies onto best; the worker rebases and resubmits, and the first two conflicts don't count against its submission limit), `rejected` (touched protected or out-of-scope paths, or too large). Candidates are rebased onto best automatically when best moves; a win measured against a best that moved is measured again before promotion. Every candidate is kept as `refs/studies/<slug>/c/<n>`. Nothing is pushed.
 
 ## If you are the strategist (the study thread)
 
@@ -54,6 +54,7 @@ Messages starting with `[autoresearch] Strategist round` carry a digest: recent 
 - retire dead directions: `study_retire_idea`
 - keep the dossier current: `study_update_dossier` (workers get it in their brief)
 - look things up: `study_search_findings`
+- watch the guardrail headroom line: each guardrail's room left under its total limit against the segment base. With little room left, prefer ideas that don't cost that guardrail, or that win some of it back; a win that would push best beyond the total limit is rejected
 - relay any "Notices for the human" in one or two lines, pointing to the Studies page for anything that needs them
 - reply to the human in two or three short lines (what changed, what you queued, anything they should decide) and end your turn
 - write improvements the way the plugin does: better is positive, in the metric's own terms ("12% lower p99")

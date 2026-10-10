@@ -17,6 +17,7 @@ import type {
   SnapshotInput,
   SnapshotResult,
 } from "./contract.ts";
+import { ignoreExcludePathspecs, ignoreIncludePathspecs } from "../scope.ts";
 
 const GIT_IDENTITY: Record<string, string> = {
   GIT_AUTHOR_NAME: "autoresearch",
@@ -172,10 +173,22 @@ export async function deleteRef(repoPath: string, ref: string): Promise<{ delete
 
 export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
   const cwd = input.worktreePath;
-  await git(cwd, ["add", "-A"]);
-  const status = await git(cwd, ["status", "--porcelain"]);
+  const ignore = input.ignore ?? [];
+  // Tracked files: every modification and deletion. Untracked files: all but
+  // build outputs and caches ([scope] ignore), so a repo without a .gitignore
+  // doesn't get __pycache__/*.pyc or node_modules/ committed into candidates.
+  let ignoredPaths: string[] = [];
+  if (ignore.length) {
+    await git(cwd, ["add", "-u"]);
+    await git(cwd, ["add", "-A", "--", ".", ...ignoreExcludePathspecs(ignore)]);
+    const left = await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...ignoreIncludePathspecs(ignore)], { allowFail: true });
+    ignoredPaths = left.stdout.split("\0").filter(Boolean).slice(0, 200);
+  } else {
+    await git(cwd, ["add", "-A"]);
+  }
+  const staged = await git(cwd, ["diff", "--cached", "--quiet"], { allowFail: true });
   let committed = false;
-  if (status.stdout.length > 0) {
+  if (staged.code === 1) {
     await git(cwd, ["commit", "--no-verify", "--no-gpg-sign", "-q", "-m", input.message]);
     committed = true;
   }
@@ -187,6 +200,7 @@ export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
     if (mb.code === 0 && mb.stdout) forkSha = mb.stdout;
   }
   const names = await git(cwd, ["diff", "--name-only", "--no-renames", forkSha, sha]);
+  const added = await git(cwd, ["diff", "--name-only", "--no-renames", "--diff-filter=A", forkSha, sha]);
   const numstat = await git(cwd, ["diff", "--numstat", "--no-renames", forkSha, sha]);
   let linesAdded = 0;
   let linesDeleted = 0;
@@ -200,6 +214,8 @@ export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
     forkSha,
     committed,
     changedPaths: names.stdout ? names.stdout.split("\n").filter(Boolean) : [],
+    addedPaths: added.stdout ? added.stdout.split("\n").filter(Boolean) : [],
+    ignoredPaths,
     linesAdded,
     linesDeleted,
   };

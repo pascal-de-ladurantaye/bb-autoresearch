@@ -9,7 +9,7 @@ import type { OracleView, OverviewResult } from "../views.ts";
 import { ApproveSpecDialog, StartDialog } from "./Actions.tsx";
 import { useLive, type Rpc } from "./data.ts";
 import { ago, duration, frac, shortSha } from "./format.ts";
-import { Callout, EmptyState, Help, Mono, Section, StatePill, TabState } from "./ui.tsx";
+import { Callout, EmptyState, GuardrailBadge, Help, Mono, Section, StatePill, TabState } from "./ui.tsx";
 
 export function OracleTab({ slug, o: overview, rpc, onChanged }: { slug: string; o: OverviewResult; rpc: Rpc; onChanged: () => void }) {
   const o = useLive((r) => r.call("study.oracle", { slug }), [slug], 15_000);
@@ -194,6 +194,43 @@ function Calibration({ c, specVersion, onAction }: { c: OracleView["calibration"
                   <td className="py-1 text-right">{frac(h.noiseFloor)}</td>
                   <td className="py-1 text-right">{frac(h.mde)}</td>
                   <td className="py-1 text-right">{duration(h.evalSeconds)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : null}
+        {c.warnings.length ? (
+          <ul className="list-disc pl-5 text-xs text-warning-text" aria-label="Calibration warnings">
+            {c.warnings.map((w, i) => (
+              <li key={i}>Warning: {w}</li>
+            ))}
+          </ul>
+        ) : null}
+        {c.guardrails.length ? (
+          <table className="w-full text-xs tabular-nums" aria-label="Guardrail noise">
+            <thead className="text-left text-muted-foreground">
+              <tr>
+                <th className="px-2 py-1 font-medium">
+                  Guardrail <Help term="guardrail" />
+                </th>
+                <th className="px-2 py-1 text-right font-medium">A/A noise</th>
+                <th className="px-2 py-1 text-right font-medium">CI half-width</th>
+                <th className="px-2 py-1 text-right font-medium">Limit (step / total)</th>
+                <th className="px-2 py-1 font-medium">Judged</th>
+              </tr>
+            </thead>
+            <tbody>
+              {c.guardrails.map((g) => (
+                <tr key={g.name} className="border-t border-border align-top">
+                  <td className="py-1 pr-2">{g.name}</td>
+                  <td className="px-2 py-1 text-right">{frac(g.noise)}</td>
+                  <td className="px-2 py-1 text-right">{frac(g.halfWidth)}</td>
+                  <td className="px-2 py-1 text-right">
+                    {frac(g.limit, 1)} / {frac(g.totalLimit, 1)}
+                  </td>
+                  <td className="py-1">
+                    <GuardrailBadge state={g.judgeable ? "pass" : "inconclusive"} text={g.judgeable ? `rejected beyond about ${frac(g.limit + g.halfWidth, 1)} worse` : "too noisy to show within its limit"} title={g.text} />
+                  </td>
                 </tr>
               ))}
             </tbody>

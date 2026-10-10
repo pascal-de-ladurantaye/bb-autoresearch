@@ -77,6 +77,8 @@ export const STATE_TONE: Record<string, string> = {
 export const GUARDRAIL: Record<string, { icon: string; tone: string }> = {
   pass: { icon: "Check", tone: "text-success" },
   warn: { icon: "AlertTriangle", tone: "text-warning-text" },
+  // A CI straddles a limit: flagged (warn tone, its own glyph and word), not a rejection.
+  inconclusive: { icon: "AlertCircle", tone: "text-warning-text" },
   broken: { icon: "CircleX", tone: "text-destructive" },
   missing: { icon: "CircleQuestion", tone: "text-muted-foreground" },
 };

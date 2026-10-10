@@ -28,6 +28,34 @@ const fraction = z.union([z.number(), z.string()]).transform((value, ctx) => {
 });
 
 const command = z.string().trim().min(1).max(4000);
+
+/** Untracked files the worker snapshot never commits (gitignore-style patterns, see scope.ts). */
+export const DEFAULT_IGNORE = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pyo",
+  ".pytest_cache/",
+  "node_modules/",
+  "dist/",
+  "build/",
+  "target/",
+  ".DS_Store",
+  "coverage/",
+  ".coverage",
+  ".nyc_output/",
+  "htmlcov/",
+] as const;
+
+const ignorePattern = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .refine((g) => !g.startsWith("!"), "ignore patterns can't be negated")
+  .refine((g) => !g.split("/").includes(".."), "ignore patterns may not contain ..")
+  .refine((g) => !/[:'"\\]/u.test(g), "ignore patterns may not contain quotes, backslashes or colons")
+  .refine((g) => g.replace(/^\/+|\/+$/gu, "").length > 0, "ignore patterns must name something");
+
 const glob = z
   .string()
   .trim()
@@ -66,10 +94,14 @@ export const specSchema = z
         z
           .object({
             name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/u),
+            /** Per step: how much worse a candidate may be than the current best. */
             max_regression: fraction,
+            /** Cumulative: how much worse best may get than the segment base, over all promotions (default: max_regression). */
+            max_total_regression: fraction.optional(),
             direction: z.enum(["lower", "higher"]).default("lower"),
           })
-          .strict(),
+          .strict()
+          .transform((g) => ({ ...g, max_total_regression: g.max_total_regression ?? g.max_regression })),
       )
       .max(16)
       .default([]),
@@ -79,6 +111,11 @@ export const specSchema = z
         protected: z.array(glob).max(64).default([]),
         max_files: z.number().int().min(1).max(10_000).default(50),
         max_lines: z.number().int().min(1).max(1_000_000).default(2000),
+        /**
+         * Build outputs and caches (gitignore-style patterns) that snapshots never
+         * commit, and that a candidate may not add. Replaces the defaults when set.
+         */
+        ignore: z.array(ignorePattern).max(64).default([...DEFAULT_IGNORE]),
       })
       .strict(),
     oracle: z
@@ -258,6 +295,9 @@ export function validateSemantics(spec: StudySpec): SpecResult {
   for (const g of spec.guardrail) {
     if (names.has(g.name)) errors.push(`guardrail ${g.name}: duplicates another metric name`);
     names.add(g.name);
+    if (g.max_total_regression < g.max_regression) {
+      warnings.push(`guardrail ${g.name}: max_total_regression ${(g.max_total_regression * 100).toFixed(1)}% is below max_regression ${(g.max_regression * 100).toFixed(1)}%, so the total limit is the one that binds`);
+    }
   }
   for (const e of spec.scope.editable) {
     for (const pr of spec.scope.protected) {
@@ -278,6 +318,16 @@ export function validateSemantics(spec: StudySpec): SpecResult {
   }
   if (errors.length) return { ok: false, errors };
   return { ok: true, spec, warnings };
+}
+
+/**
+ * Fill fields added after a spec version was stored (spec_json is the parsed
+ * spec as it was then), so old versions read like new ones and hash the same.
+ */
+export function normalizeSpec(spec: StudySpec): StudySpec {
+  const guardrail = (spec.guardrail ?? []).map((g) => ({ ...g, direction: g.direction ?? "lower", max_total_regression: g.max_total_regression ?? g.max_regression }));
+  const scope = { ...spec.scope, ignore: spec.scope.ignore ?? [...DEFAULT_IGNORE] };
+  return { ...spec, guardrail, scope };
 }
 
 function canonical(value: unknown): string {

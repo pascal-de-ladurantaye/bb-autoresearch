@@ -12,7 +12,7 @@ You turn the user's goal into a study spec (TOML) that the autoresearch plugin c
 Ask only what you cannot find in the code:
 
 - **Objective and metric.** What number should move, which direction is better, and its unit. One primary metric; others become guardrails.
-- **Guardrails.** Secondary metrics that must not regress, each with a limit (e.g. memory ≤ 5% worse).
+- **Guardrails.** Secondary metrics that must not regress, each with two limits: how much worse one change may make it than the current best (`max_regression`, e.g. memory ≤ 5% worse), and how much worse it may get in total over the whole study, against the segment base (`max_total_regression`, default the same as `max_regression`; e.g. 10%). Without a total limit, many small regressions can each pass and add up.
 - **Scope.** Which directories workers may edit. Everything else, and especially the benchmark harness and tests, is protected.
 - **Budget.** How many candidates and bench hours; a deadline if any.
 - **Base.** The branch to start from (default `main`).
@@ -50,7 +50,8 @@ direction = "lower"              # lower | higher
 
 [[guardrail]]
 name = "rss_mb"
-max_regression = "5%"
+max_regression = "5%"            # per step: vs the current best
+max_total_regression = "10%"     # in total: best vs the segment base (default: max_regression)
 direction = "lower"              # direction of "better" for this metric
 
 [scope]
@@ -58,6 +59,9 @@ editable = ["src/parser/**"]
 protected = ["bench/**", "test/**"]
 max_files = 20                   # optional, default 50
 max_lines = 800                  # optional, default 2000
+# optional: untracked build outputs and caches the snapshot never commits
+# (gitignore-style; setting it replaces the defaults below; [] turns it off)
+ignore = ["__pycache__/", "*.pyc", "*.pyo", ".pytest_cache/", "node_modules/", "dist/", "build/", "target/", ".DS_Store", "coverage/", ".coverage", ".nyc_output/", "htmlcov/"]
 
 [oracle]
 build = "make release"           # optional
@@ -114,6 +118,10 @@ measure_standalone = true        # also measure each PR's effect on its base (be
 group_timeout_minutes = 10       # wait this long for study_propose_harvest, then one changeset per win
 remote = "origin"                # the GitHub remote `--publish` pushes to
 ```
+
+The plugin commits each worker's worktree for it (`git add`), so a repo without a complete `.gitignore` would otherwise get build outputs committed into candidates, where they conflict. `[scope] ignore` lists them, gitignore-style: a pattern without a slash matches at any depth (`*.pyc`, `__pycache__/`), one with a slash is anchored at the repo root (`/out/`), and a trailing slash means a directory. Untracked files matching it are never committed; changes to tracked files always are; a candidate that adds a matching file anyway (the worker committed it itself) is rejected with instructions. If the repo keeps sources in a directory the defaults name (a `build/` of scripts, say), set `ignore` without that pattern; calibration warns when the base tracks files that match.
+
+Guardrails are judged on a confidence interval, like the primary metric: a guardrail breaks a win only when its whole CI is beyond a limit; when the CI straddles a limit it is flagged inconclusive, not a rejection. Calibration measures each guardrail's noise and warns when it exceeds the limit (such a guardrail can never be shown within it): then loosen the limit, make its measurement steadier, or raise `n_max`.
 
 Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries must name enrolled BB machines (checked when you call `study_propose`). Unknown keys are rejected.
 

@@ -333,14 +333,15 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       archive: cliCommand({
-        summary: "Stop a study for good: stop workers, archive their threads, remove bench checkouts (refs are kept)",
+        summary: "Stop a study for good: stop workers, archive their threads, remove bench checkouts (refs are kept); --archive-thread also archives the study thread",
         positionals: slugArg,
-        options: { ...jsonOpt },
+        options: { ...jsonOpt, "archive-thread": { type: "boolean", description: "Also archive the study thread (the conversation that created the study)" } },
         run: (input, ctx) =>
           wrap(engine, input.positionals.slug, async () => {
             const actor = guardHuman(engine, ctx);
-            await engine.auditControl(input.positionals.slug, "archive", caller(ctx), "study archived");
-            return control(engine, input.positionals.slug, input.options.json, await engine.archiveStudy(input.positionals.slug, actor));
+            const archiveThread = Boolean(input.options["archive-thread"]);
+            await engine.auditControl(input.positionals.slug, "archive", caller(ctx), `study archived${archiveThread ? " with its study thread" : ""}`, { archiveThread });
+            return control(engine, input.positionals.slug, input.options.json, await engine.archiveStudy(input.positionals.slug, actor, { archiveThread }));
           }),
       }),
       workers: cliCommand({
@@ -591,12 +592,13 @@ function benchText(engine: Engine, slug: string): string {
 
 function calibrationText(engine: Engine, slug: string): string {
   const s = engine.study(slug);
-  const report = safeJson<{ ok: boolean; problems: string[]; baselineSha: string; oracleHash: string; report: string }>(s.calibration_json);
+  const report = safeJson<{ ok: boolean; problems: string[]; warnings?: string[]; baselineSha: string; oracleHash: string; report: string }>(s.calibration_json);
   if (s.calibration_status === "running") return "Calibration: running.";
   if (!report) return `Calibration: ${s.calibration_status ?? "not run"}.`;
   if (!report.ok) return `Calibration FAILED (study back in draft):\n${report.problems.map((p) => `- ${clip(p, 600)}`).join("\n")}\nAsk the study thread to revise the spec, then \`bb study calibrate ${slug}\`.`;
   const next = s.calibration_approved_at === null ? `\nApprove and start with \`bb study start ${slug}\`.` : "";
-  return `Calibration ${s.calibration_approved_at === null ? "ready" : "approved"} (baseline ${report.baselineSha.slice(0, 10)}, oracle ${report.oracleHash}):\n${report.report}${next}`;
+  const warnings = (report.warnings ?? []).map((w) => `\nWarning: ${clip(w, 600)}`).join("");
+  return `Calibration ${s.calibration_approved_at === null ? "ready" : "approved"} (baseline ${report.baselineSha.slice(0, 10)}, oracle ${report.oracleHash}):\n${report.report}${warnings}${next}`;
 }
 
 export function showStudy(engine: Engine, slug: string, eventCount: number): string {
@@ -621,7 +623,7 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
       kv([
         ["Objective", clip(spec.study.objective, 300)],
         ["Metric", `${spec.metric.name}${spec.metric.unit ? ` (${spec.metric.unit})` : ""}, ${spec.metric.direction} is better · ${spec.oracle.noise} oracle`],
-        ["Guardrails", spec.guardrail.map((g) => `${g.name} (limit ${magnitudePct(g.max_regression, 1)} worse)`).join(", ") || "none"],
+        ["Guardrails", spec.guardrail.map((g) => `${g.name} (limit ${magnitudePct(g.max_regression, 1)} worse per step, ${magnitudePct(g.max_total_regression ?? g.max_regression, 1)} in total)`).join(", ") || "none"],
         ["Scope", `editable ${spec.scope.editable.join(", ")} · protected ${spec.scope.protected.join(", ") || "none"}`],
         ["Oracle", `build ${spec.oracle.build ? "`" + clip(spec.oracle.build, 80) + "`" : "none"} · gate ${spec.oracle.gate.map((g) => "`" + clip(g, 60) + "`").join(", ") || "none"} · measure \`${clip(spec.oracle.measure, 80)}\`${spec.oracle.holdout ? " · holdout: configured (hidden from agents)" : ""}`],
         ["Segment", segmentLine(engine, s)],
@@ -640,7 +642,7 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
     ),
   );
   if (o.secondary.guardrails.length) {
-    lines.push(...section("Guardrails (best vs the segment base)", o.secondary.guardrails.map((g) => `  ${g.name}: ${g.label} · ${g.text}${g.raw ? ` · ${g.raw}` : ""}`)));
+    lines.push(...section("Guardrails (best vs the segment base)", o.secondary.guardrails.map((g) => `  ${g.name}: ${g.label} · ${g.text}${g.raw ? ` · ${g.raw}` : ""}\n    ${g.headroomText}`)));
   }
   lines.push(...section("Bench hosts", benchLines(engine, s)));
   const cal = o.calibration;
