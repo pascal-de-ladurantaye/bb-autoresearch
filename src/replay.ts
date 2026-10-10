@@ -27,7 +27,7 @@ import {
   type Stage,
   type WorkerPhase,
 } from "./live-model.ts";
-import { improvementText, type MetricInfo } from "./present.ts";
+import { improvementText, runningStatusText, verdictCause, type MetricInfo, type NoiseClass } from "./present.ts";
 import { titleKey, upNext } from "./scheduler.ts";
 
 /** Everything replay needs: immutable metadata plus the timestamped event rows and the measurements' bands. */
@@ -42,12 +42,13 @@ export interface ReplayBundle {
   start: number;
   end: number;
   now: number;
-  spec: { maxCandidates: number; maxSubmissions: number; maxWorkers: number };
+  spec: { maxCandidates: number; maxSubmissions: number; maxWorkers: number; noise?: NoiseClass };
   hosts: Array<{ hostId: string; name: string }>;
   ideas: Array<{ id: number; title: string; theme: string; source: string; variationOf: number | null }>;
   /** Worker rows (threads.id is the lane key). */
   workers: Array<{ key: number; threadId: string | null; ideaId: number | null; spawnedAt: number }>;
-  candidates: Array<{ id: number; n: number; ideaId: number | null; threadId: string | null; title: string }>;
+  /** `workerKey`: the worker row that submitted it (candidates.worker_id); lanes link through it, the BB thread id is the fallback. */
+  candidates: Array<{ id: number; n: number; ideaId: number | null; threadId: string | null; workerKey?: number | null; title: string }>;
   /** Bench lock intervals (utilization). */
   intervals: Array<{ hostId: string; start: number; end: number | null }>;
   /** Event rows in id order, payloads trimmed to what replay reads. */
@@ -135,6 +136,7 @@ interface RC {
   stageAt: number;
   verdict: string | null;
   effect: number | null;
+  cause: string | null;
   host: string | null;
   pairs: Pairs | null;
   rebases: number;
@@ -152,8 +154,9 @@ export interface ReplayState {
   workers: Record<number, RW>;
   cands: Record<number, RC>;
   candCount: number;
-  latestByThread: Record<string, number>;
-  submissions: Record<string, number>;
+  /** Worker row (lane key) → its latest candidate number, and its submissions used. */
+  latestByWorker: Record<number, number>;
+  submissions: Record<number, number>;
   ideas: Record<number, { status: string; priority: number; pinned: boolean; at: number }>;
   best: number | null;
   movedAt: number | null;
@@ -167,7 +170,7 @@ export interface ReplayState {
 }
 
 function empty(): ReplayState {
-  return { i: 0, lastEventId: 0, workers: {}, cands: {}, candCount: 0, latestByThread: {}, submissions: {}, ideas: {}, best: null, movedAt: null, wins: [], state: "draft", runningSince: null, pauseReason: null, w: null, drift: {}, hostStatus: {} };
+  return { i: 0, lastEventId: 0, workers: {}, cands: {}, candCount: 0, latestByWorker: {}, submissions: {}, ideas: {}, best: null, movedAt: null, wins: [], state: "draft", runningSince: null, pauseReason: null, w: null, drift: {}, hostStatus: {} };
 }
 
 function clone(s: ReplayState): ReplayState {
@@ -180,7 +183,7 @@ function clone(s: ReplayState): ReplayState {
     ...s,
     workers: rec(s.workers),
     cands: rec(s.cands),
-    latestByThread: { ...s.latestByThread },
+    latestByWorker: { ...s.latestByWorker },
     submissions: { ...s.submissions },
     ideas: rec(s.ideas),
     wins: [...s.wins],
@@ -247,7 +250,7 @@ export class ReplayModel {
     // The feed, told once over the whole study (only the kinds the live view's feed reads).
     this.feed = feedItems(
       this.events.filter((e) => FEED_KINDS.has(e.kind)),
-      { metric: bundle.metric, ideas: new Map(bundle.ideas.map((i) => [i.id, { title: i.title }] as const)), hostName: (id) => this.hostName.get(id) ?? id, candidateN: new Map(bundle.candidates.map((c) => [c.id, c.n] as const)) },
+      { metric: bundle.metric, ideas: new Map(bundle.ideas.map((i) => [i.id, { title: i.title }] as const)), hostName: (id) => this.hostName.get(id) ?? id, candidateN: new Map(bundle.candidates.map((c) => [c.id, c.n] as const)), noise: bundle.spec.noise ?? "noisy" },
     );
     this.feedMaxId = [];
     let m = 0;
@@ -255,6 +258,17 @@ export class ReplayModel {
       m = Math.max(m, f.id);
       this.feedMaxId.push(m);
     }
+  }
+
+  /**
+   * The lane (worker row) a candidate belongs to: its worker row, else the
+   * worker row its BB thread id maps to, else the submit event's worker row or thread.
+   */
+  private workerKeyOf(meta: ReplayBundle["candidates"][number] | undefined, d: Record<string, unknown>): number | null {
+    if (typeof meta?.workerKey === "number") return meta.workerKey;
+    const thread = meta?.threadId ?? str(d.worker);
+    if (thread && this.keyByThread.has(thread)) return this.keyByThread.get(thread)!;
+    return num(d.worker_row);
   }
 
   /** How many events happened at or before t. */
@@ -297,12 +311,12 @@ export class ReplayModel {
         if (!to) break;
         if (!c) {
           const meta = this.candByN.get(candN);
-          const thread = meta?.threadId ?? str(d.worker);
-          s.cands[candN] = { n: candN, id: num(d.candidate) ?? meta?.id ?? 0, stage: to, stageAt: e.at, verdict: str(d.verdict), effect: null, host: null, pairs: reducePairs(null, e), rebases: 0, submittedAt: e.at, decidedAt: null, queuedAt: to === "queued" ? e.at : null, startedAt: null };
+          const key = this.workerKeyOf(meta, d);
+          s.cands[candN] = { n: candN, id: num(d.candidate) ?? meta?.id ?? 0, stage: to, stageAt: e.at, verdict: str(d.verdict), effect: null, cause: null, host: null, pairs: reducePairs(null, e), rebases: 0, submittedAt: e.at, decidedAt: null, queuedAt: to === "queued" ? e.at : null, startedAt: null };
           s.candCount += 1;
-          if (thread) {
-            s.latestByThread[thread] = Math.max(s.latestByThread[thread] ?? 0, candN);
-            s.submissions[thread] = (s.submissions[thread] ?? 0) + 1;
+          if (key !== null) {
+            s.latestByWorker[key] = Math.max(s.latestByWorker[key] ?? 0, candN);
+            s.submissions[key] = (s.submissions[key] ?? 0) + 1;
           }
           break;
         }
@@ -317,6 +331,7 @@ export class ReplayModel {
         if (!c) break;
         c.verdict = str(d.verdict);
         c.effect = num(d.effect) ?? c.effect;
+        c.cause = str(d.cause) ?? verdictCause(c.verdict, d.reasons);
         c.decidedAt = e.at;
         if (d.verdict === "win" && num(d.effect) !== null) s.wins.push({ n: c.n, at: e.at, effect: num(d.effect)! });
         break;
@@ -340,8 +355,8 @@ export class ReplayModel {
         if (c) c.rebases += 1;
         break;
       case "submission.refunded": {
-        const thread = candN !== null ? this.candByN.get(candN)?.threadId : null;
-        if (thread) s.submissions[thread] = Math.max(0, (s.submissions[thread] ?? 0) - 1);
+        const key = num(d.worker) ?? (candN !== null ? this.workerKeyOf(this.candByN.get(candN), {}) : null);
+        if (key !== null) s.submissions[key] = Math.max(0, (s.submissions[key] ?? 0) - 1);
         break;
       }
       case "worker.phase": {
@@ -443,13 +458,14 @@ export class ReplayModel {
         n: c.n,
         ideaId: meta?.ideaId ?? null,
         ideaTitle: meta?.title ?? "",
-        workerKey: meta?.threadId ? (this.keyByThread.get(meta.threadId) ?? null) : null,
+        workerKey: this.workerKeyOf(meta, {}),
         stage: c.stage,
         column: columnOf(c.stage, c.verdict),
         stageAt: c.stageAt,
         verdict: c.verdict,
         effect: c.effect,
         effectText: c.effect === null ? null : improvementText(c.effect, metric, { digits: 1, factor: false }),
+        cause: c.stage === "decided" ? c.cause : null,
         hostId: c.host,
         pairs: mergeProgress(c.pairs, c.stage === "decided" ? null : bandOf.get(c.n)),
         rebases: c.rebases,
@@ -465,7 +481,7 @@ export class ReplayModel {
         const meta = this.workerMeta.get(w.key);
         const idea = w.ideaId !== null ? this.ideaById.get(w.ideaId) : undefined;
         const thread = w.threadId ?? null;
-        const latestN = thread ? (s.latestByThread[thread] ?? null) : null;
+        const latestN = s.latestByWorker[w.key] ?? null;
         const latest = latestN !== null ? s.cands[latestN] : undefined;
         const qpos = latest?.stage === "queued" ? queued.findIndex((q) => q.n === latest.n) + 1 + onBench : null;
         return {
@@ -477,7 +493,7 @@ export class ReplayModel {
           phase: w.phase,
           phaseAt: w.phaseAt,
           spawnedAt: meta?.spawnedAt ?? w.phaseAt,
-          submissions: thread ? (s.submissions[thread] ?? 0) : 0,
+          submissions: s.submissions[w.key] ?? 0,
           maxSubmissions: b.spec.maxSubmissions,
           candidate: latestN,
           candidateStage: latest?.stage ?? null,
@@ -520,16 +536,16 @@ export class ReplayModel {
     const history = bestHistory(s.wins, metric.direction);
     const value = history.length ? history.at(-1)!.value : null;
     const bestCand = s.best !== null ? s.cands[s.best] : undefined;
-    const winnerThread = s.best !== null ? (this.candByN.get(s.best)?.threadId ?? null) : null;
-    const winnerKey = winnerThread ? (this.keyByThread.get(winnerThread) ?? null) : null;
+    const winnerKey = s.best !== null ? this.workerKeyOf(this.candByN.get(s.best), {}) : null;
     const measuring = inFlight.filter((c) => c.stage === "measuring" || c.stage === "confirming").map((c) => `c/${c.n}`);
-    const depth = inFlight.filter((c) => c.stage === "gating" || c.stage === "queued" || c.stage === "measuring" || c.stage === "confirming").length;
+    const inTests = inFlight.filter((c) => c.stage === "gating").length;
     return {
       studyId: b.studyId,
       slug: b.slug,
       state: s.state,
-      statusLine: replayStatusLine(s.state, workers.length, measuring, depth, s.pauseReason),
+      statusLine: replayStatusLine(s.state, workers.length, measuring, { queued: queued.length, inTests }, s.pauseReason),
       metric,
+      noise: b.spec.noise ?? "noisy",
       now: t,
       lastEventId: s.lastEventId,
       studyThreadId: b.studyThreadId,
@@ -605,10 +621,10 @@ export function nextMilestone(milestones: readonly Milestone[], t: number, kind:
 }
 
 /** The status line at a replayed moment (the live one also reads the harvest and pause details from the database). */
-export function replayStatusLine(state: string, workers: number, measuring: readonly string[], benchDepth: number, pauseReason: string | null): string {
+export function replayStatusLine(state: string, workers: number, measuring: readonly string[], waiting: { queued: number; inTests: number }, pauseReason: string | null): string {
   switch (state) {
     case "running":
-      return `Running: ${workers} worker${workers === 1 ? "" : "s"} editing${measuring.length ? `, measuring ${measuring.join(", ")}` : ""}${benchDepth ? `, ${benchDepth} in the bench queue` : ""}.`;
+      return runningStatusText(workers, measuring, waiting.queued, waiting.inTests);
     case "paused":
       return `Paused: ${clip(pauseReason ?? "no reason recorded", 200)}.${workers ? ` ${workers} worker${workers === 1 ? "" : "s"} finishing.` : ""}`;
     case "harvesting":

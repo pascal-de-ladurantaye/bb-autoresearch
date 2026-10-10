@@ -166,8 +166,13 @@ function Calibration({ c, specVersion, onAction }: { c: OracleView["calibration"
         </div>
         {c.hosts.length ? (
           <p className="text-sm">
-            A win must improve by more than <strong>{frac(Math.max(...c.hosts.map((h) => h.mde)))}</strong> with confidence <Help term="mde" />
-            {c.detectable !== null ? <> (in practice, changes of about {frac(c.detectable)} or more are detected)</> : null}. Run-to-run noise is {frac(Math.max(...c.hosts.map((h) => h.noiseFloor)))} per pair <Help term="noiseFloor" />.
+            {c.noise === "deterministic" ? null : (
+              <>
+                A win must improve by more than <strong>{frac(Math.max(...c.hosts.map((h) => h.mde)))}</strong> with confidence <Help term="mde" />
+                {c.detectable !== null ? <> (in practice, changes of about {frac(c.detectable)} or more are detected)</> : null}.{" "}
+              </>
+            )}
+            {c.noiseText} <Help term="noiseFloor" />
           </p>
         ) : null}
         {c.problems.length ? (

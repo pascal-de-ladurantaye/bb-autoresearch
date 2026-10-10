@@ -5,7 +5,7 @@ import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { CandidateDetailView, CandidateView } from "../views.ts";
 import { useLive } from "./data.ts";
-import { ago, ciText, duration, formatValue, improvementText, pct, shortSha, valueWithUnit, VERDICT, type MetricInfo } from "./format.ts";
+import { ago, ciRangeText, ciText, duration, formatValue, improvementText, pct, shortSha, valueWithUnit, VERDICT, type MetricInfo } from "./format.ts";
 import { EmptyState, ErrorLine, GuardrailBadge, Help, Mono, Section, Skeleton, VerdictBadge } from "./ui.tsx";
 import { improvementOf } from "../present.ts";
 
@@ -101,11 +101,12 @@ function Table({ rows, metric, selected, onSelect }: { rows: CandidateView[]; me
               <td className="whitespace-nowrap px-3 py-2">
                 <VerdictBadge verdict={c.verdict} stage={c.stage} />
                 {c.rebases ? <span className="text-xs text-muted-foreground"> · rebased</span> : null}
+                {c.cause ? <div className="max-w-56 truncate text-xs text-muted-foreground" title={c.cause}>{c.cause}</div> : null}
               </td>
               <td className="px-3 py-2 text-right tabular-nums" title={c.effectText ?? undefined}>
                 {pct(c.effect)}
               </td>
-              <td className="whitespace-nowrap px-3 py-2 text-right text-xs tabular-nums text-muted-foreground">{c.ciLo !== null && c.ciHi !== null ? `${pct(Math.min(c.ciLo, c.ciHi))} to ${pct(Math.max(c.ciLo, c.ciHi))}` : "—"}</td>
+              <td className="whitespace-nowrap px-3 py-2 text-right text-xs tabular-nums text-muted-foreground">{ciRangeText(c.ciLo, c.ciHi)}</td>
               <td className="px-3 py-2">
                 <GuardrailBadge state={c.guardrails.state} text={c.guardrails.text} title={c.guardrails.list.map((g) => `${g.name}: ${g.text}`).join("\n") || undefined} />
               </td>
@@ -150,7 +151,10 @@ function CandidateDetail({ slug, n, metric, onClose }: { slug: string; n: number
             <p className="text-sm tabular-nums">
               {improvementText(c.effect, metric, { digits: 2 })} than the best it was measured against
               {c.ciLo !== null && c.ciHi !== null ? <span className="text-muted-foreground"> ({ciText(c.ciLo, c.ciHi, 2)})</span> : null}
+              {c.cause ? <span className="font-medium">, but {c.cause}</span> : null}
             </p>
+          ) : c?.cause ? (
+            <p className="text-sm">{c.cause}</p>
           ) : null}
           {c ? <p className="text-sm text-muted-foreground">{c.ideaTitle ?? `idea #${c.ideaId ?? "?"}`}</p> : null}
         </div>
@@ -282,7 +286,7 @@ function Samples({ samples, metric }: { samples: CandidateDetailView["samples"];
   }, [samples, metric.name]);
   if (!pairs.length) return null;
   return (
-    <Section title={`Samples (${metric.name}, ${pairs.length} pairs)`}>
+    <Section title={`Samples (${metric.name}, ${pairs.length} ${pairs.length === 1 ? "pair" : "pairs"})`}>
       <div className="max-h-56 overflow-auto rounded-md border border-border">
         <table className="w-full text-xs tabular-nums">
           <thead className="text-left text-muted-foreground">

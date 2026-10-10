@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { bandEnd, type MeasureBand } from "../../band.ts";
-import { COLUMN_INFO, COLUMNS, PHASE_INFO, PHASE_STEPS, REBASE_NOTICE_MS, STAGE_LABEL, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
+import { COLUMN_INFO, COLUMNS, PHASE_INFO, PHASE_STEPS, progressText, REBASE_NOTICE_MS, STAGE_LABEL, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
 import { improvementText } from "../../present.ts";
 import { VERDICT } from "../format.ts";
 import { EmptyState, ErrorLine, FOCUS_RING, Skeleton, StatePill } from "../ui.tsx";
@@ -546,9 +546,12 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
   const vd = c.verdict ? (VERDICT[c.verdict] ?? { label: c.verdict, icon: "Circle", tone: "text-muted-foreground" }) : null;
   const elapsed = clock(now - c.stageAt);
   const qpos = c.stage === "queued" ? v.queue.indexOf(c.n) + 1 : 0;
+  const band = v.bands.find((b) => b.n === c.n) ?? null;
+  const pairsText = (p: Pairs, opts: { short?: boolean; spoken?: boolean } = {}) => progressText(p, v.noise, { ...opts, band });
   const detail =
     c.stage === "decided"
-      ? c.effectText ?? (c.verdict === "gate_failed" ? "tests failed" : c.verdict === "conflict" ? "conflicts with best" : c.verdict === "rejected" ? "outside the scope" : "")
+      ? // Why it isn't the primary metric's verdict wins over the primary number: a guardrail loss never reads like a win.
+        c.cause ?? c.effectText ?? (c.verdict === "gate_failed" ? "tests failed" : c.verdict === "conflict" ? "conflicts with best" : c.verdict === "rejected" ? "outside the scope" : "")
       : c.stage === "queued"
         ? `${qpos ? `${ordinal(qpos)} in line` : "queued"} · ${elapsed}`
         : c.stage === "measuring" || c.stage === "confirming"
@@ -608,13 +611,6 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
   );
 }
 
-/** "pair 3 of ≤12" (the sequential test may stop early); `spoken` for labels; `short` for chips ("3/12"). */
-function pairsText(p: Pairs, opts: { short?: boolean; spoken?: boolean; run?: boolean } = {}): string {
-  if (opts.short) return `${p.done}${p.of > 1 ? `/${p.of}` : ""}`;
-  const of = p.of > 1 ? (opts.spoken ? ` of up to ${p.of}` : ` of ≤${p.of}`) : "";
-  return `${opts.run && p.run === "confirm" ? "confirmation " : ""}pair ${p.done}${of}`;
-}
-
 function PairBar({ pairs, className }: { pairs: Pairs; className?: string }) {
   const pct = pairs.of > 0 ? Math.min(100, (pairs.done / pairs.of) * 100) : 0;
   return (
@@ -636,7 +632,7 @@ function BenchStrip({ v, now, compact, onOpenCandidate }: { v: LiveView; now: nu
         <ul className="space-y-1.5">
           {v.bench.map((h) => (
             <li key={h.hostId}>
-              <BenchHost h={h} now={now} compact={compact} onOpenCandidate={onOpenCandidate} />
+              <BenchHost h={h} now={now} compact={compact} noise={v.noise} band={h.current?.kind === "measure" ? (v.bands.find((b) => b.n === (h.current as { n: number }).n) ?? null) : null} onOpenCandidate={onOpenCandidate} />
             </li>
           ))}
         </ul>
@@ -659,7 +655,7 @@ function BenchStrip({ v, now, compact, onOpenCandidate }: { v: LiveView; now: nu
   );
 }
 
-function BenchHost({ h, now, compact, onOpenCandidate }: { h: LiveBenchHost; now: number; compact: boolean; onOpenCandidate: (n: number) => void }) {
+function BenchHost({ h, now, compact, noise, band, onOpenCandidate }: { h: LiveBenchHost; now: number; compact: boolean; noise: LiveView["noise"]; band: MeasureBand | null; onOpenCandidate: (n: number) => void }) {
   const cur = h.current;
   const health = h.status === "offline" ? "offline" : h.deferredUntil ? "waiting for the machine to calm down" : h.healthOk === false ? "unhealthy" : h.healthOk ? "healthy" : "not checked yet";
   return (
@@ -675,7 +671,7 @@ function BenchHost({ h, now, compact, onOpenCandidate }: { h: LiveBenchHost; now
               c/{cur.n}
             </button>
             <span className="text-muted-foreground">{cur.stage === "confirming" ? "confirming" : cur.stage === "promoting" ? "promoting" : "measuring"}</span>
-            {cur.pairs ? <span className="tabular-nums text-muted-foreground">{pairsText(cur.pairs, { run: true })}</span> : null}
+            {cur.pairs ? <span className="tabular-nums text-muted-foreground">{progressText(cur.pairs, noise, { run: true, band })}</span> : null}
             <span className="ml-auto tabular-nums text-muted-foreground">{clock(now - cur.startedAt)}</span>
           </div>
           {cur.pairs ? <PairBar pairs={cur.pairs} /> : null}

@@ -9,7 +9,7 @@ import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type Plug
 import { EngineError, type Caller, type Engine } from "./engine.ts";
 import { errText } from "./pipeline.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
-import { ciText, magnitudePct, sharePct, signedPct } from "./present.ts";
+import { ciText, magnitudePct, sharePct, signedPct, verdictCause } from "./present.ts";
 import {
   benchHostsView,
   benchView,
@@ -169,8 +169,9 @@ function candidateLine(c: { n: number; stage: string; verdict: string | null; ef
   const what = c.stage === "decided" ? (c.verdict ?? "decided") : c.stage;
   const ci = c.ci_lo !== null && c.ci_hi !== null && c.ci_lo !== c.ci_hi ? ` (${ciText(c.ci_lo, c.ci_hi)})` : "";
   const eff = c.effect !== null ? ` ${signedPct(c.effect)}${ci}` : "";
-  // A win's reason restates its effect; other verdicts say why.
-  const reason = c.verdict === "win" ? undefined : (safeJson<string[]>(c.reasons_json) ?? [])[0];
+  // A win's reason restates its effect; other verdicts say why (a guardrail loss names the guardrail, not the primary win).
+  const reasons = safeJson<string[]>(c.reasons_json) ?? [];
+  const reason = c.verdict === "win" ? undefined : (verdictCause(c.verdict, reasons) ?? reasons[0]);
   return `c/${c.n} ${what}${eff} · idea #${c.idea_id ?? "?"}${reason ? ` · ${clip(reason, 100)}` : ""}`;
 }
 

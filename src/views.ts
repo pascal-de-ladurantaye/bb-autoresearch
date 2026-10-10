@@ -2,7 +2,7 @@
 // Pure functions of the store (plus the engine's scheduler view), bounded.
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
-import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
+import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
 import type { StackRecord } from "./harvest.ts";
 import { checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions } from "./pipeline.ts";
@@ -23,7 +23,11 @@ import {
   sharePct,
   signedPct,
   amountText,
+  isPointCi,
+  noiseFloorText,
+  runningStatusText,
   valueWithUnit,
+  verdictCause,
   vsBaseFromVsBest,
   type Direction,
   type MetricInfo,
@@ -214,10 +218,11 @@ export function bestCi(engine: Engine, s: StudyRow): { lo: number; hi: number } 
   return { lo: compound(wins.map((w) => w.ci_lo ?? w.effect!), direction), hi: compound(wins.map((w) => w.ci_hi ?? w.effect!), direction) };
 }
 
-function workerPhase(engine: Engine, s: StudyRow, threadId: string | null): { phase: string; candidate: number | null; position: number | null } {
-  if (!threadId) return { phase: "spawning", candidate: null, position: null };
+function workerPhase(engine: Engine, s: StudyRow, worker: ThreadRow): { phase: string; candidate: number | null; position: number | null } {
   const { store } = engine.ctx;
-  const mine = store.candidates(s.id, { threadId }).find((c) => c.stage !== "decided" || c.reported_at === null);
+  // Linked through the worker row (a row may have no BB thread id); the thread id is the fallback.
+  const mine = store.workerCandidates(s.id, worker).find((c) => c.stage !== "decided" || c.reported_at === null);
+  if (!mine && !worker.thread_id) return { phase: "spawning", candidate: null, position: null };
   if (!mine) return { phase: "thinking", candidate: null, position: null };
   if (mine.stage === "queued") {
     const queued = store.candidates(s.id, { stages: ["queued"] }).sort((a, b) => (a.queued_at ?? 0) - (b.queued_at ?? 0) || a.id - b.id);
@@ -233,7 +238,7 @@ export function overview(engine: Engine, s: StudyRow) {
   const seg = store.segment(s.id, s.segment);
   const ideas = new Map(store.ideas(s.id).map((i) => [i.id, i] as const));
   const workers = store.threads(s.id, { role: "worker", states: ["spawning", "active", "finishing"] }).map((w) => {
-    const phase = workerPhase(engine, s, w.thread_id);
+    const phase = workerPhase(engine, s, w);
     return {
       threadId: w.thread_id,
       ideaId: w.idea_id,
@@ -404,6 +409,8 @@ export function candidateRow(engine: Engine, c: CandidateRow, ideaTitle: string 
       list: guardrails,
     },
     effectText: c.effect === null ? null : improvementText(c.effect, metricOf(spec), { digits: 1, factor: false }),
+    /** Why the verdict isn't the primary metric's own ("lost on guardrail mem_kb (27.6% worse)"); null when the primary metric decided it. */
+    cause: c.stage === "decided" ? verdictCause(c.verdict, safeJson<string[]>(c.reasons_json)) : null,
     n: c.n,
     ideaId: c.idea_id,
     ideaTitle: ideaTitle ? clip(ideaTitle, 160) : null,
@@ -501,7 +508,7 @@ export function threadBadge(
     return { kind: "study", slug: s.slug, state: s.state, tone, text, needsYou: needs.length, label: `Study ${s.slug}: ${text}` };
   }
   const spec = specOf(engine, s);
-  const phase = workerPhase(engine, s, threadId);
+  const phase = workerPhase(engine, s, row);
   const where =
     phase.phase === "queued" && phase.position !== null ? `queued ${ordinal(phase.position)}` : phase.phase === "thinking" ? (row.state === "active" ? "working" : row.state) : phase.phase;
   const text = `${s.slug} · idea #${row.idea_id ?? "?"} · submission ${row.submissions}/${spec?.agents.max_submissions_per_worker ?? "?"} · ${where}`;
@@ -575,8 +582,8 @@ export function findingsView(engine: Engine, s: StudyRow, q: { query?: string; o
   const offset = Math.max(0, Math.min(q.offset ?? 0, 100_000));
   const matching = (store.db.prepare(`SELECT COUNT(*) AS c ${from} WHERE ${where.join(" AND ")}`).get(...params) as { c: number }).c;
   const rows = store.db
-    .prepare(`SELECT f.*, COALESCE(f.idea_id, c.idea_id) AS any_idea, i.title AS idea_title, i.theme AS theme, c.n AS n, c.verdict AS verdict, c.effect AS effect ${from} WHERE ${where.join(" AND ")} ORDER BY f.id DESC LIMIT ? OFFSET ?`)
-    .all(...params, limit, offset) as Array<{ id: number; idea_id: number | null; any_idea: number | null; thread_id: string | null; outcome: string; learned: string; revisit_if: string; evidence: string; created_at: number; idea_title: string | null; theme: string | null; n: number | null; verdict: string | null; effect: number | null }>;
+    .prepare(`SELECT f.*, COALESCE(f.idea_id, c.idea_id) AS any_idea, i.title AS idea_title, i.theme AS theme, c.n AS n, c.verdict AS verdict, c.effect AS effect, c.reasons_json AS reasons_json ${from} WHERE ${where.join(" AND ")} ORDER BY f.id DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset) as Array<{ id: number; idea_id: number | null; any_idea: number | null; thread_id: string | null; outcome: string; learned: string; revisit_if: string; evidence: string; created_at: number; idea_title: string | null; theme: string | null; n: number | null; verdict: string | null; effect: number | null; reasons_json: string | null }>;
   const facet = (sql: string) => (store.db.prepare(sql).all(s.id) as Array<{ k: string | null; c: number }>).map((r) => ({ value: r.k ?? "", count: r.c }));
   const themes = facet(`SELECT COALESCE(NULLIF(i.theme, ''), '${NO_THEME}') AS k, COUNT(*) AS c ${from} WHERE f.study_id = ? GROUP BY k ORDER BY c DESC`);
   const metric = metricOf(specOf(engine, s));
@@ -597,6 +604,8 @@ export function findingsView(engine: Engine, s: StudyRow, q: { query?: string; o
       verdict: f.verdict,
       effect: f.effect,
       effectText: f.effect === null ? null : improvementText(f.effect, metric, { factor: false }),
+      /** Why the candidate's verdict isn't the primary metric's own ("lost on guardrail rss (30.0% worse)"). */
+      cause: verdictCause(f.verdict, safeJson<string[]>(f.reasons_json)),
       threadId: f.thread_id,
       outcome: f.outcome,
       learned: clip(f.learned, 4000),
@@ -649,6 +658,11 @@ function lineDiff(a: string, b: string): Array<{ op: "same" | "add" | "del"; tex
   return out;
 }
 
+/** A number, or null when it is missing or not finite (imported studies have no A/A noise floor). */
+function finiteOrNull(v: number | null | undefined): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
 /** Calibrated guardrail noise as table rows (Oracle tab, CLI, report). */
 export function guardrailCalibrationRows(list: readonly GuardrailCalibration[]) {
   return list.map((g) => ({ name: g.name, noise: g.noise, halfWidth: g.halfWidth, limit: g.limit, totalLimit: g.totalLimit, judgeable: g.judgeable, text: g.text }));
@@ -675,7 +689,8 @@ export function oracleView(engine: Engine, s: StudyRow) {
       diff: lineDiff(active!.toml, p.toml).slice(0, 2000),
     };
   }
-  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; warnings?: string[]; guardrails?: GuardrailCalibration[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number; report: string }>; finishedAt?: number }>(s.calibration_json);
+  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; warnings?: string[]; guardrails?: GuardrailCalibration[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number; report: string }>; finishedAt?: number }>(s.calibration_json);
+  const spec = specOf(engine, s);
   return {
     slug: s.slug,
     state: s.state,
@@ -704,8 +719,12 @@ export function oracleView(engine: Engine, s: StudyRow) {
       guardrails: guardrailCalibrationRows(report?.guardrails ?? []),
       baselineSha: report?.baselineSha ?? null,
       oracleHash: report?.oracleHash ?? null,
-      hosts: (report?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: h.noiseFloor, mde: h.mde, evalSeconds: h.evalSeconds, report: clip(h.report, 600) })),
+      hosts: (report?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, evalSeconds: h.evalSeconds, report: clip(h.report, 600) })),
       finishedAt: report?.finishedAt ?? null,
+      /** The oracle's noise class: the noise is per pair (noisy), the σ of one run (expensive), or none (deterministic: single runs against the tolerance). */
+      noise: spec?.oracle.noise ?? "noisy",
+      /** The calibrated noise in one sentence for the class; "not measured" without an A/A floor. */
+      noiseText: noiseFloorText(spec?.oracle.noise ?? "noisy", (report?.hosts ?? []).map((h) => finiteOrNull(h.noiseFloor)), spec?.oracle.protocol.tolerance ?? 0),
       /** The command that approves what's waiting, if anything (the page has the same action as a button). */
       nextCommand: s.state === "draft" && s.calibration_status !== "running" ? `bb study calibrate ${s.slug}` : s.state === "calibrating" && s.calibration_status === "ready" && s.calibration_approved_at === null ? `bb study start ${s.slug}` : null,
       /** The in-app action for what's waiting: approve the draft spec (and calibrate), or approve the calibration (and start). */
@@ -728,12 +747,12 @@ export function oracleView(engine: Engine, s: StudyRow) {
       oracleHash: g.oracle_hash,
       specVersion: g.spec_version,
       baselineSha: g.baseline_sha,
-      noiseFloor: g.noise_floor,
+      noiseFloor: finiteOrNull(g.noise_floor),
       mde: g.mde,
       evalSeconds: g.eval_seconds,
       gateSeconds: g.gate_seconds,
       report: g.report ? clip(g.report, 1500) : null,
-      hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number; mde: number; evalSeconds: number }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: h.noiseFloor, mde: h.mde, evalSeconds: h.evalSeconds })),
+      hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, evalSeconds: h.evalSeconds })),
       guardrails: guardrailCalibrationRows(safeJson<{ guardrails?: GuardrailCalibration[] }>(g.details_json)?.guardrails ?? []),
       ref: `refs/studies/${s.slug}/segment/${g.k}`,
       createdAt: g.created_at,
@@ -1351,7 +1370,7 @@ export function bestView(engine: Engine, s: StudyRow) {
     text: value === null ? null : improvementText(value, metric),
     signed: signedPct(value),
     factor: value === null ? "" : factorText(value, metric.direction),
-    ciText: ci ? `${ciText(ci.lo, ci.hi)} (compounded from the promoted candidates)` : "",
+    ciText: ci ? (isPointCi(ci.lo, ci.hi) ? "single runs, no CI" : `${ciText(ci.lo, ci.hi)} (compounded from the promoted candidates)`) : "",
     base,
     best,
     /** "210,802 → 53,300 opcodes" */
@@ -1533,14 +1552,13 @@ export function statusLine(engine: Engine, s: StudyRow): string {
   const { store } = engine.ctx;
   const live = store.threads(s.id, { role: "worker", states: ["spawning", "active", "finishing"] }).length;
   const measuring = store.candidates(s.id, { stages: ["measuring", "confirming"] }).map((c) => `c/${c.n}`);
-  const queued = engine.benchDepth(s.id);
   switch (s.state) {
     case "draft":
       return s.calibration_status === "failed" ? "Draft: the last calibration failed. A revised spec needs your approval." : `Draft: spec v${s.spec_version} waits for your approval.`;
     case "calibrating":
       return s.calibration_status === "running" ? "Calibrating: gates on the base commit, then A/A measurements to learn the noise." : s.calibration_status === "ready" ? "Calibration finished: review it and start the study." : "Calibrating.";
     case "running":
-      return `Running: ${live} worker${live === 1 ? "" : "s"} editing${measuring.length ? `, measuring ${measuring.join(", ")}` : ""}${queued ? `, ${queued} in the bench queue` : ""}.`;
+      return runningStatusText(live, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length);
     case "paused": {
       const p = pauseInfo(engine, s);
       return `Paused${p.system ? " by the system" : " by you"}: ${clip(s.pause_reason ?? "no reason recorded", 200)}.${live ? ` ${live} worker${live === 1 ? "" : "s"} finishing.` : ""}`;

@@ -168,6 +168,8 @@ export interface CandidateRow {
   measure_restarts: number;
   /** The measurement's CI band (band.ts), stored when it ended. */
   band_json: string | null;
+  /** The worker row (threads.id) that submitted it; null for candidates not linked to a worker row. */
+  worker_id: number | null;
 }
 
 export interface FindingRow {
@@ -700,16 +702,31 @@ export class Store {
   nextCandidateNumber(studyId: string): number {
     return ((this.db.prepare(`SELECT COALESCE(MAX(n), 0) AS n FROM candidates WHERE study_id = ?`).get(studyId) as { n: number }).n) + 1;
   }
-  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json"> & Partial<Pick<CandidateRow, "lines_added" | "lines_deleted">>): CandidateRow {
+  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json"> & Partial<Pick<CandidateRow, "lines_added" | "lines_deleted" | "worker_id">>): CandidateRow {
     const r = this.db
       .prepare(
-        `INSERT INTO candidates (study_id, n, idea_id, thread_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at, lines_added, lines_deleted)
-         VALUES (@study_id, @n, @idea_id, @thread_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at, @lines_added, @lines_deleted)`,
+        `INSERT INTO candidates (study_id, n, idea_id, thread_id, worker_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at, lines_added, lines_deleted)
+         VALUES (@study_id, @n, @idea_id, @thread_id, @worker_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at, @lines_added, @lines_deleted)`,
       )
-      .run({ lines_added: 0, lines_deleted: 0, ...row, submitted_at: this.now() });
+      .run({ lines_added: 0, lines_deleted: 0, worker_id: null, ...row, submitted_at: this.now() });
     const c = this.candidate(Number(r.lastInsertRowid))!;
-    this.event(c.study_id, "candidate.stage", "plugin", { candidate: c.id, n: c.n, from: null, to: c.stage, worker: c.thread_id });
+    this.event(c.study_id, "candidate.stage", "plugin", { candidate: c.id, n: c.n, from: null, to: c.stage, worker: c.thread_id, ...(c.worker_id !== null ? { worker_row: c.worker_id } : {}) });
     return c;
+  }
+  /**
+   * A worker's candidates: linked through its worker row (candidates.worker_id),
+   * with the BB thread id as the fallback for rows that predate the link.
+   */
+  workerCandidates(studyId: string, worker: Pick<ThreadRow, "id" | "thread_id">, opts: { stages?: CandidateStage[]; limit?: number; order?: "asc" | "desc" } = {}): CandidateRow[] {
+    const parts = [`study_id = ?`, worker.thread_id ? `(worker_id = ? OR (worker_id IS NULL AND thread_id = ?))` : `worker_id = ?`];
+    const args: unknown[] = [studyId, worker.id, ...(worker.thread_id ? [worker.thread_id] : [])];
+    if (opts.stages?.length) {
+      parts.push(`stage IN (${opts.stages.map(() => "?").join(",")})`);
+      args.push(...opts.stages);
+    }
+    return this.db
+      .prepare(`SELECT * FROM candidates WHERE ${parts.join(" AND ")} ORDER BY id ${opts.order === "desc" ? "DESC" : "ASC"} LIMIT ?`)
+      .all(...args, opts.limit ?? 1_000_000) as CandidateRow[];
   }
   candidate(id: number): CandidateRow | undefined {
     return this.db.prepare(`SELECT * FROM candidates WHERE id = ?`).get(id) as CandidateRow | undefined;

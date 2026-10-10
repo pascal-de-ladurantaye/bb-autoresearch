@@ -174,6 +174,10 @@ bb plugin install . --yes && bb plugin reload bb-autoresearch
 Tests never depend on the machine's load: real-git tests use `localRunner()`
 (test/helpers.ts), which injects fixed health readings.
 
+## Credits
+
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch) and [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

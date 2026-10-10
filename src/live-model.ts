@@ -9,7 +9,7 @@
 // throttled projection of those rows, and `replaySkeleton` rebuilds the same
 // state from the rows alone at any time t, which is what a replay needs.
 import { bandProgress, type BandPoint, type MeasureBand } from "./band.ts";
-import { compoundOne, type MetricInfo } from "./present.ts";
+import { compoundOne, verdictCause, type MetricInfo, type NoiseClass } from "./present.ts";
 
 /** Pipeline stages a candidate moves through (mirrors db/schema.ts CANDIDATE_STAGES). */
 export type Stage = "submitted" | "gating" | "queued" | "measuring" | "confirming" | "promoting" | "decided";
@@ -220,6 +220,13 @@ export interface LiveCard {
   /** Better is positive, in the metric's own terms; text once known. */
   effect: number | null;
   effectText: string | null;
+  /**
+   * Why the verdict isn't the primary metric's own ("lost on guardrail mem_kb
+   * (27.6% worse)", a failed gate, the scope, a conflict); null when the
+   * primary metric decided it. Shown instead of the effect, so a loss never
+   * reads like a win.
+   */
+  cause: string | null;
   hostId: string | null;
   pairs: Pairs | null;
   rebases: number;
@@ -266,6 +273,8 @@ export interface LiveView {
   state: string;
   statusLine: string;
   metric: MetricInfo;
+  /** The oracle's noise class: noisy measurements count pairs, deterministic and expensive ones count runs. */
+  noise: NoiseClass;
   /** Server time when built (elapsed timers use the offset to the client clock). */
   now: number;
   /** Deltas at or below this event id are already in the view. */
@@ -303,6 +312,33 @@ export const BAND_LINGER_MS = 30_000;
 /** How long lanes say "best moved: rebases on next submit". */
 export const REBASE_NOTICE_MS = 6_000;
 
+/**
+ * Progress of a measurement in words, per noise class: noisy measurements
+ * count pairs ("pair 3 of ≤12": the sequential test may stop early),
+ * deterministic ones are one run each side ("running best", "running the
+ * candidate", "run 1 of 1"), expensive ones count runs ("run 2 of ≤4": a
+ * screening run, then confirmation runs if it looks promising).
+ * `spoken` for labels, `short` for chips, `run` to name the confirmation.
+ */
+export function progressText(p: Pairs, noise: NoiseClass = "noisy", opts: { short?: boolean; spoken?: boolean; run?: boolean; band?: MeasureBand | null } = {}): string {
+  if (noise === "deterministic") {
+    if (opts.short) return `${Math.min(1, p.done)}/1`;
+    const b = opts.band?.kind === "deterministic" ? opts.band : null;
+    if (b && !b.value) return b.best ? "running the candidate" : "running best";
+    return p.done >= 1 ? "run 1 of 1 done" : "run 1 of 1";
+  }
+  if (noise === "expensive") {
+    const of = Math.max(1, p.of);
+    const at = Math.min(of, p.done + 1);
+    if (opts.short) return `${at}/${of}`;
+    const label = opts.run && p.run === "confirm" ? "confirmation run" : "run";
+    return `${label} ${at}${of > 1 ? (opts.spoken ? ` of up to ${of}` : ` of ≤${of}`) : " of 1"}`;
+  }
+  if (opts.short) return `${p.done}${p.of > 1 ? `/${p.of}` : ""}`;
+  const of = p.of > 1 ? (opts.spoken ? ` of up to ${p.of}` : ` of ≤${p.of}`) : "";
+  return `${opts.run && p.run === "confirm" ? "confirmation " : ""}pair ${p.done}${of}`;
+}
+
 /** Pair progress, at least as far as the band got (bands follow samples, progress events are coarse). */
 export function mergeProgress(pairs: Pairs | null, band: MeasureBand | null | undefined): Pairs | null {
   const b = band ? bandProgress(band) : null;
@@ -322,7 +358,7 @@ export type LiveDelta =
   | { k: "stage"; id: number; t: number; c: number; to: Stage; v?: string }
   | { k: "phase"; id: number; t: number; w: number; to: WorkerPhase; c?: number | null }
   | { k: "pair"; id: number; t: number; c: number; run: "measure" | "confirm"; i: number; of: number }
-  | { k: "verdict"; id: number; t: number; c: number; v: string; e: number | null }
+  | { k: "verdict"; id: number; t: number; c: number; v: string; e: number | null; why?: string }
   | { k: "best"; id: number; t: number; c: number }
   | { k: "idea"; id: number; t: number; i: number; to: string }
   /** A worker's last action changed (a short sanitized label). */
@@ -393,7 +429,8 @@ export function deltaFromEvent(e: EventLike): LiveDelta | null {
       const c = num(d.n);
       const v = str(d.verdict);
       if (c === null || !v) return null;
-      return { k: "verdict", id: e.id, t: e.at, c, v, e: num(d.effect) };
+      const why = verdictCause(v, d.reasons);
+      return { k: "verdict", id: e.id, t: e.at, c, v, e: num(d.effect), ...(why ? { why: why.slice(0, 120) } : {}) };
     }
     case "best.promoted": {
       const c = num(d.n);
@@ -486,7 +523,7 @@ export function applyDeltas(view: LiveView, msg: LiveDeltaMessage, effectText?: 
         break;
       }
       case "verdict": {
-        const ok = card(d.c, (c) => ({ ...c, verdict: d.v, effect: d.e, effectText: effectText ? effectText(d.e) : c.effectText, column: c.stage === "decided" ? columnOf("decided", d.v) : c.column }));
+        const ok = card(d.c, (c) => ({ ...c, verdict: d.v, effect: d.e, effectText: effectText ? effectText(d.e) : c.effectText, cause: d.why ?? null, column: c.stage === "decided" ? columnOf("decided", d.v) : c.column }));
         if (!ok) refetch = true;
         break;
       }

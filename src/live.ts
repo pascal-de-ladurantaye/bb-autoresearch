@@ -41,7 +41,7 @@ import { buildBand, type BandInput, type MeasureBand, type SampleLike } from "./
 import type { GuardrailJudgement } from "./guardrails.ts";
 import { feedItems } from "./live-feed.ts";
 import { bestGuardrailPositions, measurementMde, measurementNoise } from "./pipeline.ts";
-import { improvementText, type MetricInfo } from "./present.ts";
+import { improvementText, verdictCause, type MetricInfo } from "./present.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { REPLAY_VIEW_KINDS, type ReplayBundle } from "./replay.ts";
 import { titleKey, upNext } from "./scheduler.ts";
@@ -179,7 +179,7 @@ export class LiveRecorder {
       const live = (LIVE_WORKER_STATES as readonly string[]).includes(w.state);
       // Workers that ended before this view existed (no recorded phase) stay out of the event log.
       if (!live && (w.phase === null || w.phase === "done")) continue;
-      const latest = w.thread_id ? store.candidates(studyId, { threadId: w.thread_id, order: "desc", limit: 1 })[0] : undefined;
+      const latest = store.workerCandidates(studyId, w, { order: "desc", limit: 1 })[0];
       const phase = deriveWorkerPhase({
         state: w.state,
         activity: (w.activity as Activity | null) ?? null,
@@ -448,6 +448,8 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const ideas = new Map(store.ideas(s.id).map((i) => [i.id, i] as const));
   const threadsAll = store.threads(s.id, { role: "worker" });
   const workerKeyByThread = new Map(threadsAll.filter((t) => t.thread_id).map((t) => [t.thread_id!, t.id] as const));
+  // Lanes link to candidates through the plugin's own worker row; the BB thread id is the fallback.
+  const workerKeyOf = (c: CandidateRow): number | null => c.worker_id ?? (c.thread_id ? (workerKeyByThread.get(c.thread_id) ?? null) : null);
 
   const queuedRows = store.candidates(s.id, { stages: ["queued"] }).sort((a, b) => (a.queued_at ?? 0) - (b.queued_at ?? 0) || a.id - b.id);
   const onBench = store.candidates(s.id, { stages: ["measuring", "confirming"] }).length;
@@ -470,13 +472,14 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
     n: c.n,
     ideaId: c.idea_id,
     ideaTitle: c.idea_id !== null ? clip(ideas.get(c.idea_id)?.title ?? "", 120) : clip(c.summary.split("\n")[0] ?? "", 120),
-    workerKey: c.thread_id ? (workerKeyByThread.get(c.thread_id) ?? null) : null,
+    workerKey: workerKeyOf(c),
     stage: c.stage,
     column: columnOf(c.stage, c.verdict),
     stageAt: stageAt.get(c.id) ?? (c.stage === "decided" ? (c.decided_at ?? c.submitted_at) : c.stage === "queued" ? (c.queued_at ?? c.submitted_at) : c.submitted_at),
     verdict: c.verdict,
     effect: c.effect,
     effectText: c.effect === null ? null : improvementText(c.effect, metric, { digits: 1, factor: false }),
+    cause: c.stage === "decided" ? verdictCause(c.verdict, safeJson<string[]>(c.reasons_json)) : null,
     hostId: c.bench_host_id,
     pairs: mergeProgress(pairs.get(c.id) ?? null, c.stage === "decided" ? null : bandOf.get(c.id)),
     rebases: c.rebases,
@@ -489,7 +492,7 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const workers: LiveWorker[] = threadsAll
     .filter((w) => (LIVE_WORKER_STATES as readonly string[]).includes(w.state))
     .map((w) => {
-      const latest = w.thread_id ? store.candidates(s.id, { threadId: w.thread_id, order: "desc", limit: 1 })[0] : undefined;
+      const latest = store.workerCandidates(s.id, w, { order: "desc", limit: 1 })[0];
       const idea = w.idea_id !== null ? ideas.get(w.idea_id) : undefined;
       const qpos = latest?.stage === "queued" ? queuedRows.findIndex((q) => q.id === latest.id) + 1 + onBench : null;
       return {
@@ -541,13 +544,14 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const bestRow = s.best_sha ? store.candidates(s.id, { stages: ["decided"] }).filter((c) => c.verdict === "win" && c.promoted_sha === s.best_sha).at(-1) : undefined;
   const cum = engine.cumulative(s);
   const movedAt = [...events].reverse().find((e) => e.kind === "best.promoted")?.at ?? bestRow?.decided_at ?? null;
-  const winnerKey = bestRow?.thread_id ? (workerKeyByThread.get(bestRow.thread_id) ?? null) : null;
+  const winnerKey = bestRow ? workerKeyOf(bestRow) : null;
   return {
     studyId: s.id,
     slug: s.slug,
     state: s.state,
     statusLine: statusLine(engine, s),
     metric,
+    noise: spec?.oracle.noise ?? "noisy",
     now,
     lastEventId: store.lastStudyEventId(s.id),
     studyThreadId: s.study_thread_id,
@@ -575,7 +579,7 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
       next: order.slice(0, NEXT_IDEAS).map(({ idea: i, blocked }) => ({ id: i.id, title: clip(i.title, 160), theme: i.theme, pinned: i.pinned === 1, source: i.source, blocked })),
       total: order.length,
     },
-    feed: feedItems(events, { metric, ideas, hostName: (id) => store.benchHost(s.id, id)?.name ?? id, candidateN: candidateNumbers(store, s.id) }).slice(-FEED_LIMIT),
+    feed: feedItems(events, { metric, ideas, hostName: (id) => store.benchHost(s.id, id)?.name ?? id, candidateN: candidateNumbers(store, s.id), noise: spec?.oracle.noise ?? "noisy" }).slice(-FEED_LIMIT),
     bands,
   };
 }
@@ -638,9 +642,11 @@ export function threadStudy(engine: Engine, threadId: string): { slug: string; r
 function trimForReplay(kind: string, d: Record<string, unknown>): Record<string, unknown> {
   if (kind === "candidate.verdict") {
     const reasons = Array.isArray(d.reasons) && typeof d.reasons[0] === "string" ? [clip(d.reasons[0], 120)] : [];
-    return { candidate: d.candidate, n: d.n, verdict: d.verdict, effect: d.effect, reasons };
+    // Why it isn't the primary metric's verdict (a guardrail, the scope, a gate): the first reason alone doesn't say.
+    const cause = verdictCause(typeof d.verdict === "string" ? d.verdict : null, d.reasons);
+    return { candidate: d.candidate, n: d.n, verdict: d.verdict, effect: d.effect, reasons, ...(cause ? { cause } : {}) };
   }
-  const keep = ["candidate", "n", "from", "to", "verdict", "worker", "thread", "idea", "candidate", "host", "of", "run", "pairs", "measure_pairs", "confirm_pairs", "seconds", "effect", "files", "label", "w", "priority", "pinned", "theme", "source", "segment", "ok", "decision"];
+  const keep = ["candidate", "n", "from", "to", "verdict", "worker", "thread", "idea", "candidate", "host", "of", "run", "pairs", "measure_pairs", "confirm_pairs", "seconds", "effect", "files", "label", "w", "worker_row", "priority", "pinned", "theme", "source", "segment", "ok", "decision"];
   const out: Record<string, unknown> = {};
   for (const k of keep) if (d[k] !== undefined) out[k] = d[k];
   for (const k of ["reason", "title"]) if (typeof d[k] === "string") out[k] = clip(d[k] as string, 120);
@@ -688,11 +694,11 @@ export function replayBundle(engine: Engine, s: StudyRow): ReplayBundle {
     // A running study's replay reaches now; any other ends with its last event (no idle tail).
     end: s.state === "running" ? now : (events.at(-1)?.at ?? now),
     now,
-    spec: { maxCandidates: spec?.budget.max_candidates ?? 0, maxSubmissions: spec?.agents.max_submissions_per_worker ?? 0, maxWorkers: spec ? engine.maxWorkers(s) : 1 },
+    spec: { maxCandidates: spec?.budget.max_candidates ?? 0, maxSubmissions: spec?.agents.max_submissions_per_worker ?? 0, maxWorkers: spec ? engine.maxWorkers(s) : 1, noise: spec?.oracle.noise ?? "noisy" },
     hosts: store.benchHosts(s.id).map((h) => ({ hostId: h.host_id, name: h.name })),
     ideas: ideas.map((i) => ({ id: i.id, title: i.title, theme: i.theme, source: i.source, variationOf: i.variation_of })),
     workers: store.threads(s.id, { role: "worker" }).map((w) => ({ key: w.id, threadId: w.thread_id, ideaId: w.idea_id, spawnedAt: w.spawned_at })),
-    candidates: candidates.map((c) => ({ id: c.id, n: c.n, ideaId: c.idea_id, threadId: c.thread_id, title: c.idea_id !== null ? clip(titles.get(c.idea_id) ?? "", 120) : clip(c.summary.split("\n")[0] ?? "", 120) })),
+    candidates: candidates.map((c) => ({ id: c.id, n: c.n, ideaId: c.idea_id, threadId: c.thread_id, workerKey: c.worker_id, title: c.idea_id !== null ? clip(titles.get(c.idea_id) ?? "", 120) : clip(c.summary.split("\n")[0] ?? "", 120) })),
     intervals: store.benchIntervals(s.id).map((i) => ({ hostId: i.host_id, start: i.started_at, end: i.ended_at })),
     events,
     bands,

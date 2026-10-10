@@ -46,11 +46,20 @@ export function Measurement({ band, card, hostName, metric, compact, onOpenCandi
         {card?.ideaTitle ? <span className="min-w-0 flex-1 truncate text-muted-foreground">{card.ideaTitle}</span> : <span className="flex-1" />}
         <span className="text-xs text-muted-foreground">
           {stage}
-          {hostName ? ` on ${hostName}` : ""} · {band.kind}
+          {hostName ? ` on ${hostName}` : ""} · {band.kind === "deterministic" ? "deterministic, single run" : band.kind}
         </span>
       </header>
       {band.kind === "noisy" ? <NoisyBandView band={band} compact={compact} /> : band.kind === "deterministic" ? <DeterministicView band={band} metric={metric} /> : <ExpensiveView band={band} compact={compact} />}
       <Guardrails states={bandGuardrails(band)} compact={compact} />
+      {card?.stage === "decided" && card.cause ? (
+        // The band shows the primary metric's test; when something else decided the verdict (a guardrail), say so.
+        <p className="flex items-start gap-1 text-xs font-medium text-destructive">
+          <Icon name="X" className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+          <span>
+            Verdict: {card.verdict === "lose" ? "lose" : (card.verdict ?? "decided").replace("_", " ")} · {card.cause}
+          </span>
+        </p>
+      ) : null}
     </article>
   );
 }
@@ -283,38 +292,42 @@ function RunWords({ band, run }: { band: NoisyBand; run: BandRun }) {
 
 // ---------------------------------------------------------- deterministic
 
+/**
+ * A deterministic measurement in one sentence: one run of best and one of
+ * the candidate, no spread, so no CI; the single value against the tolerance.
+ */
+export function deterministicWords(band: Pick<DeterministicBand, "tolerance" | "effect" | "best">): string {
+  const tol = band.tolerance;
+  const e = band.effect;
+  if (e === null) return band.best ? "Single run: best done, running the candidate." : "Single run: running best, then the candidate (one run each, no spread).";
+  const decision = e > tol ? "win" : e < -tol ? "lose" : "inconclusive";
+  const value = `Single run: ${pct(e, 2)} vs best`;
+  if (tol <= 0) return `${value}: ${decision === "win" ? "better, so a win" : decision === "lose" ? "worse, so a loss" : "no change, inconclusive"} (no tolerance).`;
+  return `${value}, ${decision === "win" ? `better by more than the ${magnitudePct(tol)} tolerance: win` : decision === "lose" ? `worse by more than the ${magnitudePct(tol)} tolerance: lose` : `within the ±${magnitudePct(tol)} tolerance: inconclusive`}.`;
+}
+
 function DeterministicView({ band, metric }: { band: DeterministicBand; metric: MetricInfo }) {
   const tol = band.tolerance;
   const e = band.effect;
   const span = Math.max(Math.abs(e ?? 0) * 1.3, tol * 3, 0.01);
   const x = (v: number) => 10 + ((Math.max(-span, Math.min(span, v)) + span) / (2 * span)) * 300;
   const decision: BandDecision = e === null ? "continue" : e > tol ? "win" : e < -tol ? "lose" : "inconclusive";
-  const words =
-    e === null
-      ? band.best
-        ? "One run of best done; running the candidate."
-        : "Running best, then the candidate (one run each)."
-      : `${pct(e, 2)} ${decision === "win" ? `is better than the ${magnitudePct(tol)} tolerance: win` : decision === "lose" ? `is worse than the ${magnitudePct(tol)} tolerance: lose` : `is within the ${magnitudePct(tol)} tolerance: inconclusive`}.`;
+  const words = deterministicWords(band);
   return (
     <figure className="space-y-1">
-      <svg viewBox="0 0 320 54" className="h-14 w-full" role="img" aria-label={words} preserveAspectRatio="none">
+      <svg viewBox="0 0 320 40" className="h-10 w-full" role="img" aria-label={words} preserveAspectRatio="none">
         <rect className="text-destructive" fill="currentColor" fillOpacity={0.08} x={10} y={8} width={x(-tol) - 10} height={24} />
         <rect className="text-muted-foreground" fill="currentColor" fillOpacity={0.12} x={x(-tol)} y={8} width={Math.max(1, x(tol) - x(-tol))} height={24} />
         <rect className="text-success" fill="currentColor" fillOpacity={0.1} x={x(tol)} y={8} width={310 - x(tol)} height={24} />
         <line x1={x(0)} x2={x(0)} y1={4} y2={36} className="text-foreground" stroke="currentColor" strokeOpacity={0.5} />
         {e !== null ? <path d={`M${x(e)},11 l7,9 l-7,9 l-7,-9 Z`} className={decision === "win" ? "text-success" : decision === "lose" ? "text-destructive" : "text-foreground"} fill="currentColor" /> : null}
-        <g className="fill-muted-foreground" style={{ fontSize: 9 }}>
-          <text x={12} y={46}>
-            lose
-          </text>
-          <text x={x(0)} y={46} textAnchor="middle">
-            ±{magnitudePct(tol)}
-          </text>
-          <text x={308} y={46} textAnchor="end">
-            win
-          </text>
-        </g>
       </svg>
+      {/* Labels in HTML: the chart stretches to the card's width, which would stretch SVG text. */}
+      <div className="-mt-1 flex justify-between px-[3%] text-[9px] text-muted-foreground" aria-hidden>
+        <span>lose</span>
+        <span>{tol > 0 ? `±${magnitudePct(tol)}` : "0"}</span>
+        <span>win</span>
+      </div>
       <p className="text-xs text-muted-foreground">
         {words}
         {band.best && band.value ? ` ${band.best.v.toLocaleString("en-US")} → ${band.value.v.toLocaleString("en-US")}${metric.unit ? ` ${metric.unit}` : ""}.` : ""}
@@ -445,7 +458,7 @@ function LimitBar({ check, label }: { check: NonNullable<BandGuardrailState["ste
   const x = (v: number) => ((Math.max(min, Math.min(max, v)) - min) / (max - min)) * 100;
   const tone = check.state === "broken" ? "bg-destructive" : check.state === "inconclusive" ? "bg-warning" : "bg-success";
   return (
-    <span className="relative inline-flex h-3 w-24 shrink-0 items-center" aria-hidden title={`${label}: CI ${pct(lo)} to ${pct(hi)} (worse is positive) vs the ${magnitudePct(check.limit, 1)} limit`}>
+    <span className="relative inline-flex h-3 w-24 shrink-0 items-center" aria-hidden title={`${label}: ${Math.abs(hi - lo) < 1e-12 ? `${pct(lo)}, single run` : `CI ${pct(lo)} to ${pct(hi)}`} (worse is positive) vs the ${magnitudePct(check.limit, 1)} limit`}>
       <span className="absolute inset-x-0 top-1/2 h-px bg-border" />
       <span className="absolute top-0 h-3 w-px bg-foreground/40" style={{ left: `${x(0)}%` }} />
       <span className="absolute top-0 h-3 w-0.5 bg-destructive" style={{ left: `${x(check.limit)}%` }} />

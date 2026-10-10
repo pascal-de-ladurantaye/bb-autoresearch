@@ -134,6 +134,7 @@ function FindingItem({ f, onOpenCandidate }: { f: FindingsView["findings"][numbe
             {pct(f.effect)}
           </span>
         ) : null}
+        {f.cause ? <span className="text-xs text-muted-foreground">{f.cause}</span> : null}
         <span className="text-xs text-muted-foreground">
           #{f.id} · {ago(f.createdAt)}
         </span>

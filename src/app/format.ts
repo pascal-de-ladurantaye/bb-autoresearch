@@ -2,6 +2,7 @@
 // improvement convention itself lives in ../present.ts (shared with the
 // server, CLI and report): better is positive, in the metric's own terms.
 export {
+  ciRangeText,
   ciText,
   factorText,
   formatValue,
@@ -94,4 +95,20 @@ export function bytes(n: number | null | undefined): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
   return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+/** The Overview's "Now" hint, by state: only a running study spawns workers. */
+export function nowHint(o: { state: string; workers: number; targetWorkers: number; maxWorkers: number; maxWorkersOverride: number | null }): string {
+  switch (o.state) {
+    case "running":
+      return `up to ${o.targetWorkers} now (W), max ${o.maxWorkers}${o.maxWorkersOverride !== null ? " (your override)" : ""}`;
+    case "paused":
+      return o.workers ? `paused: ${o.workers} finishing, no new workers until you resume` : "paused: no new workers until you resume";
+    case "harvesting":
+      return o.workers ? `harvesting: ${o.workers} finishing, no new workers` : "harvesting: no new workers";
+    case "archived":
+      return "workers stopped for good";
+    default:
+      return "no workers before the study starts";
+  }
 }

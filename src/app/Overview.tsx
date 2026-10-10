@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils";
 import type { OverviewResult, UsageView } from "../views.ts";
 import { ArchiveDialog, HarvestDialog, NeedsYou } from "./Actions.tsx";
 import type { Rpc } from "./data.ts";
-import { ago, duration, formatValue, frac, ratio, shortSha } from "./format.ts";
+import { ago, duration, formatValue, frac, nowHint, ratio, shortSha } from "./format.ts";
 import { BenchHostList } from "./BenchHosts.tsx";
 import { Sparkline, TrajectoryChart } from "./TrajectoryChart.tsx";
 import { EmptyState, GuardrailBadge, Mono, Section, Stat } from "./ui.tsx";
@@ -65,7 +65,7 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
         <Stat
           label="Now"
           value={running ? `${o.workers} worker${o.workers === 1 ? "" : "s"} · queue ${o.benchDepth}` : o.state}
-          hint={running ? `up to ${o.targetWorkers} now (W), max ${o.maxWorkers}${o.maxWorkersOverride !== null ? " (your override)" : ""}` : "no workers before the study starts"}
+          hint={nowHint(o)}
         />
         <Stat label="Budget" value={`${o.candidates} of ${o.maxCandidates} candidates`} hint={`bench ${duration(o.benchSeconds)} of ${o.maxBenchHours} h${o.usage.tokens !== null ? ` · ${o.usage.tokens.toLocaleString("en-US")} tokens` : ""}`} />
       </div>
@@ -202,7 +202,7 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
           ) : null}
         </div>
         <p className="text-xs text-muted-foreground">
-          {o.noise} oracle · win threshold (MDE) {frac(o.calibration.mde)} · think ≈ {duration(o.tThink)} · eval ≈ {duration(o.tEval)} · bench busy {ratio(u.ratio)} of running time · best <Mono>{shortSha(o.bestSha)}</Mono> on <Mono>studies/{o.slug}/best</Mono>
+          {o.noise} oracle · {o.noise === "deterministic" ? `single runs, tolerance ${frac(o.calibration.mde)}` : `win threshold (MDE) ${frac(o.calibration.mde)}`} · think ≈ {duration(o.tThink)} · eval ≈ {duration(o.tEval)} · bench busy {ratio(u.ratio)} of running time · best <Mono>{shortSha(o.bestSha)}</Mono> on <Mono>studies/{o.slug}/best</Mono>
         </p>
         <Usage u={o.usage} />
       </Section>

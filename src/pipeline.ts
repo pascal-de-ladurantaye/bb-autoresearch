@@ -220,6 +220,7 @@ export class Pipeline {
         n,
         idea_id: worker.idea_id,
         thread_id: worker.thread_id,
+        worker_id: worker.id,
         sha: snap.sha,
         parent_sha: forkSha,
         summary: clip(summary, 4000),

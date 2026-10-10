@@ -2,7 +2,7 @@
 // about, grouped by candidate on the page. Pure and frontend-safe, so the
 // live view (server) and replay (app) tell the same story.
 import type { EventLike, FeedTone, LiveFeedItem } from "./live-model.ts";
-import { improvementText, type MetricInfo } from "./present.ts";
+import { improvementText, verdictCause, type MetricInfo, type NoiseClass } from "./present.ts";
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
@@ -25,7 +25,7 @@ function seconds(ms: number): string {
  */
 export function feedItems(
   events: readonly EventLike[],
-  ctx: { metric: MetricInfo; ideas: Map<number, { title: string }>; hostName: (id: string) => string; candidateN: Map<number, number> },
+  ctx: { metric: MetricInfo; ideas: Map<number, { title: string }>; hostName: (id: string) => string; candidateN: Map<number, number>; noise?: NoiseClass },
 ): LiveFeedItem[] {
   const out: LiveFeedItem[] = [];
   const gatingAt = new Map<number, number>();
@@ -81,18 +81,23 @@ export function feedItems(
       case "measure.finished": {
         const m = typeof d.measure_pairs === "number" ? d.measure_pairs : typeof d.pairs === "number" ? d.pairs : null;
         const c = typeof d.confirm_pairs === "number" && d.confirm_pairs > 0 ? d.confirm_pairs : 0;
-        push(`c/${n} measured${m !== null ? `: ${plural(m, "pair")}${c ? `, then ${plural(c, "confirmation pair")}` : ""}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}`);
+        // Deterministic measurements are one run each side; expensive ones count candidate runs; noisy ones pairs.
+        const what = ctx.noise === "deterministic" ? "one run each" : m === null ? null : ctx.noise === "expensive" ? plural(m, "run") : `${plural(m, "pair")}${c ? `, then ${plural(c, "confirmation pair")}` : ""}`;
+        push(`c/${n} measured${what ? `: ${what}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}`);
         break;
       }
       case "candidate.verdict": {
         const eff = typeof d.effect === "number" ? improvementText(d.effect, ctx.metric, { digits: 1, factor: false }) : null;
         const reason = Array.isArray(d.reasons) && typeof d.reasons[0] === "string" ? clip(d.reasons[0], 90) : "";
+        // Why it isn't the primary metric's verdict (replay bundles carry it precomputed, their reasons are trimmed).
+        const cause = typeof d.cause === "string" ? d.cause : verdictCause(typeof d.verdict === "string" ? d.verdict : null, d.reasons);
         switch (d.verdict) {
           case "win":
             push(`c/${n} won${eff ? `: ${eff}` : ""}`, "win");
             break;
           case "lose":
-            push(`c/${n} lost${eff ? `: ${eff}` : reason ? `: ${reason}` : ""}`, "lose");
+            // A primary-metric win that broke a guardrail says so first: "c/3 lost on guardrail mem_kb (27.6% worse), despite 43.3% fewer ops".
+            push(cause ? `c/${n} ${cause}${eff && typeof d.effect === "number" && d.effect > 0 ? `, despite ${eff}` : ""}` : `c/${n} lost${eff ? `: ${eff}` : reason ? `: ${reason}` : ""}`, "lose");
             break;
           case "inconclusive":
             push(`c/${n} inconclusive${eff ? `: ${eff}, within the noise` : ""}`, "info");

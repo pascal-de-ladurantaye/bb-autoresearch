@@ -78,10 +78,105 @@ export function improvementText(f: number | null | undefined, metric: MetricInfo
   return `${mag.toFixed(digits)}% ${word} ${metric.name}${fx ? ` (${fx})` : ""}${f < 0 ? " (worse)" : ""}`;
 }
 
-/** A CI of improvements, both ends signed (better is positive): "CI +73.7% to +75.6%". Empty when unknown. */
+/** Whether a CI is a single point (deterministic measurements: one run each side, no spread). */
+export function isPointCi(lo: number | null | undefined, hi: number | null | undefined): boolean {
+  return finite(lo) && finite(hi) && Math.abs(hi - lo) < 1e-12;
+}
+
+/**
+ * A CI of improvements, both ends signed (better is positive): "CI +73.7% to +75.6%".
+ * Empty when unknown; "single run, no CI" when it is a single point (deterministic).
+ */
 export function ciText(lo: number | null | undefined, hi: number | null | undefined, digits = 1): string {
   if (!finite(lo) || !finite(hi)) return "";
+  if (isPointCi(lo, hi)) return "single run, no CI";
   return `CI ${signedPct(Math.min(lo, hi), digits)} to ${signedPct(Math.max(lo, hi), digits)}`;
+}
+
+/** A CI range for a table cell: "+73.7% to +75.6%", the single value of a point CI, or "—". */
+export function ciRangeText(lo: number | null | undefined, hi: number | null | undefined, digits = 1): string {
+  if (!finite(lo) || !finite(hi)) return "—";
+  if (isPointCi(lo, hi)) return `${signedPct(lo, digits)} (single run)`;
+  return `${signedPct(Math.min(lo, hi), digits)} to ${signedPct(Math.max(lo, hi), digits)}`;
+}
+
+export type NoiseClass = "noisy" | "deterministic" | "expensive";
+
+/**
+ * The calibrated noise in one sentence, per noise class: noisy oracles have a
+ * noise floor per pair, expensive ones the σ of one run, deterministic ones
+ * no spread at all (single runs judged against the tolerance). Says "not
+ * measured" when there is no floor (no A/A calibration).
+ */
+export function noiseFloorText(noise: NoiseClass, floors: ReadonlyArray<number | null | undefined>, tolerance = 0): string {
+  const measured = floors.filter(finite);
+  const floor = measured.length ? Math.max(...measured) : null;
+  switch (noise) {
+    case "deterministic":
+      return `Deterministic: single runs, no spread; a candidate wins when it beats best by more than the tolerance (${magnitudePct(tolerance)})${floor !== null ? `, and a repeat of the baseline differed by ${magnitudePct(floor)}` : ""}.`;
+    case "expensive":
+      return floor === null ? "Run-to-run noise: not measured." : `Run-to-run noise is ${magnitudePct(floor)} (σ of one run).`;
+    default:
+      return floor === null ? "Run-to-run noise: not measured." : `Run-to-run noise is ${magnitudePct(floor)} per pair.`;
+  }
+}
+
+/**
+ * The Running status sentence, shared by the live status line and replay:
+ * "Running: 2 workers editing, measuring c/3, 1 queued for the bench, 1 in tests."
+ * A candidate on the bench is being measured, not queued, so it is counted once.
+ */
+export function runningStatusText(workers: number, measuring: readonly string[], queued: number, inTests: number): string {
+  return `Running: ${workers} worker${workers === 1 ? "" : "s"} editing${measuring.length ? `, measuring ${measuring.join(", ")}` : ""}${queued ? `, ${queued} queued for the bench` : ""}${inTests ? `, ${inTests} in tests` : ""}.`;
+}
+
+const clipText = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`);
+
+/**
+ * Why a verdict isn't the primary metric's own, in a few words, or null when
+ * the primary metric decided it (a win, an inconclusive, a regression). A
+ * primary-metric win that broke a guardrail reads "lost on guardrail mem_kb
+ * (27.6% worse)", so a card never shows "lose" next to "43.3% fewer ops"
+ * without saying why. Reads the verdict's own reasons (verdict.ts,
+ * guardrails.ts, pipeline.ts, scope.ts).
+ */
+export function verdictCause(verdict: string | null | undefined, reasons: unknown): string | null {
+  const list = Array.isArray(reasons) ? reasons.filter((r): r is string => typeof r === "string") : [];
+  const first = list[0] ?? "";
+  switch (verdict) {
+    case "lose": {
+      // The primary metric itself got worse: its number says why.
+      if (list.some((r) => /^primary metric regressed|^failed confirmation/u.test(r))) return null;
+      const broken: string[] = [];
+      for (const r of list) {
+        const m = /^guardrail (\S+): (.*)$/u.exec(r);
+        if (!m) continue;
+        const parts = m[2]!.split(/;\s*/u);
+        const step = parts.find((p) => /than best\b.*beyond the/u.test(p));
+        const total = parts.find((p) => /than the segment base\b.*beyond the/u.test(p));
+        const amount = (p: string) => /^(\d+(?:\.\d+)?% worse)/u.exec(p)?.[1] ?? null;
+        if (step) broken.push(`${m[1]} (${amount(step) ?? "beyond its limit"})`);
+        else if (total) broken.push(`${m[1]} (${amount(total) ? `${amount(total)} than the segment base` : "beyond its total limit"})`);
+        else if (/not measured|missing/u.test(m[2]!)) broken.push(`${m[1]} (not measured)`);
+      }
+      if (broken.length) return `lost on guardrail${broken.length > 1 ? "s" : ""} ${broken.join(", ")}`;
+      if (list.some((r) => /failed the holdout check/u.test(r))) return "lost on the holdout check";
+      // The primary metric improved, so another reason decided it (an imported verdict, for example): say that one.
+      if (/^primary metric improved/u.test(first)) {
+        const other = list.find((r) => !/^primary metric improved|^confirmed: /u.test(r));
+        return other ? clipText(other, 80) : "lost although the primary metric improved";
+      }
+      return null;
+    }
+    case "gate_failed":
+      return first ? clipText(first, 80) : "tests failed";
+    case "conflict":
+      return "conflicts with best";
+    case "rejected":
+      return first ? clipText(first, 80) : "outside the scope";
+    default:
+      return null;
+  }
 }
 
 /**

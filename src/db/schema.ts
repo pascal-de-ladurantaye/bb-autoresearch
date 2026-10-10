@@ -422,4 +422,14 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE threads ADD COLUMN action_recorded_at INTEGER`,
   /** The measurement's CI band (band.ts), stored when the measurement ends so views and replay don't recompute it. */
   `ALTER TABLE candidates ADD COLUMN band_json TEXT`,
+  // ---- v0.2.1 ----
+  /**
+   * The worker row (threads.id) that submitted the candidate: the live view and
+   * replay link lanes to candidates through it (a worker row may have no BB
+   * thread id). Backfilled from the BB thread id, then from the worker.phase
+   * events, which record each worker's latest candidate.
+   */
+  `ALTER TABLE candidates ADD COLUMN worker_id INTEGER`,
+  `UPDATE candidates SET worker_id = (SELECT t.id FROM threads t WHERE t.study_id = candidates.study_id AND t.role = 'worker' AND t.thread_id = candidates.thread_id ORDER BY t.id LIMIT 1) WHERE worker_id IS NULL AND thread_id IS NOT NULL`,
+  `UPDATE candidates SET worker_id = (SELECT json_extract(e.data_json, '$.worker') FROM events e WHERE e.study_id = candidates.study_id AND e.kind = 'worker.phase' AND json_extract(e.data_json, '$.candidate') = candidates.n AND json_type(e.data_json, '$.worker') = 'integer' ORDER BY e.id LIMIT 1) WHERE worker_id IS NULL`,
 ];

@@ -5,7 +5,7 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: bb-autoresearch
 brandSublabel: BB plugin design
-pills: v0.2.0 | M0-M3 built | Live view and replay | Toy-validated | Exit criteria partly validated
+pills: v0.2.1 | M0-M3 built | Live view and replay | v0.2.1 wording and linking fixes | Toy-validated | Exit criteria partly validated
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -30,7 +30,7 @@ The last pass before release closed two guardrail gaps and three usability issue
 
 After the release, a **Live** view was added (part 1 of 2): while a study runs, the study page opens on a Live tab, and the same view can sit beside the study thread in its split pane. Every change it shows is recorded as an event, so a later replay can rebuild it at any time (see "Implementation notes: live view (part 1)"). Part 2 added a CI band per measurement that narrows pair by pair to the sequential test's decision (computed from the samples with the decision's own seeded bootstrap, so it shows exactly the CI the verdict saw), a "last action" line per worker, a visible "best moved" moment, and a replay of any study with a timeline scrubber (see "Implementation notes: live view (part 2)").
 
-Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2).
+Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes").
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
@@ -1493,3 +1493,17 @@ Append-only migrations: `threads.last_action`, `last_action_at`, `action_recorde
 - **Event density only, no zoom.** A study of many hours puts minutes into one scrubber pixel; seeking by keyboard steps 1% or 10%.
 - **Last action is per batch of items.** BB announces thread events about once a second; a worker that does three things in that second shows the last one.
 - **Workers write outside their worktree.** Agents in the smoke test left scratch files in `/tmp`; the plugin doesn't sandbox them.
+
+## Implementation notes: v0.2.1 fixes
+
+Small fixes before the marketplace submission; no new features. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+- **Noise per class (Oracle tab).** `noiseFloorText` (`src/present.ts`) says the calibrated noise for the oracle's class: per pair (noisy), the σ of one run (expensive), or none (deterministic: single runs judged against the tolerance, so no MDE sentence). Without a noise floor (an imported study has no A/A calibration) it says "not measured"; the old sentence took `Math.max` over a null floor and printed "0.00% per pair". The view's host and segment floors are null when missing or not finite.
+- **Why a verdict isn't the primary metric's.** `verdictCause` reads the verdict's own reasons: a primary-metric win that broke a guardrail is "lost on guardrail mem_kb (27.6% worse)" (or "… than the segment base" when only the total limit broke), a holdout failure "lost on the holdout check", and failed gates, conflicts and scope rejections their reason. Pipeline cards, the Candidates list and detail, Findings, the feed ("c/3 lost on guardrail mem_kb (27.6% worse), despite 43.3% fewer ops"), the CLI and replay show it instead of, or next to, the primary number. The `verdict` delta carries it; replay bundles carry it precomputed (their reasons are trimmed to the first one).
+- **Single runs.** A point CI (deterministic) reads "single run, no CI" and "+20.0% (single run)" in tables, never "+20.0% to +20.0%". Measurement progress is per class (`progressText`): pairs for noisy, "running best" / "running the candidate" / "run 1 of 1" for deterministic, "run 2 of ≤4" for expensive; the live view carries the noise class (`LiveView.noise`, the replay bundle's `spec.noise`). The deterministic band reads "Single run: +2.00% vs best, better by more than the 0.50% tolerance: win", and the feed says "measured: one run each".
+- **Status line and Overview.** A candidate on the bench is counted as measured, not queued: "Running: 2 workers editing, measuring c/1, 1 queued for the bench, 1 in tests." (`runningStatusText`, shared by the live status line and replay). The Overview's "Now" hint depends on the state: "no workers before the study starts" only for draft and calibrating; paused, harvesting and archived say what they mean.
+- **Lanes link through the worker row.** `candidates.worker_id` (append-only migration) records the `threads` row that submitted a candidate; the live view, the recorder's phases, the Overview's workers and replay link lanes to candidates through it, with the BB thread id as the fallback. The migration backfills existing rows from the BB thread id, then from `worker.phase` events (which record each worker's latest candidate). A worker row without a BB thread id now shows its submissions and "c/N measuring" (it showed "submission 0 of 1" and never its candidate). The submit event carries `worker_row`.
+
+## Credits
+
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch) and [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch).

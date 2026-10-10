@@ -55,6 +55,7 @@ function fixture(over: Partial<LiveView> = {}): LiveView {
     state: "running",
     statusLine: "Running: 2 workers editing, measuring c/2.",
     metric: { name: "ops", unit: "ops", direction: "lower" },
+    noise: "noisy",
     now: T,
     lastEventId: 100,
     studyThreadId: "thr_study",
@@ -65,8 +66,8 @@ function fixture(over: Partial<LiveView> = {}): LiveView {
       { key: 2, threadId: "thr_w2", ideaId: 4, ideaTitle: "Use a set", theme: "data", phase: "editing", phaseAt: T - 5_000, spawnedAt: T - 90_000, submissions: 0, maxSubmissions: 2, candidate: null, candidateStage: null, queuePosition: null, action: { label: "editing src/toy.py", at: T - 4_000 } },
     ],
     cards: [
-      { n: 1, ideaId: 1, ideaTitle: "Closed form sum", workerKey: null, stage: "decided", column: "promoted", stageAt: T - 600_000, verdict: "win", effect: 0.2, effectText: "20.0% fewer ops", hostId: "host_test", pairs: { run: "confirm", done: 6, of: 20 }, rebases: 0, submittedAt: T - 700_000, decidedAt: T - 600_000 },
-      { n: 2, ideaId: 3, ideaTitle: "Memoize fib", workerKey: 1, stage: "measuring", column: "bench", stageAt: T - 42_000, verdict: null, effect: null, effectText: null, hostId: "host_test", pairs: { run: "measure", done: 9, of: 20 }, rebases: 0, submittedAt: T - 80_000, decidedAt: null },
+      { n: 1, ideaId: 1, ideaTitle: "Closed form sum", workerKey: null, stage: "decided", column: "promoted", stageAt: T - 600_000, verdict: "win", effect: 0.2, effectText: "20.0% fewer ops", cause: null, hostId: "host_test", pairs: { run: "confirm", done: 6, of: 20 }, rebases: 0, submittedAt: T - 700_000, decidedAt: T - 600_000 },
+      { n: 2, ideaId: 3, ideaTitle: "Memoize fib", workerKey: 1, stage: "measuring", column: "bench", stageAt: T - 42_000, verdict: null, effect: null, effectText: null, cause: null, hostId: "host_test", pairs: { run: "measure", done: 9, of: 20 }, rebases: 0, submittedAt: T - 80_000, decidedAt: null },
     ],
     queue: [],
     bench: [{ hostId: "host_test", name: "local", status: "online", healthOk: true, deferredUntil: null, current: { kind: "measure", n: 2, stage: "measuring", pairs: { run: "measure", done: 9, of: 20 }, startedAt: T - 42_000 }, utilization: 0.7, windowSeconds: 600 }],
@@ -142,7 +143,7 @@ describe("frontend: Live view part 2", () => {
     const c2 = within(section).getByRole("article", { name: "CI band of c/2" });
     expect(within(c2).getByRole("figure", { name: /Measurement of c\/2/u })).toBeTruthy();
     expect(within(c2).getByRole("figure", { name: /Confirmation · fresh pairs of c\/2/u }).textContent).toMatch(/Pair 4 of up to 20: no decision before pair 6/u);
-    expect(within(section).getByRole("article", { name: "CI band of c/4" }).textContent).toMatch(/\+2\.00% is better than the 0\.50% tolerance: win\. 1,000 → 980 ops\./u);
+    expect(within(section).getByRole("article", { name: "CI band of c/4" }).textContent).toMatch(/Single run: \+2\.00% vs best, better by more than the 0\.50% tolerance: win\. 1,000 → 980 ops\./u);
     expect(within(section).getByRole("article", { name: "CI band of c/5" }).textContent).toMatch(/Screen \+6\.0%: beyond the ±.*noise band, so 3 confirmation runs\.Confirmed mean \+5\.5% over 1 of 3 runs\./u);
   });
 

@@ -8,7 +8,7 @@ import { harvestAccounting, type Accounting, type Estimate } from "./harvest-mat
 import type { GuardrailCost, StackRecord } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
 import { bestGuardrailPositions, segmentGuardrailCalibration } from "./pipeline.ts";
-import { amountText, ciText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
+import { amountText, ciRangeText, ciText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
 
@@ -183,7 +183,7 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   let cum = 0;
   for (const c of decided.slice(-200)) {
     if (c.verdict === "win" && c.effect !== null) cum = compound([cum, c.effect], metric.direction);
-    lines.push(`| c/${c.n} | ${mdCell(titles.get(c.idea_id ?? -1) ?? c.summary.split("\n")[0] ?? "", 60)} | ${c.verdict} | ${signedPct(c.effect)} | ${c.ci_lo !== null && c.ci_hi !== null ? `${signedPct(Math.min(c.ci_lo, c.ci_hi))} to ${signedPct(Math.max(c.ci_lo, c.ci_hi))}` : ""} | ${signedPct(cum)} |`);
+    lines.push(`| c/${c.n} | ${mdCell(titles.get(c.idea_id ?? -1) ?? c.summary.split("\n")[0] ?? "", 60)} | ${c.verdict} | ${signedPct(c.effect)} | ${c.ci_lo !== null && c.ci_hi !== null ? ciRangeText(c.ci_lo, c.ci_hi) : ""} | ${signedPct(cum)} |`);
   }
   if (decided.length > 200) lines.push(`| … | ${decided.length - 200} earlier candidates omitted | | | | |`);
   lines.push("", "## Wins", "");
