@@ -28,6 +28,8 @@ After M3, a dedicated human interface pass reworked the Studies page, the study 
 
 The last pass before release closed two guardrail gaps and three usability issues (see "Implementation notes: guardrails and pre-release fixes"). Guardrails now have a cumulative limit against the segment base next to the per-step one, and both are judged on a confidence interval like the primary metric. In simulation that cut false rejections of real wins by a noisy guardrail from 13.3% to 0.0%, with real regressions still rejected. Worker snapshots no longer commit build outputs (`[scope] ignore`), the new-study composer opens on the current project, and archiving a study can archive its study thread too.
 
+After the release, a **Live** view was added (part 1 of 2): while a study runs, the study page opens on a Live tab, and the same view can sit beside the study thread in its split pane. Every change it shows is recorded as an event, so a later replay can rebuild it at any time (see "Implementation notes: live view (part 1)").
+
 Released as `bb-autoresearch` v0.1.0 (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch.
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
@@ -415,6 +417,7 @@ The sum of the measured contributions should roughly equal the total gain. A lar
 
 A **Studies** nav panel lists every study with its state, what needs the human, best vs. base, and budget spent; its sidebar entry carries a count of what needs the human. The study page is the primary surface: what you see first is the state and what the study is doing now, then **Needs you** (pending approvals, system pauses, drift alarms, a failed calibration, a harvest ready for review), then best vs. base and what is running. The study page has these tabs:
 
+- **Live.** The default tab while the study runs: workers picking up ideas and moving through their phases, candidate cards moving through tests and the bench to a verdict, the bench hosts, the ideas up next, a feed of what just happened, and one worker's transcript at a time. Read only. The same view opens beside the study thread (see Threads).
 - **Overview.** Needs you, best vs. base in words with raw values and CI, what's running now, a trajectory chart (every candidate as a mark, best as a step line), secondary metrics and guardrails against their limits, budget, controls (pause, resume, concurrency, harvest, archive), and notices that each name the action they ask for.
 - **Ideas.** A board: queued, running, won, lost, abandoned. You can add, reorder, pin, or veto.
 - **Candidates.** A filterable table. Each row opens its diff, samples, verdict, and worker thread.
@@ -427,11 +430,11 @@ Deliberate steps (approving a spec, approving a calibration and starting, publis
 
 Every number follows one convention: **better is positive, in the metric's own terms** ("74.7% fewer ops (4.0×)", "+74.7%"), with the raw values next to it ("210,802 → 53,300 opcodes"). See "Implementation notes: human interface".
 
-Live updates use `bb.realtime` signals, and the page refetches through `bb.rpc`.
+Live updates use `bb.realtime` signals, and the page refetches through `bb.rpc`. The Live view also applies small typed deltas (stage changes, phases, pair progress, verdicts) locally, throttled per study.
 
 ### Threads
 
-- The **study thread** is visible, and it's the one place to talk to the study. A header badge shows `run 84 · best −23.4% ±1.1 · 3 workers · queue 2`.
+- The **study thread** is visible, and it's the one place to talk to the study. A header badge shows `run 84 · best −23.4% ±1.1 · 3 workers · queue 2`, and a **Live** button opens the Live view in the thread's right split pane, so the human can watch while talking to the strategist.
 - **Worker threads** are hidden and grouped in a thread section per study. The study page links to them. Their header badge shows `routing-p99 · idea #31 · submission 2/3 · queued 4th`.
 - Workers aren't children of the study thread. Otherwise child lifecycle notices would start a strategist turn every time a worker exits.
 
@@ -466,7 +469,7 @@ SQLite through `bb.storage.database()`:
 | `candidates` | id, study_id, idea_id, thread_id, sha, parent_sha, against_sha, verdict, effect, ci_lo, ci_hi, metrics_json |
 | `samples` | candidate_id, pair, side, metric, value, host_id, at |
 | `findings` | id, study_id, idea_id, candidate_id, outcome, learned, revisit_if |
-| `events` | Append-only audit log of every state change and decision |
+| `events` | Append-only audit log of every state change and decision; the Live view and its replay are built on it |
 
 The dossier is stored as a versioned text blob per study. Git refs are the source of truth for code, and SQLite for everything else.
 
@@ -482,7 +485,8 @@ The dossier is stored as a versioned text blob per study. Git refs are the sourc
 | Git, gates, builds, benchmarks on machines | `bb.host` entry with `bb.hosts.experimental_client`, host signals for progress | Experimental |
 | State | `bb.storage.database()` (SQLite), `bb.storage.kv` | Public |
 | Drift checks, sweeps, reconciliation | `bb.background.schedule`, `bb.background.service` | Public |
-| UI | `navPanel`, `threadHeader`, `threadPanelAction`; `bb.rpc`, `bb.realtime` | Public |
+| UI | `navPanel`, `threadHeader`, `threadPanelAction`; `bb.rpc`, `bb.realtime`; `ThreadChat` (`variant="timeline"`) for a worker's transcript | Public |
+| What a worker is doing now (live view) | `experimental_thread.events` and `bb.sdk.threads.events.list` (tool items only) | Experimental |
 | CLI | `bb.cli` | Public |
 | Study creation and harvest prompts | `skills/study-create`, `skills/study-harvest` | Public |
 | Keep the study thread small | `bb.sdk.threads.compact` | Public |
@@ -1316,3 +1320,109 @@ Append-only migrations: `harvests.total_guardrails_json`, `changesets.guardrails
 - **The chain is an estimate.** It compounds per-step estimates; harvest's direct base-vs-best measurement is the better number when it exists, and the report shows both.
 - **Reconciliation** re-checks scope for a crashed submission from its recorded paths, without the added-files list, so the ignore rule isn't applied there.
 - **The composer's "current project"** falls back to the latest active study's project because the Studies panel isn't a project route; with no active study the human picks it.
+
+## Implementation notes: live view (part 1)
+
+A Live view for watching a running study: workers picking up ideas, editing and pushing candidates through tests and the bench, with verdicts arriving. Part 1 is the live surfaces and the event log they stand on; part 2 adds a CI band per measurement, a "last action" line per worker, a visible "best moved" moment, and a replay of finished studies. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+### Decisions taken before building
+
+- **Two surfaces, one component.** A **Live** tab on the study page, which is the default tab while the study is Running (other states keep Overview), and a **Live panel** in the study thread's right split pane (`threadPanelAction`), so the human can watch while talking to the strategist. Both render `LiveStudy` (`src/app/live/`), in a wide and a compact layout.
+- **Read only.** No stop, steer or reprioritize controls. The view opens things (a candidate, a worker's transcript or thread, the Overview); Pause stays on the Overview.
+
+### Step 0: the transcript spike
+
+- **Question.** Does `ThreadChat` with `variant="timeline"` (a transcript without a composer) render a hidden, plugin-spawned thread live, and do agent-only blocks stay hidden?
+- **Setup.** A scratch plugin spawned a hidden thread in a managed worktree with a slow, multi-step prompt, rendered it with `ThreadChat variant="timeline"` in a nav panel and in a `threadPanelAction` tab, and sent it a message with a one-line summary and an agent-only block holding a secret word.
+- **Result: it works.** The timeline streamed as the agent ran (commands appearing as they ran, "Working…" while busy). The human view showed only the summary line; the agent's reply quoted the secret word, so the agent-only block reached the agent and stayed out of the human view. The worker's brief (its first user message) is shown in full, as in the worker thread itself.
+- **Also found.** `useBbNavigate().openThreadPanel` returns false on a plugin page, even right after `toThread` (the hook belongs to the page, not the thread). From a component mounted on the thread surface (the header badge) it opens the panel on the first try. That decided how "Open beside the study thread" works (below).
+
+### Every visible change is an event
+
+The Live view shows nothing that isn't in `events`, so a replay can rebuild it at any time t. Realtime deltas are a throttled projection of the same rows.
+
+| Event | Recorded | Payload | Shows |
+|---|---|---|---|
+| `candidate.stage` | on every stage change, by the store (`insertCandidate`, `updateCandidate`): one choke point, so none is missed | candidate, n, from, to, the verdict when decided | which column a card is in, and since when |
+| `worker.phase` | by the live recorder whenever a worker's derived phase changes | worker (the `threads` row id), thread, idea, from, to, candidate, reason (when done) | the lanes |
+| `measure.started` | at the start of each measurement (now with `of`) | candidate, n, host, of | bench strip, card |
+| `measure.progress` | for the first completed pair, then at most once per 2 s per candidate, and the last pair of each run | candidate, n, run (measure or confirm), pairs, of, host | pair i of n |
+| `measure.finished` | at the end (now with `pairs`, `run`, `measure_pairs`, `confirm_pairs`) | | feed |
+| `drift.started` | when a drift check takes a host | host | bench strip |
+| `idea.added` | now with `theme`, `priority`, `pinned` | | Up next |
+| `candidate.verdict`, `best.promoted`, `idea.status`, `worker.spawned/finished/abandoned`, `candidate.queued/rebased/requeued`, `measure.restarted` | as before | | cards, feed, Up next |
+
+- **Replay.** `replaySkeleton(events, until)` (`src/live-model.ts`) rebuilds the state the view shows (live workers and their phases, every candidate's stage, verdict and pair progress, best, queued ideas, what each bench host measures) from these rows alone. `skeletonFromDb` builds the same from the tables. Tests compare the two at several points of simulated studies (including a replay up to an earlier t), and the smoke test compared them on the live database (below).
+- **Pair progress is shared.** `reducePairs` turns a candidate's events into "pair i of n"; the live view and replay both use it, so they show the same numbers.
+
+### Worker phases
+
+- **From plugin state, not transcripts.** `deriveWorkerPhase` reads the thread row, the worker's latest candidate, and its activity: starting (spawning) → reading, editing or testing (before the first submission, by activity) → waiting for the bench (submitted, gating, queued) → being measured (measuring, confirming, promoting) → verdict received (decided) → refining (activity after the verdict was delivered) → finishing → done.
+- **Activity.** BB announces new thread events at most once a second per thread (`experimental_thread.events`). For a live worker, the engine reads the `item/started` rows after the last one it read (`bb.sdk.threads.events.list`, at most 100 per page, which is BB's cap) and keeps only each item's kind, command and tool name, never message text. `classifyItem` maps them: file reads and searches are reading; file changes and shell edits (`sed -i`, scripts that write files, redirects into files, `apply_patch`) are editing; other commands are testing, unless every part of a compound command only reads. `threads.activity`, `activity_at` and `activity_seq` hold the result.
+- **Recording.** The `LiveRecorder` (`src/live.ts`) listens to every appended event (`Store.onEvent`) and, on a microtask after the transaction, syncs the study's workers: a changed phase updates `threads.phase` and `phase_at` and appends `worker.phase`. A flip between reading, editing and testing is recorded at most every 3 s per worker (`liveDwellMs`); the latest activity wins. The control loop also syncs every tick as a safety net.
+
+### Realtime deltas
+
+- **Channel `study-live`.** A message is `{ s: studyId, d: [...] }`, each delta ids and small numbers only (`stage`, `phase`, `pair`, `verdict`, `best`, `idea`), carrying its event id and time. Data still comes from RPC (`study.live`).
+- **Throttled per study (decision: ~4 messages/s).** `DeltaBus` sends at most one message per 250 ms per study, keeps only the latest delta per key within a window (a card that went gating → queued → measuring sends "measuring"), and turns a burst of more than 40 into `{ refetch: true }`.
+- **Applied locally.** `applyDeltas` (shared, pure) moves cards, counts pairs, updates phases and removes picked ideas; a delta for a card, worker or idea the view doesn't know yet, a new best, a decided card or a newly queued one asks for a refetch. Deltas at or below the snapshot's `lastEventId` are ignored. The view refetches at most once a second, on `study-changed` (still published for the other pages), on reconnect, and every 5 s.
+
+### Surfaces
+
+- **Live tab.** The route without a tab opens Live while Running and Overview otherwise, decided once per visit so a study that pauses doesn't pull the page away. An explicit tab always wins. When the tab's area is narrower than 760 px (a narrow window, or the page beside an open side panel) it uses the compact layout.
+- **Live panel.** `threadPanelAction` `study-live` (flush layout, "Study live view" in a thread's right-panel launcher). It resolves its study from the thread with the `thread.study` RPC: the study thread, or a worker thread (whose transcript is then selected). `params.slug`, when given, is validated and wins. On any other thread it says so and links to the Studies page.
+- **Open beside the study thread.** The study thread's header badge gets a **Live** button that opens the panel there. The Live tab's button records a request and navigates to the study thread; the badge, mounted on that thread surface, takes the request and opens the panel (retrying briefly while the surface settles). The request lives in the app window's memory for 15 s.
+- **Not running.** A calm state says why (draft, calibrating, paused, harvesting, archived), points to the Overview, and shows the last verdicts. A paused study with workers still finishing shows the full view.
+
+### What the view shows
+
+- **Header.** Live or not running (a dot that pings while running, and the word), the status line, best vs. base in the improvement convention (highlighted with "best moved" for a moment when it moves), candidates used, workers and W.
+- **Worker lanes.** Idea number, title and theme; the phase in words with its glyph; time in phase and since spawn; submissions used of the maximum; the candidate it waits on and where (for example "c/4 queued, 2nd for the bench"); a row of step segments with the current one marked. Selecting a lane shows that worker's transcript (`ThreadChat`, timeline variant, read only), one at a time; Escape or Close hides it, and it stays readable after the worker finishes.
+- **Pipeline.** Submitted → Tests → Queue → Bench → Verdict / Promoted. In-flight cards plus the last five verdicts and four promotions. Cards carry the stage in words, time in stage or queue position, pair progress on the bench, and the verdict with its glyph and the improvement ("23.4% fewer ops") once known. A card opens the candidate.
+- **Bench strip.** Per host: health in words, what it measures (candidate, measuring or confirming, pair i of ≤n, elapsed), or a drift check, or idle; how busy it was over the last 10 minutes of running time (this study's bench intervals); the shared queue behind it.
+- **Up next.** The next six queued ideas in board order (pinned, priority, age), with a count of the rest.
+- **What just happened.** Plain sentences from events ("c/14 tests passed in 41 s, queued for the bench", "c/13 lost: 0.4% more ops (worse)", "Best moved: c/12 promoted, workers notified"), grouped by candidate with the newest group last, auto-scrolling unless the human scrolled up.
+
+### Motion and accessibility
+
+- **Motion.** Cards glide between columns and an idea glides from Up next into its worker's lane (FLIP with the Web Animations API, keyed by `card-<n>` and `idea-<id>`, positions relative to the view so scrolling isn't motion); new items fade in; pair bars and utilization ease; the running dot pings; the current phase segment pulses; a verdict briefly rings its card.
+- **Reduced motion.** Under `prefers-reduced-motion` nothing moves (WAAPI is skipped, CSS uses `motion-safe:`/`motion-reduce:`). Animations are also skipped when the page renders no frames (a one-per-second animation-frame heartbeat): a hidden tab would otherwise leave items frozen at their first keyframe.
+- **State in words and shapes.** Phases, stages and verdicts carry a word and a glyph; color is never the only signal. Lanes, cards, queue chips and buttons are keyboard reachable with focus rings and labels that read the state ("Worker on idea #3, Memoize fib: being measured for 42 seconds, submission 1 of 2, c/2 measuring. Show its transcript."). The feed is a `log` region (not announced on every line); the status lines are polite live regions.
+
+### Data model
+
+Append-only migrations: `threads.phase`, `phase_at`, `activity`, `activity_at`, `activity_seq`. New events `candidate.stage`, `worker.phase`, `measure.progress`, `drift.started`; extended payloads of `measure.started`, `measure.finished` and `idea.added` (above). New RPC `study.live` and `thread.study`; the thread badge view gains `state`.
+
+### For part 2
+
+- **Replay.** Build a view at time t from `store.eventsAsc(studyId, { untilAt })`: `replaySkeleton` gives phases, stages, verdicts, pairs, best, queued ideas and bench occupancy; `feedItems` turns any slice of events into the feed; titles come from `idea.added` (or the ideas table), effects from `candidate.verdict`. Times in stage and phase come from the same events (`candidate.stage`, `worker.phase`).
+- **CI band per measurement.** Samples have per-pair values with timestamps (`samples.at`, run, pair, side) for every finished measurement; `measure.progress` marks the coarse steps. Samples of a measurement that restarted are deleted with it.
+- **Last action per worker.** The port already reads each item's kind, command (first 300 characters) and tool name; only the class is stored. Persisting a short label (for example `threads.last_item` plus an event when it changes, rate-limited like phases) gives part 2 its line.
+- **Best moved.** The `best` delta and the header highlight exist; a bigger moment can hang off the same delta.
+
+### Smoke test (BB 0.45, one MacBook, toy repos under /tmp, a temporary project)
+
+- **Toy.** The M3 toy: `src/toy.py` with a naive sum, a recursive fib and a quadratic dedupe; the metric is opcodes of `toy.run()` counted by a protected `bench/measure.py` with 1% synthetic noise; the gate is a protected test. Noisy class, `n_min` 5, `n_max` 12, `max_workers` 3, local bench, health checks off (a busy laptop), default provider. Studies 2 and 3 added a 6 s gate and 1 s per run so every stage stays on screen for a while.
+- **Runs.**
+
+  | Study | Candidates | Verdicts | Best vs base | Events replayed |
+  |---|---|---|---|---|
+  | `toy-live` | 6 | 4 wins, 1 inconclusive, 1 conflict | 99.5% fewer ops (210×) | 161 |
+  | `toy-live2` | 6 | 4 wins, 2 inconclusive | 97.3% fewer ops (38×) | 200 |
+  | `toy-live3` | 8 | 6 wins, 2 conflicts after best moved (one measurement restarted by a plugin reload) | 100.0% fewer ops (35,057×) | 279 |
+
+- **Replay parity on the live database.** For all three studies, `replaySkeleton` over the recorded events equaled `skeletonFromDb` on a copy of the plugin database, including the measurement that a plugin reload restarted.
+- **Seen in the app.** The Live tab opened by default once the study ran (and Overview while calibrating or paused); lanes went starting → reading → testing → editing → waiting → being measured → verdict → refining → finishing; cards moved Tests → Queue → Bench → Promoted or Verdict, with queue positions and pair counts; the bench strip showed pair i of ≤12 and utilization; "Open beside the study thread" opened the panel beside the study thread, which survived a reload; "Study live view" appeared in the thread's right-panel launcher; selecting a lane showed the hidden worker's transcript live.
+- **Found and fixed during the run.** BB caps a thread events page at 100 rows (the first build asked for 200 and got HTTP 400, so no activity was recorded); workers edit through shell heredocs, which the first classifier read as reading; animations started in the hidden automation tab froze cards at their first keyframe (now skipped without rendered frames); the Live tab's six columns overflowed beside an open side panel (now compact under 760 px); the feed said "Best moved" before "won" (promotion is recorded first; the feed now tells the win first).
+- **Evidence.** Screenshots, timelapses built from timed screenshots, and contact sheets are in the building thread's storage (`shots/`). They were captured from a hidden automation tab, which doesn't repaint animated layers, so they were taken with `prefers-reduced-motion` emulated; the motion itself is covered by tests.
+- **Cleanup.** All three studies and their threads were archived, the temporary project and `/tmp` files deleted, and the released plugin reinstalled from GitHub.
+
+### Not done, and known issues
+
+- **Activity is a heuristic.** A provider that edits through a tool name the classifier doesn't know, or a worker whose thread emits no tool items, stays at "reading" until it submits. Short activities can be skipped by the 3 s dwell.
+- **Coarse pair progress.** At most one progress event per 2 s per candidate, so a fast benchmark jumps by several pairs.
+- **Up next is approximate.** It shows board order; the scheduler's theme-diversity cap can pick a later idea first.
+- **Utilization** counts this study's bench intervals only, not other studies sharing the host.
+- **Open beside** relies on the header badge mounting in the same app window within 15 s.
+- **Visual motion** is checked in tests (jsdom with stubbed layout and animation frames); it was not watched or recorded in a visible window, because the only window available to the build was a hidden automation tab.
+- **Reload during a measurement** logs "The database connection is not open" from the old instance's in-flight jobs before the new instance reconciles (pre-existing; the measurement restarts cleanly).

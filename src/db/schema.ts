@@ -405,4 +405,12 @@ export const MIGRATIONS: string[] = [
   /** Guardrails at harvest: per guardrail, the cost of the whole study (base vs best) and of each changeset (ablation), relative to best. */
   `ALTER TABLE harvests ADD COLUMN total_guardrails_json TEXT`,
   `ALTER TABLE changesets ADD COLUMN guardrails_json TEXT`,
+  // ---- Live view ----
+  /** The worker's recorded phase (live view): every change is also a worker.phase event, so replay can rebuild it. */
+  `ALTER TABLE threads ADD COLUMN phase TEXT`,
+  `ALTER TABLE threads ADD COLUMN phase_at INTEGER`,
+  /** What the worker's agent is doing, from its thread's tool items (reading, editing, testing), and the last thread event sequence read. */
+  `ALTER TABLE threads ADD COLUMN activity TEXT`,
+  `ALTER TABLE threads ADD COLUMN activity_at INTEGER`,
+  `ALTER TABLE threads ADD COLUMN activity_seq INTEGER NOT NULL DEFAULT 0`,
 ];

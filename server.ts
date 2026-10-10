@@ -68,6 +68,8 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     bb.events.on("thread.archived", ({ thread }) => safe("thread.archived", () => engine.onThreadGone(thread.id, "archived")));
     bb.events.on("thread.deleted", ({ thread }) => safe("thread.deleted", () => engine.onThreadGone(thread.id, "deleted")));
     bb.events.on("turn.failed", (event) => safe("turn.failed", () => engine.onTurnFailed(event)));
+    // Live view: what each worker's agent is doing (tool items only), at most once a second per thread.
+    bb.events.on("experimental_thread.events", ({ thread, sequence }) => safe("thread.events", () => engine.onThreadEvents(thread.id, sequence)));
     client.experimental_onWorkerExit(({ hostId }) => {
       // In-flight host calls and jobs died with the worker: measurements on
       // that host restart from scratch (partial samples discarded).

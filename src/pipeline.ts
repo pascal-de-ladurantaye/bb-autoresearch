@@ -55,6 +55,17 @@ export interface PipelineHooks {
   notify(study: StudyRow, kind: string, text: string): Promise<void>;
 }
 
+/** Live view: at most one measure.progress event per candidate this often (plus the first and the last). */
+const PROGRESS_EVERY_MS = 2000;
+
+/** What "pair i of n" counts per noise class: paired runs (noisy), candidate runs (expensive: the screening run, then the confirmation runs), or the single run (deterministic). */
+export function progressUnits(spec: StudySpec): { measure: number; confirm: number } {
+  const p = spec.oracle.protocol;
+  if (spec.oracle.noise === "noisy") return { measure: p.n_max, confirm: p.n_max };
+  if (spec.oracle.noise === "expensive") return { measure: 1 + p.confirm_runs, confirm: p.confirm_runs };
+  return { measure: 1, confirm: 1 };
+}
+
 /** Restarts (offline host, worker restart) before a measurement counts as a pipeline error. */
 const MAX_RESTARTS = 6;
 
@@ -536,7 +547,8 @@ export class Pipeline {
     const progress = (text: string) => this.setProgress(lockKey, study.id, host.host_id, `c/${c.n}: ${text}`);
     store.deleteSamples(c.id);
     store.updateCandidate(c.id, { stage: "measuring", bench_host_id: host.host_id, holdout: null });
-    store.event(study.id, "measure.started", "plugin", { candidate: c.id, n: c.n, against, host: host.host_id, mode: host.mode });
+    const units = progressUnits(spec);
+    store.event(study.id, "measure.started", "plugin", { candidate: c.id, n: c.n, against, host: host.host_id, mode: host.mode, of: units.measure });
     this.changed(study.id);
     progress("preparing best");
     const best = await site.bestCheckout(against, spec, signal);
@@ -559,11 +571,41 @@ export class Pipeline {
     const dirs = { best: best.dir, candidate: candDir };
     const bench = site.bench(spec, dirs, { signal, label: `c/${c.n}`, onProgress: (line) => progress(line) });
     let runNo = 0;
+    // Pair progress for the live view: completed pairs (noisy) or candidate runs, recorded as
+    // measure.progress events at a coarse granularity (the first, then at most one per
+    // PROGRESS_EVERY_MS, and the last before a decision) so replay can rebuild the bench strip.
+    const pairs = { run: "measure", done: 0, sides: new Map<string, Set<Side>>(), counted: new Set<string>(), lastAt: 0, recorded: 0, byRun: {} as Record<string, number> };
+    const recordProgress = (force: boolean) => {
+      if (pairs.done === pairs.recorded) return;
+      const now = this.ctx.now();
+      if (!force && pairs.recorded > 0 && now - pairs.lastAt < PROGRESS_EVERY_MS) return;
+      pairs.lastAt = now;
+      pairs.recorded = pairs.done;
+      store.event(study.id, "measure.progress", "plugin", { candidate: c.id, n: c.n, run: pairs.run, pairs: pairs.done, of: pairs.run === "confirm" ? units.confirm : units.measure, host: host.host_id });
+    };
     const record = (run: string) => (s: { pair: number; side: Side; metrics: Record<string, number> }) => {
       runNo += 1;
       progress(`${run} pair ${s.pair + 1} ${s.side} (run ${runNo})`);
       for (const [metric, value] of Object.entries(s.metrics)) {
         store.addSample({ study_id: study.id, candidate_id: c.id, run, pair: s.pair, side: s.side, metric, value, host_id: host.host_id });
+      }
+      if (run !== pairs.run) {
+        pairs.byRun[pairs.run] = pairs.done;
+        pairs.run = run;
+        pairs.done = 0;
+        pairs.recorded = 0;
+        pairs.sides.clear();
+        pairs.counted.clear();
+      }
+      const key = String(s.pair);
+      const sides = pairs.sides.get(key) ?? new Set<Side>();
+      sides.add(s.side);
+      pairs.sides.set(key, sides);
+      const complete = strategy.kind === "noisy" ? sides.size === 2 && !pairs.counted.has(key) : s.side === "candidate";
+      if (complete) {
+        pairs.counted.add(key);
+        pairs.done += 1;
+        recordProgress(false);
       }
     };
     const bestCache = study.best_run_sha === against ? (JSON.parse(study.best_run_json ?? "null") as RunResult | null) : null;
@@ -585,12 +627,14 @@ export class Pipeline {
       guardrailNoise,
       signal,
     });
+    recordProgress(true);
     let result = decideVerdict(outcome, spec, { prior });
     let estimates: Record<string, GuardrailEstimate> = outcomeEstimates(outcome);
     if (result.verdict === "win" && spec.oracle.protocol.confirm && strategy.kind === "noisy") {
       store.updateCandidate(c.id, { stage: "confirming" });
       this.changed(study.id);
       const confirmation = await strategy.measure({ bench, spec, mde, rng: this.ctx.rng, record: record("confirm"), bestCache: null, guardrailNoise, signal });
+      recordProgress(true);
       // Guardrails didn't select the candidate, so the confirmation judges them on both measurements' pairs.
       const p = spec.oracle.protocol;
       const second = outcomeEstimates(confirmation);
@@ -619,7 +663,7 @@ export class Pipeline {
     }
     const seconds = (this.ctx.now() - started) / 1000;
     store.addBenchSeconds(study.id, seconds);
-    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id });
+    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run, measure_pairs: pairs.run === "measure" ? pairs.done : (pairs.byRun.measure ?? 0), confirm_pairs: pairs.run === "confirm" ? pairs.done : 0 });
     const hostRow = store.benchHost(study.id, host.host_id)!;
     store.updateBenchHost(study.id, host.host_id, { evals_since_drift: hostRow.evals_since_drift + 1 });
     // Cache a run of best: reused as the baseline by single-run classes, and its DIAG lines go into briefs.
@@ -782,6 +826,7 @@ export class Pipeline {
       const calibrated = host.noise_floor ?? segment?.noise_floor ?? null;
       const id = store.openDriftCheck({ study_id: study.id, host_id: hostId, segment: study.segment, best_sha: study.best_sha });
       store.updateBenchHost(study.id, hostId, { drift_status: "running" });
+      store.event(study.id, "drift.started", "plugin", { host: hostId });
       const lockKey = benchLockKey(study, spec, hostId);
       this.setProgress(lockKey, study.id, hostId, "drift check (A/A on best)");
       this.changed(study.id);

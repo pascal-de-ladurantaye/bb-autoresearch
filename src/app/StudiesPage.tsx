@@ -18,12 +18,25 @@ import { FindingsTab } from "./Findings.tsx";
 import { ago, duration } from "./format.ts";
 import { HarvestTab } from "./Harvest.tsx";
 import { IdeasTab } from "./Ideas.tsx";
+import { LiveStudy } from "./live/LiveStudy.tsx";
+import { requestOpenBeside } from "./live/openBeside.ts";
 import { OracleTab } from "./Oracle.tsx";
 import { OverviewTab } from "./Overview.tsx";
 import { EmptyState, ErrorLine, FOCUS_RING, Skeleton, StatePill, Tabs } from "./ui.tsx";
 
-const TABS = ["overview", "ideas", "candidates", "findings", "oracle", "bench", "harvest"] as const;
+const TABS = ["live", "overview", "ideas", "candidates", "findings", "oracle", "bench", "harvest"] as const;
 export type Tab = (typeof TABS)[number];
+
+/** The tab a route names explicitly, or null (the page picks: Live while Running, Overview otherwise). */
+export function explicitTab(subPath: string): Tab | null {
+  const tab = subPath.split("/").filter(Boolean)[1];
+  return (TABS as readonly string[]).includes(tab ?? "") ? (tab as Tab) : null;
+}
+
+/** The default tab for a study in this state. */
+export function defaultTab(state: string): Tab {
+  return state === "running" ? "live" : "overview";
+}
 
 export function parseSubPath(subPath: string): { slug: string | null; tab: Tab; candidate: number | null } {
   const [slug, tab, n] = subPath.split("/").filter(Boolean);
@@ -37,7 +50,7 @@ export function StudiesPanel({ subPath }: { subPath: string }) {
   const route = parseSubPath(subPath);
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto box-border w-full max-w-6xl px-4 pb-6 pt-3 md:px-5 md:pt-4">{route.slug ? <StudyPage slug={route.slug} tab={route.tab} candidate={route.candidate} /> : <StudyList />}</div>
+      <div className="mx-auto box-border w-full max-w-6xl px-4 pb-6 pt-3 md:px-5 md:pt-4">{route.slug ? <StudyPage key={route.slug} slug={route.slug} tab={explicitTab(subPath)} candidate={route.candidate} /> : <StudyList />}</div>
     </div>
   );
 }
@@ -200,10 +213,15 @@ function StudyList() {
   );
 }
 
-function StudyPage({ slug, tab, candidate }: { slug: string; tab: Tab; candidate: number | null }) {
+function StudyPage({ slug, tab: routeTab, candidate }: { slug: string; tab: Tab | null; candidate: number | null }) {
   const nav = useBbNavigate();
   const rpc = useStudyRpc();
   const o = useLive((r) => r.call("study.overview", { slug }), [slug]);
+  // Without a tab in the route: Live while Running, Overview otherwise. Decided once per visit,
+  // so a study that pauses doesn't pull the page away from what the human is looking at.
+  const firstState = useRef<string | null>(null);
+  if (firstState.current === null && o.data) firstState.current = o.data.state;
+  const tab: Tab = routeTab ?? defaultTab(firstState.current ?? "draft");
   const ideas = useLive((r) => r.call("study.ideas", { slug }), [slug], 10_000);
   // Only the total, for the tab count.
   const findings = useLive((r) => r.call("study.findings", { slug, limit: 1 }), [slug], 30_000);
@@ -261,7 +279,9 @@ function StudyPage({ slug, tab, candidate }: { slug: string; tab: Tab; candidate
         onSelect={(t) => go(t)}
         label="Study sections"
         badge={(t) =>
-          t === "ideas" && ideas.data ? (
+          t === "live" && data?.state === "running" ? (
+            <span className="ml-1.5 inline-flex size-1.5 rounded-full bg-success align-middle" aria-label="running" />
+          ) : t === "ideas" && ideas.data ? (
             <span className="ml-1 text-xs text-muted-foreground">{ideas.data.ideas.filter((i) => i.status === "queued").length}</span>
           ) : t === "candidates" && data ? (
             <span className="ml-1 text-xs text-muted-foreground">{data.candidates}</span>
@@ -280,7 +300,18 @@ function StudyPage({ slug, tab, candidate }: { slug: string; tab: Tab; candidate
         ) : (
           <>
             {o.error ? <ErrorLine error={`Live updates failed (showing the last data): ${o.error}`} retry={o.refetch} /> : null}
-            {tab === "overview" ? (
+            {tab === "live" ? (
+              <LiveStudy
+                slug={slug}
+                layout="wide"
+                onOpenCandidate={(n) => go("candidates", n)}
+                onOpenOverview={() => go("overview")}
+                onOpenBeside={(threadId) => {
+                  requestOpenBeside(threadId, slug);
+                  nav.toThread(threadId);
+                }}
+              />
+            ) : tab === "overview" ? (
               <OverviewTab o={data} rpc={rpc} onChanged={refetch} onOpenCandidate={(n) => go("candidates", n)} go={go} />
             ) : tab === "ideas" ? (
               ideas.data ? (
