@@ -142,7 +142,11 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
         seq = Math.max(seq, r.seq);
         const item = (r.data as { item?: { type?: string; command?: unknown; tool?: unknown } }).item;
         if (!item?.type) continue;
-        items.push({ seq: r.seq, at: r.createdAt, kind: item.type, command: typeof item.command === "string" ? item.command.slice(0, 300) : null, tool: typeof item.tool === "string" ? item.tool.slice(0, 80) : null });
+        // Never message text: the kind, a command, a tool name, and the file paths the item names.
+        const args = (item as { arguments?: unknown }).arguments;
+        const argCommand = args && typeof args === "object" && typeof (args as { command?: unknown }).command === "string" ? ((args as { command: string }).command) : null;
+        const command = typeof item.command === "string" ? item.command : item.type === "toolCall" ? argCommand : null;
+        items.push({ seq: r.seq, at: r.createdAt, kind: item.type, command: command ? command.slice(0, 300) : null, tool: typeof item.tool === "string" ? item.tool.slice(0, 80) : null, paths: itemPaths(item) });
       }
       return { seq, items };
     },
@@ -170,4 +174,23 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
       bb.realtime.publish(channel, payload as never);
     },
   };
+}
+
+/** File paths a thread item names (at most 5, each clipped), for the worker's "last action" label. */
+export function itemPaths(item: unknown): string[] | null {
+  if (!item || typeof item !== "object") return null;
+  const out: string[] = [];
+  const add = (v: unknown) => {
+    if (typeof v === "string" && v.trim() && out.length < 5) out.push(v.slice(0, 200));
+  };
+  const it = item as { changes?: unknown; path?: unknown; arguments?: unknown };
+  if (Array.isArray(it.changes)) for (const c of it.changes) add((c as { path?: unknown } | null)?.path);
+  add(it.path);
+  const a = it.arguments;
+  if (a && typeof a === "object") {
+    const r = a as Record<string, unknown>;
+    for (const k of ["path", "file_path", "filePath", "file", "filename"]) add(r[k]);
+    for (const k of ["paths", "files"]) if (Array.isArray(r[k])) for (const p of r[k] as unknown[]) add(p);
+  }
+  return out.length ? out : null;
 }

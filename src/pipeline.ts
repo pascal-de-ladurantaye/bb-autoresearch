@@ -18,9 +18,10 @@
 // host worker restart or an offline host restarts the measurement from
 // scratch with its partial samples discarded. Drift checks take a host's
 // next free slot every `oracle.drift.every` evaluations.
+import { ciRngFor } from "./band.ts";
 import { BenchSite, BenchTransferError, makeBench as makeBenchOn, tail } from "./bench.ts";
 import { HostMutex, type Ctx } from "./context.ts";
-import type { BenchHostRow, CandidateRow, Store, StudyRow, ThreadRow } from "./db/store.ts";
+import { StoreClosedError, type BenchHostRow, type CandidateRow, type Store, type StudyRow, type ThreadRow } from "./db/store.ts";
 import { driftExpensive, driftNoisy, type DriftResult } from "./drift.ts";
 import { poolPaired, positionsFromChain, promotionChain, type GuardrailCalibration, type GuardrailEstimate, type Position } from "./guardrails.ts";
 import { checkHealth } from "./health.ts";
@@ -53,6 +54,21 @@ export interface PipelineHooks {
   bestMoved(study: StudyRow, winner: CandidateRow, promoted: string): void;
   /** A notice for the human (no agent turn). */
   notify(study: StudyRow, kind: string, text: string): Promise<void>;
+  /** Live view: a sample of a measurement was recorded (the CI band moves pair by pair). */
+  onSample?(studyId: string, candidateId: number): void;
+  /** Live view: a measurement ended and its metrics are stored (the band is kept with the candidate). */
+  onMeasured?(candidateId: number): void;
+}
+
+/** The win threshold a measurement of `study` on `host` uses (segment MDE, at least the host's own). */
+export function measurementMde(store: Store, study: StudyRow, spec: StudySpec, host: Pick<BenchHostRow, "mde">): number {
+  const segment = store.segment(study.id, study.segment);
+  return Math.max(segment?.mde ?? spec.oracle.protocol.min_effect, host.mde ?? 0);
+}
+
+/** The calibrated per-run noise a measurement on `host` uses (expensive: σ of one run). */
+export function measurementNoise(store: Store, study: StudyRow, host: Pick<BenchHostRow, "noise_floor">): number | null {
+  return host.noise_floor ?? store.segment(study.id, study.segment)?.noise_floor ?? null;
 }
 
 /** Live view: at most one measure.progress event per candidate this often (plus the first and the last). */
@@ -252,6 +268,7 @@ export class Pipeline {
 
   /** Start jobs for whatever has work. Cheap and synchronous; safe to call often. */
   kick(): void {
+    if (this.ctx.disposed) return;
     try {
       this.launch();
     } catch (e) {
@@ -283,10 +300,11 @@ export class Pipeline {
       try {
         await fn();
       } catch (e) {
-        this.ctx.bb.log("warn", `pipeline job ${key}: ${errText(e)}`);
+        // A disposed instance (plugin reload) stops quietly: the new one reconciles.
+        if (!this.ctx.disposed && !(e instanceof StoreClosedError)) this.ctx.bb.log("warn", `pipeline job ${key}: ${errText(e)}`);
       } finally {
         this.jobs.delete(key);
-        this.kick();
+        if (!this.ctx.disposed) this.kick();
       }
     })();
     this.jobs.set(key, job);
@@ -377,6 +395,7 @@ export class Pipeline {
     try {
       await fn();
     } catch (e) {
+      if (this.ctx.disposed || e instanceof StoreClosedError) return;
       const fresh = this.ctx.store.candidate(c.id) ?? c;
       const attempts = fresh.attempts + 1;
       this.ctx.store.updateCandidate(c.id, { attempts });
@@ -411,6 +430,7 @@ export class Pipeline {
       if (worker && worker.conflict_refunds < CONFLICT_REFUNDS) {
         // Best moved under the worker: not its fault, so the submission is refunded (bounded).
         store.updateThread(worker.id, { submissions: Math.max(0, worker.submissions - 1), conflict_refunds: worker.conflict_refunds + 1 });
+        store.event(study.id, "submission.refunded", "plugin", { candidate: c.id, n: c.n, worker: worker.id });
         reasons.push("this conflict does not count against your submission limit");
       }
       this.decide(c, { verdict: "conflict", reasons });
@@ -493,6 +513,8 @@ export class Pipeline {
       try {
         await this.measureOn(study, spec, host, c, entry.controller.signal, started);
       } catch (e) {
+        // Plugin reload: the store is closed and the new instance restarts this measurement.
+        if (this.ctx.disposed) return;
         const seconds = (this.ctx.now() - started) / 1000;
         store.addBenchSeconds(study.id, seconds);
         const fresh = store.candidate(c.id)!;
@@ -607,11 +629,12 @@ export class Pipeline {
         pairs.done += 1;
         recordProgress(false);
       }
+      this.hooks.onSample?.(study.id, c.id);
     };
     const bestCache = study.best_run_sha === against ? (JSON.parse(study.best_run_json ?? "null") as RunResult | null) : null;
     const baseline = safeJson<{ sha: string; runs: RunResult[] }>(store.benchHost(study.id, host.host_id)?.baseline_json ?? null);
-    const mde = Math.max(segment?.mde ?? spec.oracle.protocol.min_effect, host.mde ?? 0);
-    const noiseFloor = host.noise_floor ?? segment?.noise_floor ?? null;
+    const mde = measurementMde(store, study, spec, host);
+    const noiseFloor = measurementNoise(store, study, host);
     const guardrailNoise = Object.fromEntries(segmentGuardrailCalibration(store, study).map((g) => [g.name, g.noise]));
     // Guardrails: the step is judged against best, the total against the segment base (best's position so far).
     const prior = bestGuardrailPositions(store, study, spec);
@@ -620,6 +643,7 @@ export class Pipeline {
       spec,
       mde,
       rng: this.ctx.rng,
+      ciRng: ciRngFor(c.id, "measure"),
       record: record("measure"),
       bestCache,
       baseline: baseline?.sha === against ? baseline.runs : null,
@@ -633,7 +657,7 @@ export class Pipeline {
     if (result.verdict === "win" && spec.oracle.protocol.confirm && strategy.kind === "noisy") {
       store.updateCandidate(c.id, { stage: "confirming" });
       this.changed(study.id);
-      const confirmation = await strategy.measure({ bench, spec, mde, rng: this.ctx.rng, record: record("confirm"), bestCache: null, guardrailNoise, signal });
+      const confirmation = await strategy.measure({ bench, spec, mde, rng: this.ctx.rng, ciRng: ciRngFor(c.id, "confirm"), record: record("confirm"), bestCache: null, guardrailNoise, signal });
       recordProgress(true);
       // Guardrails didn't select the candidate, so the confirmation judges them on both measurements' pairs.
       const p = spec.oracle.protocol;
@@ -663,7 +687,7 @@ export class Pipeline {
     }
     const seconds = (this.ctx.now() - started) / 1000;
     store.addBenchSeconds(study.id, seconds);
-    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run, measure_pairs: pairs.run === "measure" ? pairs.done : (pairs.byRun.measure ?? 0), confirm_pairs: pairs.run === "confirm" ? pairs.done : 0 });
+    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run, measure_pairs: pairs.run === "measure" ? pairs.done : (pairs.byRun.measure ?? 0), confirm_pairs: pairs.run === "confirm" ? pairs.done : 0, effect: Number.isFinite(outcome.effect) ? outcome.effect : null });
     const hostRow = store.benchHost(study.id, host.host_id)!;
     store.updateBenchHost(study.id, host.host_id, { evals_since_drift: hostRow.evals_since_drift + 1 });
     // Cache a run of best: reused as the baseline by single-run classes, and its DIAG lines go into briefs.
@@ -690,6 +714,7 @@ export class Pipeline {
       diag_json: JSON.stringify(outcome.candidateDiag.slice(0, 40)),
       bench_seconds: c.bench_seconds + seconds,
     });
+    this.hooks.onMeasured?.(c.id);
     if (result.verdict === "win") {
       // A win only counts against the best it was measured on. If best moved
       // during the measurement (another bench host promoted), measure again.

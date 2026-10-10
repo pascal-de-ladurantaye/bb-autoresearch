@@ -38,7 +38,15 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     // Host job progress streams back as signals; runners subscribe by job id.
     const progress = new ProgressBus();
     client.experimental_onSignal("progress", ({ payload }) => progress.emit(payload.key, payload.message));
-    const port = deps.port ? deps.port(bb) : createBbPort(bb, client, progress);
+    const rawPort = deps.port ? deps.port(bb) : createBbPort(bb, client, progress);
+    // After dispose (reload, disable, shutdown) the old instance logs nothing: work still in flight stops quietly.
+    const port: BbPort = new Proxy(rawPort, {
+      get(target, key) {
+        if (key === "log") return (level: "info" | "warn" | "error", message: string) => (ctx.disposed ? undefined : target.log(level, message));
+        const v = Reflect.get(target, key, target) as unknown;
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
     const ctx: Ctx = {
       store,
       bb: port,
@@ -49,17 +57,20 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     };
     const engine = new Engine(ctx);
     deps.onEngine?.(engine);
+    // Stop the old instance before BB closes its database (see Engine.dispose).
+    bb.onDispose(() => engine.dispose());
 
     registerTools(bb, engine);
     registerRpc(bb, engine);
     bb.cli.register(studyCli(engine));
 
     const safe = (name: string, fn: () => void | Promise<void>) => {
+      if (ctx.disposed) return;
       try {
         const r = fn();
-        if (r instanceof Promise) r.catch((e) => bb.log.warn(`${name}: ${errText(e)}`));
+        if (r instanceof Promise) r.catch((e) => ctx.bb.log("warn", `${name}: ${errText(e)}`));
       } catch (e) {
-        bb.log.warn(`${name}: ${errText(e)}`);
+        ctx.bb.log("warn", `${name}: ${errText(e)}`);
       }
     };
     bb.events.on("thread.idle", ({ thread }) => safe("thread.idle", () => engine.onThreadIdle(thread.id)));
@@ -73,6 +84,7 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     client.experimental_onWorkerExit(({ hostId }) => {
       // In-flight host calls and jobs died with the worker: measurements on
       // that host restart from scratch (partial samples discarded).
+      if (ctx.disposed) return;
       bb.log.warn(`host worker exited on ${hostId}`);
       engine.onHostWorkerExit(hostId);
     });
@@ -86,7 +98,7 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
           bb.log.error(`reconcile failed: ${errText(e)}`);
         }
         while (!signal.aborted) {
-          await engine.tick().catch((e) => bb.log.warn(`tick: ${errText(e)}`));
+          await engine.tick().catch((e) => ctx.bb.log("warn", `tick: ${errText(e)}`));
           await new Promise<void>((resolve) => {
             const t = setTimeout(resolve, ctx.config.tickMs);
             signal.addEventListener("abort", () => {

@@ -132,14 +132,15 @@ function view(over: Partial<LiveView> = {}): LiveView {
     now: 0,
     lastEventId: 10,
     studyThreadId: "thr_study",
-    best: { text: null, n: null, at: null },
+    best: { text: null, n: null, at: null, value: null, movedAt: null, history: [], rebases: [] },
     counts: { candidates: 1, maxCandidates: 6, workers: 1, targetWorkers: 3, queue: 0 },
-    workers: [{ key: 1, threadId: "thr_w1", ideaId: 1, ideaTitle: "Idea", theme: "", phase: "testing", phaseAt: 0, spawnedAt: 0, submissions: 1, maxSubmissions: 3, candidate: 1, candidateStage: "gating", queuePosition: null }],
+    workers: [{ key: 1, threadId: "thr_w1", ideaId: 1, ideaTitle: "Idea", theme: "", phase: "testing", phaseAt: 0, spawnedAt: 0, submissions: 1, maxSubmissions: 3, candidate: 1, candidateStage: "gating", queuePosition: null, action: null }],
     cards: [{ n: 1, ideaId: 1, ideaTitle: "Idea", workerKey: 1, stage: "gating", column: "gates", stageAt: 0, verdict: null, effect: null, effectText: null, hostId: null, pairs: null, rebases: 0, submittedAt: 0, decidedAt: null }],
     queue: [],
     bench: [],
-    ideas: { next: [{ id: 2, title: "Next", theme: "", pinned: false, source: "human" }], total: 1 },
+    ideas: { next: [{ id: 2, title: "Next", theme: "", pinned: false, source: "human", blocked: null }], total: 1 },
     feed: [],
+    bands: [],
     ...over,
   };
 }

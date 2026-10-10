@@ -38,6 +38,8 @@ export interface ThreadActivityItem {
   kind: string;
   command: string | null;
   tool: string | null;
+  /** File paths the item names (fileChange changes, fileRead/search path, a tool's path arguments), for the "last action" label. */
+  paths?: string[] | null;
 }
 
 export interface HostInfo {
