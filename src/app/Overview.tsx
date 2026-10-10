@@ -188,6 +188,12 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
               </Button>
             </form>
           ) : null}
+          {o.state !== "draft" ? (
+            <Button size="sm" variant="outline" onClick={() => nav.toPluginPanel("studies", { subPath: `${o.slug}/live/replay` })} aria-label="Replay this study in the Live view">
+              <Icon name="RotateCcw" className="size-4" aria-hidden />
+              Replay
+            </Button>
+          ) : null}
           {o.state !== "archived" ? (
             <Button size="sm" variant="ghost" className="ml-auto text-muted-foreground" disabled={busy} onClick={() => setDialog("archive")}>
               <Icon name="Archive" className="size-4" aria-hidden />

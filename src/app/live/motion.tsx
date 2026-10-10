@@ -31,6 +31,8 @@ class FlipRegistry {
   expiry = new Map<string, ReturnType<typeof setTimeout>>();
   mounted = new Map<string, number>();
   ready = false;
+  /** Jumps, not motion (a replay being scrubbed). */
+  still = false;
   /** Last time an animation frame ran (a hidden or occluded page renders none: animating there would freeze items mid-flight). */
   lastFrame = Number.NEGATIVE_INFINITY;
   rendering(): boolean {
@@ -49,12 +51,14 @@ class FlipRegistry {
 
 const FlipContext = createContext<FlipRegistry | null>(null);
 
-export function FlipRoot({ children, className }: { children: ReactNode; className?: string }) {
+export function FlipRoot({ children, className, still = false }: { children: ReactNode; className?: string; still?: boolean }) {
   const reduced = usePrefersReducedMotion();
   const ref = useRef<HTMLDivElement | null>(null);
   const registry = useRef<FlipRegistry | null>(null);
   if (!registry.current) registry.current = new FlipRegistry(null, reduced);
   registry.current.reduced = reduced;
+  // A replay that is scrubbed or paused jumps: nothing glides (positions are still remembered).
+  registry.current.still = still;
   useLayoutEffect(() => {
     registry.current!.root = ref.current;
     // Items present when the view first fills in don't fly in.
@@ -95,7 +99,7 @@ export function useFlip<T extends HTMLElement>(key: string): (el: T | null) => v
     const now = { x: r.left - o.x, y: r.top - o.y };
     const prev = reg.rects.get(key);
     reg.rects.set(key, now);
-    if (reg.reduced || typeof node.animate !== "function" || !reg.rendering()) return;
+    if (reg.reduced || reg.still || typeof node.animate !== "function" || !reg.rendering()) return;
     if (prev) {
       const dx = prev.x - now.x;
       const dy = prev.y - now.y;
@@ -138,4 +142,54 @@ export function useFlash(value: unknown, ms = 1800): boolean {
     return () => clearTimeout(t);
   }, [value, ms]);
   return on;
+}
+
+/**
+ * Whether motion may run right now: not under prefers-reduced-motion, and
+ * the page is drawing frames (inside a FlipRoot, its heartbeat decides).
+ */
+export function useMotionGate(): () => boolean {
+  const reg = useContext(FlipContext);
+  const reduced = usePrefersReducedMotion();
+  return useCallback(() => !reduced && !(reg?.reduced ?? false) && !(reg?.still ?? false) && (reg ? reg.rendering() : true), [reg, reduced]);
+}
+
+/** Run a Web Animation on `el` when motion is allowed (no-op otherwise). */
+export function animateIf(ok: boolean, el: Element | null | undefined, keyframes: Keyframe[], options: KeyframeAnimationOptions): void {
+  if (!ok || !el || typeof (el as HTMLElement).animate !== "function") return;
+  (el as HTMLElement).animate(keyframes, { easing: EASE, ...options });
+}
+
+/**
+ * A number that counts up (or down) to `value` over `ms` when `animate` is
+ * true at the moment it changes, and jumps otherwise (first render, reduced
+ * motion, a page that draws no frames, a replay scrubbed backwards).
+ */
+export function useCountUp(value: number | null, animate: boolean, ms = 900): number | null {
+  const [shown, setShown] = useState(value);
+  const prev = useRef(value);
+  useEffect(() => {
+    const from = prev.current;
+    prev.current = value;
+    if (value === null || from === null || from === value || !animate || typeof requestAnimationFrame !== "function") {
+      setShown(value);
+      return;
+    }
+    const start = performance.now();
+    let raf = 0;
+    const step = () => {
+      const k = Math.min(1, (performance.now() - start) / ms);
+      const e = 1 - (1 - k) ** 3;
+      setShown(from + (value - from) * e);
+      if (k < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    // If frames stop (hidden page), land on the value anyway.
+    const done = setTimeout(() => setShown(value), ms + 200);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(done);
+    };
+  }, [value, animate, ms]);
+  return shown;
 }
