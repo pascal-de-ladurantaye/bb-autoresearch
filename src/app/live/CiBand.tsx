@@ -7,7 +7,7 @@
 // ones the runs against the calibrated σ band. Guardrails sit underneath,
 // compactly: the step against its limit and the total against its own.
 // Every state is also in words; color is never the only signal.
-import { useId, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
+import { useCallback, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { bandGuardrails, expensiveThresholds, pointDecision, runDecision, type BandDecision, type BandGuardrailState, type BandPoint, type BandRun, type DeterministicBand, type ExpensiveBand, type MeasureBand, type NoisyBand } from "../../band.ts";
@@ -88,12 +88,33 @@ function NoisyBandView({ band, compact }: { band: NoisyBand; compact: boolean })
   );
 }
 
-const W = 320;
-const H = 150;
 const M = { l: 40, r: 10, t: 12, b: 20 };
+
+/** The pixel width of a box (charts draw in pixels, so their text stays crisp); `fallback` until measured. */
+function useBoxWidth(fallback: number): [(el: HTMLDivElement | null) => void, number] {
+  const [w, setW] = useState(fallback);
+  const obs = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: HTMLDivElement | null) => {
+    obs.current?.disconnect();
+    obs.current = null;
+    if (!el) return;
+    const width = el.getBoundingClientRect().width;
+    if (width > 0) setW(Math.round(width));
+    if (typeof ResizeObserver === "function") {
+      obs.current = new ResizeObserver((entries) => {
+        const x = entries[0]?.contentRect.width;
+        if (x && x > 0) setW(Math.round(x));
+      });
+      obs.current.observe(el);
+    }
+  }, []);
+  return [ref, w];
+}
 
 function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run: BandRun; domain: [number, number]; title: string | null; compact: boolean }) {
   const clip = useId().replace(/:/gu, "");
+  const [box, W] = useBoxWidth(320);
+  const H = compact ? 128 : 160;
   const motion = useMotionGate();
   const [yMin, yMax] = domain;
   const x = (n: number) => M.l + ((n - 0.5) / band.nMax) * (W - M.l - M.r);
@@ -133,7 +154,8 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
   return (
     <figure className="min-w-0 space-y-1" aria-label={`${title ?? "Measurement"} of c/${band.n}`}>
       {title ? <figcaption className="text-xs font-medium text-muted-foreground">{title}</figcaption> : null}
-      <svg viewBox={`0 0 ${W} ${H}`} className={cn("w-full", compact ? "h-32" : "h-40")} role="img" aria-label={runWords(band, run)} preserveAspectRatio="none">
+      <div ref={box} className="w-full">
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label={runWords(band, run)}>
         <defs>
           <clipPath id={`plot-${clip}`}>
             <rect x={M.l} y={M.t} width={W - M.l - M.r} height={H - M.t - M.b} />
@@ -174,12 +196,16 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
                 {v === 0 ? "0" : pct(v)}
               </text>
             ))}
-            <text x={M.l - 4} y={M.t + 7} textAnchor="end">
-              {pct(yMax, 0)}
-            </text>
-            <text x={M.l - 4} y={H - M.b} textAnchor="end">
-              {pct(yMin, 0)}
-            </text>
+            {Math.min(...yTicks.map((v) => Math.abs(y(v) - (M.t + 4)))) > 11 ? (
+              <text x={M.l - 4} y={M.t + 7} textAnchor="end">
+                {pct(yMax, 0)}
+              </text>
+            ) : null}
+            {Math.min(...yTicks.map((v) => Math.abs(y(v) - (H - M.b - 3)))) > 11 ? (
+              <text x={M.l - 4} y={H - M.b} textAnchor="end">
+                {pct(yMin, 0)}
+              </text>
+            ) : null}
             {xTicks.map((n) => (
               <text key={n} x={x(n)} y={H - 6} textAnchor="middle">
                 {n}
@@ -203,13 +229,14 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
           {stop ? (
             <g data-decision className={DECISION_WORD[stop.decision].tone} style={{ transformBox: "fill-box", transformOrigin: "center bottom" }}>
               <line x1={x(stop.n)} x2={x(stop.n)} y1={M.t} y2={H - M.b} stroke="currentColor" strokeWidth={1.5} strokeDasharray="2 2" />
-              <text x={Math.min(W - M.r - 2, x(stop.n) + 3)} y={M.t + 8} fill="currentColor" style={{ fontSize: 9, fontWeight: 600 }} textAnchor={x(stop.n) > W - 80 ? "end" : "start"}>
+              <text x={x(stop.n) > W - 80 ? x(stop.n) - 3 : x(stop.n) + 3} y={x(stop.n) > W - 80 ? M.t + 20 : M.t + 8} fill="currentColor" style={{ fontSize: 9, fontWeight: 600 }} textAnchor={x(stop.n) > W - 80 ? "end" : "start"}>
                 {stop.n} of {band.nMax}
               </text>
             </g>
           ) : null}
         </g>
       </svg>
+      </div>
       <RunWords band={band} run={run} />
     </figure>
   );

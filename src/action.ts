@@ -66,7 +66,7 @@ export function displayPath(path: string, worktree: string | null | undefined): 
   }
   if (p.startsWith("~/") || p.startsWith("/")) {
     const parts = p.split("/").filter(Boolean);
-    p = parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : parts.join("/");
+    p = parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : `${p.startsWith("~/") ? "~/" : "/"}${parts.filter((x) => x !== "~").join("/")}`;
   }
   return redact(p);
 }

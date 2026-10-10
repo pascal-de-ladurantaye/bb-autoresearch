@@ -685,7 +685,8 @@ export function replayBundle(engine: Engine, s: StudyRow): ReplayBundle {
     state: s.state,
     studyThreadId: s.study_thread_id,
     start: events[0]?.at ?? s.created_at,
-    end: s.state === "running" || s.state === "paused" ? now : (events.at(-1)?.at ?? now),
+    // A running study's replay reaches now; any other ends with its last event (no idle tail).
+    end: s.state === "running" ? now : (events.at(-1)?.at ?? now),
     now,
     spec: { maxCandidates: spec?.budget.max_candidates ?? 0, maxSubmissions: spec?.agents.max_submissions_per_worker ?? 0, maxWorkers: spec ? engine.maxWorkers(s) : 1 },
     hosts: store.benchHosts(s.id).map((h) => ({ hostId: h.host_id, name: h.name })),

@@ -220,6 +220,35 @@ describe("frontend: Live view part 2", () => {
     }
   });
 
+  it("a page that draws a frame only now and then (an occluded window) gets no animations: nothing freezes mid-flight", async () => {
+    const calls: unknown[] = [];
+    const proto = HTMLElement.prototype as unknown as { animate?: unknown };
+    const original = proto.animate;
+    proto.animate = function (frames: unknown) {
+      calls.push(frames);
+      return { cancel() {}, finished: Promise.resolve() } as unknown as Animation;
+    };
+    const w = window as unknown as { requestAnimationFrame?: (cb: (t: number) => void) => number };
+    const raf = w.requestAnimationFrame;
+    // One frame per second: each probe's second frame comes ~1 s after the first.
+    let next = performance.now();
+    w.requestAnimationFrame = (cb) => {
+      next = Math.max(next + 1000, performance.now());
+      return setTimeout(() => cb(next), 5) as unknown as number;
+    };
+    try {
+      const p = await page("toy-size/live", { "study.live": async () => fixture() });
+      await p.findByText("Live");
+      await new Promise((r) => setTimeout(r, 1700));
+      await p.behavior.emitRealtime(LIVE_CHANNEL, { s: "s1", d: [{ k: "stage", id: 300, t: T, c: 2, to: "confirming" }, { k: "phase", id: 301, t: T, w: 2, to: "testing" }] });
+      await waitFor(() => expect(p.getByRole("button", { name: /Use a set: testing locally/u })).toBeTruthy());
+      expect(calls).toHaveLength(0);
+    } finally {
+      proto.animate = original;
+      w.requestAnimationFrame = raf;
+    }
+  });
+
   it("the rebase notice is for a few seconds only", async () => {
     const p = await page("toy-size/live", { "study.live": async () => fixture({ best: { ...fixture().best, movedAt: T - 10_000, rebases: [2] } }) });
     await p.findByText("Live");

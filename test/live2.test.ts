@@ -185,6 +185,7 @@ describe("last action labels", () => {
     expect(actionLabel([{ kind: "agentMessage" }, { kind: "reasoning" }], wt)).toBeNull();
     // Other absolute paths keep their last two segments.
     expect(itemLabel({ kind: "fileRead", paths: ["/etc/ssh/sshd_config"] }, wt)).toBe("reading …/ssh/sshd_config");
+    expect(itemLabel({ kind: "fileChange", paths: ["/tmp/a"] }, wt)).toBe("editing /tmp/a");
   });
 
   it("never shows secrets, URL credentials, heredoc bodies or more than 80 characters", () => {
