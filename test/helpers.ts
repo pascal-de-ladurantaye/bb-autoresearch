@@ -107,6 +107,10 @@ export class FakeHost implements HostRunner {
   delays: { gate: number; measure: number } = { gate: 0, measure: 0 };
   active = { gate: 0, measure: 0 };
   maxActive = { gate: 0, measure: 0 };
+  /** Most gate and measure commands running at once, together (single-machine mode: 1). */
+  maxActiveAll = 0;
+  /** Start order of gate and measure commands, with the cwd ("gate:/co/x" or "measure:/co/y"). */
+  started: string[] = [];
   /** Called before every measure run (tests mutate state mid-measurement). */
   onMeasure: ((cwd: string) => void | Promise<void>) | null = null;
   /** Health report returned by health(). */
@@ -165,6 +169,7 @@ export class FakeHost implements HostRunner {
   private async timed<T>(kind: "gate" | "measure", fn: () => T | Promise<T>): Promise<T> {
     this.active[kind] += 1;
     this.maxActive[kind] = Math.max(this.maxActive[kind], this.active[kind]);
+    this.maxActiveAll = Math.max(this.maxActiveAll, this.active.gate + this.active.measure);
     try {
       if (this.delays[kind] > 0) await new Promise((r) => setTimeout(r, this.delays[kind]));
       return await fn();
@@ -270,8 +275,12 @@ export class FakeHost implements HostRunner {
   async exec(input: ExecInput): Promise<ExecResult> {
     this.maybeFail("exec");
     this.commands.push(input.command);
-    if (input.command.startsWith("gate")) return await this.timed("gate", () => this.execNow(input));
+    if (input.command.startsWith("gate")) {
+      this.started.push(`gate:${input.cwd}`);
+      return await this.timed("gate", () => this.execNow(input));
+    }
     if (input.command.startsWith("measure")) {
+      this.started.push(`measure:${input.cwd}`);
       return await this.timed("measure", async () => {
         if (this.onMeasure) await this.onMeasure(input.cwd);
         return this.execNow(input);
@@ -539,6 +548,11 @@ export class FakePort implements BbPort {
   published: Array<{ channel: string; payload: unknown; at: number }> = [];
   publish(channel: string, payload: unknown) {
     this.published.push({ channel, payload, at: Date.now() });
+  }
+  /** recheckDispatch calls (quiet bench). */
+  rechecks = 0;
+  async recheckDispatch() {
+    this.rechecks += 1;
   }
 }
 

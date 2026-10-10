@@ -440,7 +440,8 @@ describe("live recorder and view (fake host)", () => {
     expect(v.bench).toHaveLength(1);
     expect(v.bench[0]!.current).toBeNull();
     const texts = v.feed.map((f) => f.text);
-    expect(texts).toEqual(expect.arrayContaining(["c/1 tests started", "c/1 won: 10.0% lower size", "Best moved: c/1 promoted, workers notified"]));
+    // A local noisy bench is single-machine mode (auto): tests wait for the bench, then hold it.
+    expect(texts).toEqual(expect.arrayContaining(["c/1 waits to run its tests on the bench", "c/1 tests started on edit-machine (local), holding the bench (single-machine mode)", "c/1 won: 10.0% lower size", "Best moved: c/1 promoted, workers notified"]));
     expect(texts.some((t) => /^c\/1 tests passed in [\d.]+ s, queued for the bench$/u.test(t))).toBe(true);
     // Promotion is recorded before the verdict, but the feed tells the win first.
     expect(texts.indexOf("c/1 won: 10.0% lower size")).toBeLessThan(texts.indexOf("Best moved: c/1 promoted, workers notified"));

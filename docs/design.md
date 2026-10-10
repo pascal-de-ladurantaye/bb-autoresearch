@@ -193,7 +193,7 @@ sequenceDiagram
 1. **Snapshot.** The plugin commits the worker's worktree for it and records the SHA. It also writes the ref `refs/studies/<slug>/c/<n>`. Every submission gets a ref, whatever the verdict.
 2. **Scope check.** Changed paths must all fall under `editable`, and none may fall under `protected`. Diff size must be within limits. If not, the verdict is `rejected` and nothing is measured.
 3. **Rebase.** If `best` moved since the worker started, the plugin rebases the candidate onto the current `best`. A conflict returns verdict `conflict`, and the worker resolves it, since it has the context.
-4. **Gate.** Correctness commands run on the edit host. They run in parallel across workers, since gates don't need a quiet machine. A failure returns verdict `gate_failed` with the last lines of output.
+4. **Gate.** Correctness commands run on the edit host. They run in parallel across workers, since gates don't need a quiet machine, unless that machine is also a bench host: then they would compete for CPU with the timing runs, and single-machine mode (see [Scheduling](#scheduling)) queues them for the bench lock instead. A failure returns verdict `gate_failed` with the last lines of output.
 5. **Queue.** The worker gets a ticket with its queue position and an estimated wait, then ends its turn. Waiting never holds a tool call open.
 6. **Measure.** The bench host measures the candidate against the current `best` using the protocol in [The oracle](#the-oracle).
 7. **Decide.** The plugin applies the decision rule, then the guardrails.
@@ -240,6 +240,8 @@ gate = ["bazel test //test/filters/routing/... -c opt"]
 measure = "bench/replay.sh --workload=prod-sample"
 noise = "noisy"                 # deterministic | noisy | expensive
 bench_hosts = ["bench-x86-01"]
+single_machine = "auto"         # auto | on | off: gates share the bench lock with measurements (see Scheduling)
+quiet_bench = false             # hold new worker turns on a machine while it measures
 
 [oracle.holdout]
 measure = "/srv/holdout/replay.sh --workload=holdout-a"   # lives on the bench host only
@@ -307,6 +309,20 @@ Throughput depends on two durations: how long a worker thinks before it submits 
 `W = min(max_workers, ceil(T_think / T_eval) + 1)`
 
 It learns both durations online. It doesn't spawn a worker while the bench queue is at least `W` deep. This backpressure keeps workers from waiting hours for a verdict.
+
+### One machine for everything
+
+The common case is a laptop: the edit host is also the bench host. Gates (tests, type checks, renders) running next to a timing run add noise to it. **Single-machine mode** (`[oracle] single_machine`, default `"auto"`) removes that source of noise:
+
+- Gates take the same per-host bench lock as measurements, in one queue with them, oldest first. A gate and a measurement never overlap on that machine.
+- `"auto"` turns it on when a bench host is the edit machine (`"local"`, or the edit host's own name or id) and the noise class takes the bench lock; `"on"` and `"off"` force it.
+- Gate spans are bench intervals: utilization counts them, and so does the overlap audit.
+- `T_eval` becomes gate + measure time per candidate, because both occupy the bench. Candidates waiting to gate already count as bench queue for backpressure.
+- Calibration runs the base gates under the lock too, and reports the time a candidate occupies the bench.
+
+`quiet_bench = true` goes one step further: while a measurement runs on a machine, a worker turn that would start there waits (BB's `message.dispatch` hook). Turns already running are not interrupted, and a held turn waits for at most one measurement, so a busy bench never starves the workers.
+
+Neither setting changes how a commit is judged, so neither is part of the oracle hash.
 
 ### What to try next
 

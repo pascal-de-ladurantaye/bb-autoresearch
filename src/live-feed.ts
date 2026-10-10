@@ -25,7 +25,7 @@ function seconds(ms: number): string {
  */
 export function feedItems(
   events: readonly EventLike[],
-  ctx: { metric: MetricInfo; ideas: Map<number, { title: string }>; hostName: (id: string) => string; candidateN: Map<number, number>; noise?: NoiseClass },
+  ctx: { metric: MetricInfo; ideas: Map<number, { title: string }>; hostName: (id: string) => string; candidateN: Map<number, number>; noise?: NoiseClass; gatesOnBench?: boolean },
 ): LiveFeedItem[] {
   const out: LiveFeedItem[] = [];
   const gatingAt = new Map<number, number>();
@@ -52,7 +52,8 @@ export function feedItems(
         if (d.to === "gating" && typeof d.candidate === "number") {
           gatingAt.set(d.candidate, e.at);
           if (d.from === "queued" || d.from === "measuring" || d.from === "confirming") break; // rebased: the requeue line says why
-          push(`c/${n} tests started`);
+          // Single-machine mode: tests wait for the bench lock (gate.started says when they run).
+          push(ctx.gatesOnBench ? `c/${n} waits to run its tests on the bench` : `c/${n} tests started`);
         } else if (d.to === "confirming") push(`c/${n} looks like a win: confirming with fresh pairs`);
         break;
       case "candidate.queued": {
@@ -60,6 +61,10 @@ export function feedItems(
         push(`c/${n} tests passed${started !== undefined ? ` in ${seconds(e.at - started)}` : ""}, queued for the bench`);
         break;
       }
+      case "gate.started":
+        if (typeof d.candidate === "number") gatingAt.set(d.candidate, e.at);
+        push(`c/${n} tests started on ${typeof d.host === "string" ? ctx.hostName(d.host) : "the bench"}, holding the bench (single-machine mode)`);
+        break;
       case "gate.flaky":
         push(`c/${n} a test was flaky (passed on the retry)`, "warn");
         break;

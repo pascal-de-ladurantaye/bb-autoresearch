@@ -81,6 +81,21 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     bb.events.on("turn.failed", (event) => safe("turn.failed", () => engine.onTurnFailed(event)));
     // Live view: what each worker's agent is doing (tool items only), at most once a second per thread.
     bb.events.on("experimental_thread.events", ({ thread, sequence }) => safe("thread.events", () => engine.onThreadEvents(thread.id, sequence)));
+    // Quiet bench: a new worker turn on a machine that is measuring waits until the measurement ends.
+    // Fail-open: an error here must never block a dispatch.
+    bb.experimental_hooks.on("message.dispatch", (hook) => {
+      try {
+        return engine.dispatchDecision({
+          threadId: hook.thread.id,
+          attempt: hook.attempt,
+          hostId: hook.host?.id ?? hook.environment?.hostId ?? null,
+          spawnedByPlugin: hook.thread.originPluginId === bb.pluginId || hook.originPluginId === bb.pluginId,
+        });
+      } catch (e) {
+        ctx.bb.log("warn", `message.dispatch: ${errText(e)}`);
+        return { action: "proceed" };
+      }
+    });
     client.experimental_onWorkerExit(({ hostId }) => {
       // In-flight host calls and jobs died with the worker: measurements on
       // that host restart from scratch (partial samples discarded).

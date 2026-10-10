@@ -170,6 +170,9 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
     log(level, message) {
       bb.log[level](message);
     },
+    async recheckDispatch() {
+      await bb.experimental_hooks.recheck("message.dispatch");
+    },
     publish(channel, payload) {
       bb.realtime.publish(channel, payload as never);
     },

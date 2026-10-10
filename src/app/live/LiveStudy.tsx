@@ -639,14 +639,23 @@ function BenchStrip({ v, now, compact, onOpenCandidate }: { v: LiveView; now: nu
       ) : (
         <EmptyState className="py-4">Bench hosts appear once the spec is approved.</EmptyState>
       )}
+      {v.singleMachine ? (
+        <p className="text-xs text-muted-foreground" title={v.singleMachine.text}>
+          Single-machine mode: tests and measurements take turns on the bench{v.singleMachine.quietBench ? "; new worker turns wait while a measurement runs" : ""}.
+        </p>
+      ) : null}
       <div className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
         <span>Queue{v.bench.length > 1 ? " (shared)" : ""}:</span>
         {v.queue.length ? (
-          v.queue.map((n, i) => (
-            <button key={n} type="button" className={cn("rounded border border-border bg-background px-1 font-mono text-foreground", FOCUS_RING)} onClick={() => onOpenCandidate(n)} aria-label={`c/${n}, ${ordinal(i + 1)} in the bench queue. Open the candidate.`}>
-              c/{n}
-            </button>
-          ))
+          v.queue.map((n, i) => {
+            const tests = v.queueTests?.includes(n) ?? false;
+            return (
+              <button key={n} type="button" className={cn("rounded border border-border bg-background px-1 font-mono text-foreground", FOCUS_RING)} onClick={() => onOpenCandidate(n)} aria-label={`c/${n}, ${ordinal(i + 1)} in the bench queue${tests ? ", waiting to run its tests" : ""}. Open the candidate.`}>
+                c/{n}
+                {tests ? <span className="font-sans text-muted-foreground"> tests</span> : null}
+              </button>
+            );
+          })
         ) : (
           <span>empty</span>
         )}
@@ -675,6 +684,14 @@ function BenchHost({ h, now, compact, noise, band, onOpenCandidate }: { h: LiveB
             <span className="ml-auto tabular-nums text-muted-foreground">{clock(now - cur.startedAt)}</span>
           </div>
           {cur.pairs ? <PairBar pairs={cur.pairs} /> : null}
+        </div>
+      ) : cur?.kind === "gate" ? (
+        <div className="mt-1 flex items-center gap-2 text-xs">
+          <button type="button" className={cn("rounded font-mono font-medium underline-offset-2 hover:underline", FOCUS_RING)} onClick={() => onOpenCandidate(cur.n)}>
+            c/{cur.n}
+          </button>
+          <span className="text-muted-foreground">testing (single-machine mode: tests hold the bench)</span>
+          <span className="ml-auto tabular-nums text-muted-foreground">{clock(now - cur.startedAt)}</span>
         </div>
       ) : cur?.kind === "drift" ? (
         <div className="mt-1 text-xs text-muted-foreground">Drift check (A/A on best){cur.startedAt ? ` · ${clock(now - cur.startedAt)}` : ""}</div>

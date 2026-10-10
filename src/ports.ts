@@ -107,4 +107,22 @@ export interface BbPort {
   appUrl(): string | null;
   log(level: "info" | "warn" | "error", message: string): void;
   publish(channel: string, payload: unknown): void;
+  /** Ask BB to re-decide dispatches this plugin holds (quiet bench: a measurement ended). Fire and forget. */
+  recheckDispatch(): Promise<void>;
 }
+
+/** What the message.dispatch hook needs to decide (server.ts adapts the SDK context). */
+export interface DispatchQuery {
+  threadId: string;
+  attempt: "start-turn" | "join-turn";
+  /** The machine the turn would run on, when BB knows. */
+  hostId: string | null;
+  /**
+   * BB says this plugin created the thread (originPluginId). A worker's first
+   * turn is dispatched while the spawn call is still in flight, before its
+   * row knows the thread id: only workers are spawned by the plugin.
+   */
+  spawnedByPlugin?: boolean;
+}
+
+export type DispatchDecision = { action: "proceed" } | { action: "wait"; reason: string; sendAt?: number | null };

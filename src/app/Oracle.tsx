@@ -27,6 +27,13 @@ export function OracleTab({ slug, o: overview, rpc, onChanged }: { slug: string;
       <Calibration c={v.calibration} specVersion={v.specVersion} onAction={(a) => setDialog(a.kind === "start" ? { kind: "start" } : { kind: "approve", version: a.version, changesOracle: a.changesOracle })} />
       {dialog?.kind === "approve" ? <ApproveSpecDialog o={overview} version={dialog.version} changesOracle={dialog.changesOracle} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
       {dialog?.kind === "start" ? <StartDialog o={overview} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
+      {v.singleMachine ? (
+        <Section title={`Single-machine mode: ${v.singleMachine.on ? "on" : "off"}${v.singleMachine.quietBench ? " · quiet bench" : ""}`}>
+          <p className="text-sm text-muted-foreground" aria-label="Single-machine mode">
+            {v.singleMachine.text} Set with <Mono>[oracle] single_machine</Mono> ({v.singleMachine.setting}) and <Mono>quiet_bench</Mono>; neither is part of the oracle hash, so changing them applies without recalibration.
+          </p>
+        </Section>
+      ) : null}
       <Section title={`Active spec v${v.specVersion}${v.holdoutConfigured ? " · holdout configured (hidden)" : ""}`}>
         {v.activeToml ? <pre className="max-h-96 overflow-auto rounded-md border border-border bg-muted p-3 font-mono text-xs" aria-label="Active spec">{v.activeToml}</pre> : <EmptyState>No active spec.</EmptyState>}
       </Section>

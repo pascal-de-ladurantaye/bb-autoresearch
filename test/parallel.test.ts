@@ -29,6 +29,8 @@ protected = ["bench/**"]
 gate = ["gate run"]
 measure = "measure run"
 noise = "noisy"
+# These M1 tests are about parallel gates outside the bench lock (single-machine mode: single-machine.test.ts).
+single_machine = "off"
 
 [oracle.protocol]
 warmup = 0

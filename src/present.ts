@@ -126,8 +126,10 @@ export function noiseFloorText(noise: NoiseClass, floors: ReadonlyArray<number |
  * "Running: 2 workers editing, measuring c/3, 1 queued for the bench, 1 in tests."
  * A candidate on the bench is being measured, not queued, so it is counted once.
  */
-export function runningStatusText(workers: number, measuring: readonly string[], queued: number, inTests: number): string {
-  return `Running: ${workers} worker${workers === 1 ? "" : "s"} editing${measuring.length ? `, measuring ${measuring.join(", ")}` : ""}${queued ? `, ${queued} queued for the bench` : ""}${inTests ? `, ${inTests} in tests` : ""}.`;
+/** `testing`: candidates whose gates hold the bench now (single-machine mode); they are not counted again in `inTests`. */
+export function runningStatusText(workers: number, measuring: readonly string[], queued: number, inTests: number, testing: readonly string[] = []): string {
+  const waitingTests = Math.max(0, inTests - testing.length);
+  return `Running: ${workers} worker${workers === 1 ? "" : "s"} editing${measuring.length ? `, measuring ${measuring.join(", ")}` : ""}${testing.length ? `, testing ${testing.join(", ")} on the bench` : ""}${queued ? `, ${queued} queued for the bench` : ""}${waitingTests ? `, ${waitingTests} in tests` : ""}.`;
 }
 
 const clipText = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`);
@@ -282,7 +284,7 @@ export const GLOSSARY = {
   drift: "Drift check: an A/A run on best while the study runs. Noise above the limit pauses the study, because verdicts would be random.",
   holdout: "Holdout: a hidden workload on the bench host. Wins must not regress on it; agents only learn pass or fail.",
   segment: "Segment: a period with one fixed oracle version. Changing the oracle starts a new segment with a new calibration.",
-  utilization: "Bench utilization: the share of Running time the bench spent measuring. Low values mean workers think longer than the bench measures.",
+  utilization: "Bench utilization: the share of Running time the bench lock was held: measuring, and in single-machine mode also running gates. Low values mean workers think longer than the bench measures.",
 } as const;
 
 export type GlossaryKey = keyof typeof GLOSSARY;

@@ -240,7 +240,12 @@ export interface LiveBenchHost {
   status: "online" | "offline" | "unknown";
   healthOk: boolean | null;
   deferredUntil: number | null;
-  current: { kind: "measure"; n: number; stage: Stage; pairs: Pairs | null; startedAt: number } | { kind: "drift"; startedAt: number | null } | null;
+  current:
+    | { kind: "measure"; n: number; stage: Stage; pairs: Pairs | null; startedAt: number }
+    | { kind: "drift"; startedAt: number | null }
+    /** Single-machine mode: a candidate's gates hold this host's bench lock. */
+    | { kind: "gate"; n: number; startedAt: number }
+    | null;
   /** Share of the recent window the bench lock was held (all studies on this lock), or null before any running time. */
   utilization: number | null;
   windowSeconds: number;
@@ -298,8 +303,12 @@ export interface LiveView {
   workers: LiveWorker[];
   /** In-flight candidates and the most recent decided ones. */
   cards: LiveCard[];
-  /** The shared bench queue, next first (candidate numbers). */
+  /** The shared bench queue, next first (candidate numbers). In single-machine mode it includes candidates waiting to run their tests. */
   queue: number[];
+  /** Candidates in `queue` that wait to run their tests on the bench (single-machine mode). */
+  queueTests?: number[];
+  /** Single-machine mode (gates hold the bench lock), with what it does in words; null when off. */
+  singleMachine?: { text: string; quietBench: boolean } | null;
   bench: LiveBenchHost[];
   ideas: { next: LiveIdea[]; total: number };
   feed: LiveFeedItem[];

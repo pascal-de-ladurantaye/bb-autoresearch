@@ -64,7 +64,8 @@ wait.
 3. **Start.** Seed ideas on the Ideas tab, then Needs you → *Approve and
    start*. Hidden worker threads spawn in managed worktrees from
    `studies/<slug>/best`, submit candidates, and get verdicts as messages.
-   Gates run in parallel; each bench host measures one candidate at a time;
+   Gates run in parallel (in single-machine mode, below, they take turns
+   with measurements); each bench host measures one candidate at a time;
    wins are confirmed (and checked against a hidden holdout when configured)
    before they are squashed onto best. CLI: `bb study start <slug>`.
 4. **Watch and steer.**
@@ -97,6 +98,22 @@ wait.
    be kept or dropped first. Or *Keep exploring* (resume), or *Archive*. CLI:
    `bb study harvest <slug> --publish`, `bb study resume <slug>`,
    `bb study archive <slug>`.
+
+### One machine for everything
+
+On a laptop the edit host is also the bench host, and gates (tests, type
+checks, renders) running next to a timing run add noise to it. The spec's
+`[oracle]` table has two scheduling settings for this; neither is part of the
+oracle hash, so changing them never needs a recalibration:
+
+| Key | Default | What it does |
+|---|---|---|
+| `single_machine` | `"auto"` | `"auto"`, `"on"` or `"off"`. When on, gates take the same per-host bench lock as measurements, in one queue with them (oldest first), so a gate never overlaps a measurement. `"auto"` is on when a bench host is the edit machine (`bench_hosts = ["local"]`, the default, or the edit machine's own name or id) and the oracle is `noisy` or `expensive`. Gate time then counts as bench time: in utilization, and in the worker target W (gate + measure time per candidate). |
+| `quiet_bench` | `false` | While a measurement runs on a machine, a new worker turn there waits to start (BB's dispatch hook; the thread's queued card says why). Turns already running are not interrupted, and a held turn waits for at most one measurement. |
+
+The Oracle tab, the calibration report and `bb study show` say whether
+single-machine mode is on and why; the Overview, Bench and Live views show
+"testing c/N" on the bench host while a gate holds it.
 
 Every number reads the same everywhere: **better is positive, in the
 metric's own terms** ("74.7% fewer ops (4.0×)", "+74.7%"), with raw values

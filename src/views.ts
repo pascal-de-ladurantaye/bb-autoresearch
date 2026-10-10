@@ -5,7 +5,8 @@ import type { Engine } from "./engine.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
 import type { StackRecord } from "./harvest.ts";
 import { checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
-import { BENCH_BOUND_STAGES, bestGuardrailPositions } from "./pipeline.ts";
+import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
+import { singleMachineText } from "./single-machine.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { accountingFor, standaloneText } from "./report.ts";
 import { oracleHash, type StudySpec } from "./spec.ts";
@@ -112,6 +113,39 @@ function unseenNotices(engine: Engine, s: StudyRow): number {
   return row.c;
 }
 
+/**
+ * Single-machine mode for the page and the CLI: whether gates hold the bench
+ * lock, why, and one paragraph saying what that does.
+ */
+export function singleMachineView(engine: Engine, s: StudyRow) {
+  const spec = specOf(engine, s);
+  if (!spec) return null;
+  const mode = studySingleMachine(engine.ctx.store, s, spec);
+  const host = s.host_id ? engine.ctx.store.benchHost(s.id, s.host_id) : undefined;
+  return {
+    on: mode.on,
+    /** Gates hold the bench lock (on, and there are gates). */
+    serialized: mode.on && spec.oracle.gate.length > 0 && s.host_id !== null,
+    setting: mode.setting,
+    reason: mode.reason,
+    quietBench: spec.oracle.quiet_bench,
+    hostName: host?.name ?? null,
+    text: singleMachineText(mode, spec, host?.name ?? null),
+  };
+}
+
+/** Candidates whose gates hold a bench lock now (single-machine mode), by host: open `gate` intervals. */
+export function gatesOnBench(engine: Engine, s: StudyRow): Array<{ hostId: string; n: number; candidateId: number; startedAt: number }> {
+  const { store } = engine.ctx;
+  const out: Array<{ hostId: string; n: number; candidateId: number; startedAt: number }> = [];
+  for (const i of store.benchIntervals(s.id, { since: engine.ctx.now() })) {
+    if (i.kind !== "gate" || i.ended_at !== null || i.candidate_id === null) continue;
+    const c = store.candidate(i.candidate_id);
+    if (c) out.push({ hostId: i.host_id, n: c.n, candidateId: c.id, startedAt: i.started_at });
+  }
+  return out;
+}
+
 /** Running periods [start, end) from the append-only state log. */
 export function runningPeriods(engine: Engine, s: StudyRow): Array<[number, number]> {
   const { store } = engine.ctx;
@@ -144,8 +178,10 @@ export interface Utilization {
   ratio: number | null;
   /** Busy share from the first submission to the last verdict (or now): excludes the first think time. */
   steadyRatio: number | null;
-  /** Measurement intervals that overlapped another on the same lock key (should be 0). */
+  /** Bench lock intervals (measurements, and gates in single-machine mode) that overlapped another on the same lock key (should be 0). */
   overlaps: number;
+  /** Busy seconds spent gating (single-machine mode: gates hold the bench lock). */
+  gateSeconds: number;
 }
 
 export function utilization(engine: Engine, s: StudyRow): Utilization {
@@ -154,7 +190,12 @@ export function utilization(engine: Engine, s: StudyRow): Utilization {
   const now = engine.ctx.now();
   const intervals = store.benchIntervals(s.id).map((i) => ({ ...i, end: i.ended_at ?? now }));
   let busy = 0;
-  for (const i of intervals) for (const p of periods) busy += overlap([i.started_at, i.end], p);
+  let gateBusy = 0;
+  for (const i of intervals) for (const p of periods) {
+    const o = overlap([i.started_at, i.end], p);
+    busy += o;
+    if (i.kind === "gate") gateBusy += o;
+  }
   const running = periods.reduce((a, p) => a + (p[1] - p[0]), 0);
   let overlaps = 0;
   const byKey = new Map<string, typeof intervals>();
@@ -179,7 +220,7 @@ export function utilization(engine: Engine, s: StudyRow): Utilization {
     }
     steady = wRun > 0 ? wBusy / wRun : null;
   }
-  return { runningSeconds: running / 1000, busySeconds: busy / 1000, ratio: running > 0 ? busy / running : null, steadyRatio: steady, overlaps };
+  return { runningSeconds: running / 1000, busySeconds: busy / 1000, ratio: running > 0 ? busy / running : null, steadyRatio: steady, overlaps, gateSeconds: gateBusy / 1000 };
 }
 
 export interface TrajectoryPoint {
@@ -229,6 +270,7 @@ function workerPhase(engine: Engine, s: StudyRow, worker: ThreadRow): { phase: s
     const onBench = store.candidates(s.id, { stages: ["measuring", "confirming"] }).length;
     return { phase: "queued", candidate: mine.n, position: queued.findIndex((c) => c.id === mine.id) + 1 + onBench };
   }
+  if (mine.stage === "gating" && gatesOnBench(engine, s).some((g) => g.candidateId === mine.id)) return { phase: "testing on the bench", candidate: mine.n, position: null };
   return { phase: mine.stage === "decided" ? "verdict pending delivery" : mine.stage, candidate: mine.n, position: null };
 }
 
@@ -282,6 +324,9 @@ export function overview(engine: Engine, s: StudyRow) {
     benchHosts: benchHostsView(engine, s),
     segment: segmentView(engine, s),
     tEval: engine.pipeline.recentEvalSeconds(s),
+    /** T_eval's parts: gate and measurement seconds per candidate, and whether gates count (single-machine mode). */
+    evalTimes: specOf(engine, s) ? evalTimes(store, s) : null,
+    singleMachine: singleMachineView(engine, s),
     tThink: engine.thinkSeconds(s),
     trajectory: trajectory(engine, s),
     workerList: workers,
@@ -309,6 +354,7 @@ export function benchHostsView(engine: Engine, s: StudyRow) {
   const transfers = store.transfers(s.id, 200);
   const measuring = store.candidates(s.id, { stages: ["measuring", "confirming"] });
   const progress = engine.pipeline.progress(s.id);
+  const gating = gatesOnBench(engine, s);
   return rows.map((h) => {
     const health = safeJson<{ summary?: string; problems?: string[] }>(h.health_json);
     const t = transfers.find((x) => x.host_id === h.host_id && x.ok);
@@ -325,6 +371,8 @@ export function benchHostsView(engine: Engine, s: StudyRow) {
       deferredUntil: h.deferred_until !== null && h.deferred_until > engine.ctx.now() ? h.deferred_until : null,
       offlineSince: h.offline_since,
       measuring: measuring.find((c) => c.bench_host_id === h.host_id)?.n ?? null,
+      /** Single-machine mode: the candidate whose gates hold this host's bench lock now. */
+      gating: gating.find((g) => g.hostId === h.host_id)?.n ?? null,
       progress: progress.find((p) => p.hostId === h.host_id)?.text ?? null,
       driftStatus: h.drift_status,
       driftAt: h.drift_at,
@@ -707,6 +755,7 @@ export function oracleView(engine: Engine, s: StudyRow) {
       benchHosts: (safeJson<Array<{ name: string; mode: string }>>(v.bench_json) ?? []).map((b) => `${b.name} (${b.mode})`),
     })),
     pending,
+    singleMachine: singleMachineView(engine, s),
     calibration: {
       status: s.calibration_status,
       approved: s.calibration_approved_at !== null,
@@ -779,6 +828,7 @@ export function benchView(engine: Engine, s: StudyRow) {
     hosts: benchHostsView(engine, s),
     queue,
     utilization: utilization(engine, s),
+    singleMachine: singleMachineView(engine, s),
     health: store.healthChecks(s.id, { limit: 100 }).map((h) => ({
       id: h.id,
       hostId: h.host_id,
@@ -1552,13 +1602,14 @@ export function statusLine(engine: Engine, s: StudyRow): string {
   const { store } = engine.ctx;
   const live = store.threads(s.id, { role: "worker", states: ["spawning", "active", "finishing"] }).length;
   const measuring = store.candidates(s.id, { stages: ["measuring", "confirming"] }).map((c) => `c/${c.n}`);
+  const testing = gatesOnBench(engine, s).map((g) => `c/${g.n}`);
   switch (s.state) {
     case "draft":
       return s.calibration_status === "failed" ? "Draft: the last calibration failed. A revised spec needs your approval." : `Draft: spec v${s.spec_version} waits for your approval.`;
     case "calibrating":
       return s.calibration_status === "running" ? "Calibrating: gates on the base commit, then A/A measurements to learn the noise." : s.calibration_status === "ready" ? "Calibration finished: review it and start the study." : "Calibrating.";
     case "running":
-      return runningStatusText(live, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length);
+      return runningStatusText(live, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length, testing);
     case "paused": {
       const p = pauseInfo(engine, s);
       return `Paused${p.system ? " by the system" : " by you"}: ${clip(s.pause_reason ?? "no reason recorded", 200)}.${live ? ` ${live} worker${live === 1 ? "" : "s"} finishing.` : ""}`;

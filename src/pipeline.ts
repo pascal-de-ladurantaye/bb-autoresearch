@@ -21,7 +21,7 @@
 import { ciRngFor } from "./band.ts";
 import { BenchSite, BenchTransferError, makeBench as makeBenchOn, tail } from "./bench.ts";
 import { HostMutex, type Ctx } from "./context.ts";
-import { StoreClosedError, type BenchHostRow, type CandidateRow, type Store, type StudyRow, type ThreadRow } from "./db/store.ts";
+import { StoreClosedError, type BenchHostRow, type BenchIntervalKind, type CandidateRow, type Store, type StudyRow, type ThreadRow } from "./db/store.ts";
 import { driftExpensive, driftNoisy, type DriftResult } from "./drift.ts";
 import { poolPaired, positionsFromChain, promotionChain, type GuardrailCalibration, type GuardrailEstimate, type Position } from "./guardrails.ts";
 import { checkHealth } from "./health.ts";
@@ -30,6 +30,7 @@ import { HostJobLostError, RunAbortedError, type HostRunner } from "./host/runne
 import { BenchError, strategyFor, type Bench, type MeasureOutcome, type RunResult, type Side } from "./noise.ts";
 import { clip, formatDuration, messageText, safeJson, verdictMessage, type AgentMessage } from "./prompts.ts";
 import { checkScope } from "./scope.ts";
+import { singleMachineMode, type SingleMachineMode } from "./single-machine.ts";
 import { bestBranch, candidateRef, formatPct, type StudySpec } from "./spec.ts";
 import { applyConfirmation, decideVerdict, outcomeEstimates, type VerdictResult } from "./verdict.ts";
 
@@ -106,22 +107,79 @@ export function segmentGuardrailCalibration(store: Store, study: StudyRow): Guar
 }
 
 /** Hold the bench lock of `hostId` for `fn` and record the busy interval (bench utilization, overlap audits). */
-export async function withBench<T>(ctx: Ctx, study: StudyRow, hostId: string, kind: "measure" | "profile" | "calibration" | "drift" | "harvest", candidateId: number | null, fn: () => Promise<T>): Promise<T> {
-  const key = benchLockKey(study, ctx.store.spec(study), hostId);
+export async function withBench<T>(ctx: Ctx, study: StudyRow, hostId: string, kind: BenchIntervalKind, candidateId: number | null, fn: () => Promise<T>): Promise<T> {
+  const spec = ctx.store.spec(study);
+  const key = benchLockKey(study, spec, hostId);
   return await ctx.benchLock.run(key, async () => {
     const id = ctx.store.openBenchInterval({ study_id: study.id, host_id: hostId, lock_key: key, kind, candidate_id: candidateId });
     try {
       return await fn();
     } finally {
       ctx.store.closeBenchInterval(id);
+      // Quiet bench: worker turns held while this measurement ran may start now.
+      if (kind !== "gate" && spec.oracle.quiet_bench && !ctx.disposed) ctx.bb.recheckDispatch().catch(() => undefined);
     }
   });
+}
+
+/**
+ * Whether a study's gates are serialized with measurements (single-machine
+ * mode), and the bench lock key they take: the edit host's.
+ */
+export function studySingleMachine(store: Store, study: StudyRow, spec: StudySpec = store.spec(study)): SingleMachineMode & { lockKey: string | null } {
+  const ids = store.benchHosts(study.id).map((h) => h.host_id);
+  const mode = singleMachineMode(spec, study.host_id, ids.length ? ids : null);
+  return { ...mode, lockKey: mode.on && study.host_id ? benchLockKey(study, spec, study.host_id) : null };
+}
+
+/** Gates serialize with measurements when single-machine mode is on and there are gates to run. */
+export function gatesSerialized(store: Store, study: StudyRow, spec: StudySpec = store.spec(study)): boolean {
+  return spec.oracle.gate.length > 0 && Boolean(study.host_id) && studySingleMachine(store, study, spec).on;
+}
+
+/** Run gates (calibration, harvest) under the edit host's bench lock in single-machine mode, else directly. */
+export async function withGateLock<T>(ctx: Ctx, study: StudyRow, candidateId: number | null, fn: () => Promise<T>): Promise<T> {
+  if (!gatesSerialized(ctx.store, study)) return await fn();
+  return await withBench(ctx, study, study.host_id!, "gate", candidateId, fn);
+}
+
+/** Bench time per candidate: measurement, plus the gates when they hold the bench lock (single-machine mode). */
+export interface EvalTimes {
+  /** Seconds per candidate the scheduler uses as T_eval; null until learned. */
+  tEval: number | null;
+  /** Mean gate seconds per candidate (always tracked). */
+  gate: number | null;
+  /** Mean measurement seconds per measured candidate. */
+  measure: number | null;
+  /** Gates hold the bench lock, so T_eval = gate + measure. */
+  serialized: boolean;
+}
+
+/** T_eval from the last 20 decided candidates (calibration's estimate until one exists). */
+export function evalTimes(store: Store, study: StudyRow): EvalTimes {
+  const spec = store.spec(study);
+  const serialized = gatesSerialized(store, study, spec);
+  const recent = store.candidates(study.id, { stages: ["decided"], order: "desc", limit: 20 });
+  const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+  const measured = recent.filter((c) => c.bench_seconds > 0);
+  const gated = recent.filter((c) => (c.gate_seconds ?? 0) > 0);
+  const seg = store.segment(study.id, study.segment);
+  const measure = mean(measured.map((c) => c.bench_seconds));
+  const gate = mean(gated.map((c) => c.gate_seconds ?? 0));
+  if (!serialized) return { tEval: measure ?? seg?.eval_seconds ?? null, gate, measure, serialized };
+  // Serialized gates occupy the bench too, also for candidates whose gate failed.
+  const used = recent.filter((c) => c.bench_seconds > 0 || (c.gate_seconds ?? 0) > 0);
+  const t = mean(used.map((c) => c.bench_seconds + (c.gate_seconds ?? 0)));
+  const fallback = seg?.eval_seconds !== null && seg?.eval_seconds !== undefined ? seg.eval_seconds + (seg.gate_seconds ?? 0) : null;
+  return { tEval: t ?? fallback, gate: gate ?? seg?.gate_seconds ?? null, measure: measure ?? seg?.eval_seconds ?? null, serialized };
 }
 
 export class Pipeline {
   private jobs = new Map<string, Promise<void>>();
   /** Lock keys with a measurement job launched. */
   private measuring = new Set<string>();
+  /** Lock keys with a serialized gate job launched (single-machine mode). */
+  private gating = new Set<string>();
   /** Gate checkout slots in use, per study. */
   private gateSlots = new Map<string, Set<number>>();
   /** Job key → not before (ctx.now). */
@@ -260,11 +318,24 @@ export class Pipeline {
     };
   }
 
-  /** Mean bench seconds of recent measured candidates, else the calibrated estimate. */
+  /**
+   * Bench seconds per candidate (T_eval): the mean of recent measured
+   * candidates, else the calibrated estimate. In single-machine mode gates
+   * hold the bench lock, so their time is part of it.
+   */
   recentEvalSeconds(study: StudyRow): number | null {
-    const measured = this.ctx.store.candidates(study.id, { stages: ["decided"], order: "desc", limit: 20 }).filter((c) => c.bench_seconds > 0);
-    if (measured.length) return measured.reduce((a, c) => a + c.bench_seconds, 0) / measured.length;
-    return this.ctx.store.segment(study.id, study.segment)?.eval_seconds ?? null;
+    return evalTimes(this.ctx.store, study).tEval;
+  }
+
+  /** Single-machine mode of a study (and the lock key its gates take). */
+  singleMachine(study: StudyRow, spec?: StudySpec): SingleMachineMode & { lockKey: string | null } {
+    this.benchHosts(study);
+    return studySingleMachine(this.ctx.store, study, spec);
+  }
+
+  /** A bench lock key is taken by a launched measurement, drift check, or serialized gate. */
+  private keyBusy(lockKey: string): boolean {
+    return this.measuring.has(lockKey) || this.drifting.has(lockKey) || this.gating.has(lockKey);
   }
 
   /** Start jobs for whatever has work. Cheap and synchronous; safe to call often. */
@@ -315,17 +386,26 @@ export class Pipeline {
     const { store } = this.ctx;
     // Harvesting studies finish their in-flight candidates (no new submissions arrive).
     const studies = store.studies(["running", "paused", "harvesting"]);
-    const queued: Array<{ study: StudyRow; spec: StudySpec; c: CandidateRow }> = [];
+    // Work that holds a bench lock: measurements, and gates in single-machine mode.
+    const bench: Array<{ kind: "measure" | "gate"; study: StudyRow; spec: StudySpec; c: CandidateRow; lockKey: string | null; limit: number }> = [];
     for (const study of studies) {
       for (const c of store.candidates(study.id, { stages: ["promoting"] })) {
         const key = `c:${c.id}`;
         if (this.eligible(key, c)) this.start(key, () => this.guard(study, c, () => this.promote(c.id)));
       }
-      // Gates: parallel, outside the bench lock, at most the study's worker limit at once.
+      const spec = store.spec(study);
+      const sm = this.singleMachine(study, spec);
+      const serialized = sm.lockKey !== null && spec.oracle.gate.length > 0;
+      // Gates: parallel, outside the bench lock, at most the study's worker limit at once
+      // (single-machine mode: in the bench queue, below).
       const limit = Math.max(1, this.hooks.maxWorkers(study));
       for (const c of store.candidates(study.id, { stages: ["gating"] })) {
         const key = `c:${c.id}`;
         if (!this.eligible(key, c)) continue;
+        if (serialized) {
+          bench.push({ kind: "gate", study, spec, c, lockKey: sm.lockKey, limit });
+          continue;
+        }
         const slot = this.takeGateSlot(study.id, limit);
         if (slot === null) break;
         this.start(key, async () => {
@@ -336,21 +416,38 @@ export class Pipeline {
           }
         });
       }
-      const spec = store.spec(study);
       for (const c of store.candidates(study.id, { stages: ["queued"] })) {
-        if (this.eligible(`c:${c.id}`, c)) queued.push({ study, spec, c });
+        if (this.eligible(`c:${c.id}`, c)) bench.push({ kind: "measure", study, spec, c, lockKey: null, limit });
       }
       // Drift checks are due on idle hosts even with nothing queued.
       if (study.state === "running") for (const h of this.benchHosts(study)) this.maybeStartDrift(study, spec, h);
     }
-    // Bench: one measurement per lock key, oldest queued first across studies,
-    // each to the first free, online, healthy host of its study.
-    queued.sort((a, b) => (a.c.queued_at ?? a.c.submitted_at) - (b.c.queued_at ?? b.c.submitted_at) || a.c.id - b.c.id);
+    // Bench: one holder per lock key, oldest first across studies (a candidate
+    // waits since it was queued, or, for a first gate, since it was submitted).
+    // A measurement goes to the first free, online, healthy host of its study;
+    // a serialized gate to its edit host's key.
+    bench.sort((a, b) => (a.c.queued_at ?? a.c.submitted_at) - (b.c.queued_at ?? b.c.submitted_at) || a.c.id - b.c.id);
     const now = this.ctx.now();
-    for (const { study, spec, c } of queued) {
+    for (const { kind, study, spec, c, lockKey: gateKey, limit } of bench) {
+      if (kind === "gate") {
+        if (!gateKey || this.keyBusy(gateKey)) continue;
+        const slot = this.takeGateSlot(study.id, limit);
+        if (slot === null) continue;
+        this.gating.add(gateKey);
+        this.start(`c:${c.id}`, async () => {
+          try {
+            await this.guard(study, c, () => this.gate(c.id, slot));
+          } finally {
+            this.gateSlots.get(study.id)?.delete(slot);
+            this.gating.delete(gateKey);
+            if (this.progressByKey.get(gateKey)?.studyId === study.id) this.progressByKey.delete(gateKey);
+          }
+        });
+        continue;
+      }
       for (const h of this.benchHosts(study)) {
         const lockKey = benchLockKey(study, spec, h.host_id);
-        if (this.measuring.has(lockKey) || this.drifting.has(lockKey)) continue;
+        if (this.keyBusy(lockKey)) continue;
         if (h.status === "offline" || (h.deferred_until ?? 0) > now) continue;
         if (study.state === "running" && this.maybeStartDrift(study, spec, h)) continue;
         this.measuring.add(lockKey);
@@ -410,9 +507,24 @@ export class Pipeline {
   }
 
   // ---- stage 3-4: rebase onto the current best (squash) + gate ----
+  /**
+   * Rebase and gate a candidate. In single-machine mode (gates configured)
+   * the whole stage holds the edit host's bench lock, recorded as a `gate`
+   * bench interval, so it never overlaps a measurement on that machine.
+   */
   async gate(candidateId: number, slot = 0): Promise<void> {
     const { store } = this.ctx;
     const c = store.candidate(candidateId)!;
+    if (c.stage !== "gating") return;
+    const study = store.study(c.study_id)!;
+    if (!gatesSerialized(store, study)) return await this.gateNow(candidateId, slot, false);
+    await withBench(this.ctx, study, study.host_id!, "gate", c.id, () => this.gateNow(candidateId, slot, true));
+  }
+
+  private async gateNow(candidateId: number, slot: number, serialized: boolean): Promise<void> {
+    const { store } = this.ctx;
+    const c = store.candidate(candidateId)!;
+    // It may have been decided (archive) while it waited for the lock.
     if (c.stage !== "gating") return;
     const study = store.study(c.study_id)!;
     const spec = store.spec(study);
@@ -443,19 +555,42 @@ export class Pipeline {
     }
     store.updateCandidate(c.id, { prepared_sha: prepared.sha, against_sha: best });
     if (spec.oracle.gate.length) {
-      const dir = await runner.checkout(study.repo_path!, `${study.slug}-gate-${slot}`, prepared.sha);
-      for (const command of spec.oracle.gate) {
-        const job = { cwd: dir, command, timeoutMs: spec.oracle.timeout_minutes * 60_000, label: `gate c/${c.n}` };
-        const r = await runner.run(job);
-        if (r.exitCode !== 0) {
-          // One automatic retry for flaky gates.
-          const retry = await runner.run(job);
-          store.event(study.id, retry.exitCode === 0 ? "gate.flaky" : "gate.failed", "plugin", { candidate: c.id, command: clip(command, 200) });
-          if (retry.exitCode !== 0) {
-            store.updateCandidate(c.id, { gate_output: clip(tail(r), 3000) });
-            this.decide(store.candidate(c.id)!, { verdict: "gate_failed", reasons: [`gate failed${r.timedOut ? " (timeout)" : ""}: ${clip(command, 200)} exited ${retry.exitCode}`] });
-            return;
+      const started = this.ctx.now();
+      const lockKey = benchLockKey(study, spec, study.host_id!);
+      if (serialized) {
+        store.event(study.id, "gate.started", "plugin", { candidate: c.id, n: c.n, host: study.host_id });
+        this.setProgress(lockKey, study.id, study.host_id!, `c/${c.n}: gates (single-machine mode: tests hold the bench)`);
+        this.changed(study.id);
+      }
+      let ok = true;
+      try {
+        const dir = await runner.checkout(study.repo_path!, `${study.slug}-gate-${slot}`, prepared.sha);
+        for (const command of spec.oracle.gate) {
+          const job = { cwd: dir, command, timeoutMs: spec.oracle.timeout_minutes * 60_000, label: `gate c/${c.n}` };
+          const r = await runner.run(job);
+          if (r.exitCode !== 0) {
+            // One automatic retry for flaky gates.
+            const retry = await runner.run(job);
+            store.event(study.id, retry.exitCode === 0 ? "gate.flaky" : "gate.failed", "plugin", { candidate: c.id, command: clip(command, 200) });
+            if (retry.exitCode !== 0) {
+              ok = false;
+              store.updateCandidate(c.id, { gate_output: clip(tail(r), 3000), gate_seconds: (store.candidate(c.id)?.gate_seconds ?? 0) + (this.ctx.now() - started) / 1000 });
+              if (serialized) store.event(study.id, "gate.finished", "plugin", { candidate: c.id, n: c.n, host: study.host_id, ok, seconds: (this.ctx.now() - started) / 1000 });
+              this.decide(store.candidate(c.id)!, { verdict: "gate_failed", reasons: [`gate failed${r.timedOut ? " (timeout)" : ""}: ${clip(command, 200)} exited ${retry.exitCode}`] });
+              return;
+            }
           }
+        }
+      } catch (e) {
+        ok = false;
+        if (serialized && !this.ctx.disposed) store.event(study.id, "gate.finished", "plugin", { candidate: c.id, n: c.n, host: study.host_id, ok, seconds: (this.ctx.now() - started) / 1000, error: true });
+        throw e;
+      } finally {
+        if (serialized) this.progressByKey.delete(lockKey);
+        if (ok && !this.ctx.disposed) {
+          const seconds = (this.ctx.now() - started) / 1000;
+          store.updateCandidate(c.id, { gate_seconds: (store.candidate(c.id)?.gate_seconds ?? 0) + seconds });
+          if (serialized) store.event(study.id, "gate.finished", "plugin", { candidate: c.id, n: c.n, host: study.host_id, ok, seconds });
         }
       }
     }
@@ -820,7 +955,7 @@ export class Pipeline {
     if (!this.driftDue(study, spec, h)) return false;
     const lockKey = benchLockKey(study, spec, h.host_id);
     const key = `d:${study.id}:${h.host_id}`;
-    if (this.measuring.has(lockKey) || this.drifting.has(lockKey) || this.jobs.has(key)) return false;
+    if (this.keyBusy(lockKey) || this.jobs.has(key)) return false;
     this.drifting.add(lockKey);
     this.start(key, async () => {
       try {

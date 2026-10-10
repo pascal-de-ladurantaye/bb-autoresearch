@@ -17,7 +17,7 @@ import { FakeHost, makeCtx, makeDb, type Clock, type FakePort } from "./helpers.
 
 const SLUG = "toy-v021";
 
-function spec(opts: { maxWorkers?: number } = {}): string {
+function spec(opts: { maxWorkers?: number; single?: "auto" | "on" | "off" } = {}): string {
   return `
 [study]
 slug = "${SLUG}"
@@ -43,6 +43,7 @@ protected = ["bench/**"]
 gate = ["gate run"]
 measure = "measure run"
 noise = "noisy"
+single_machine = "${opts.single ?? "auto"}"
 
 [oracle.protocol]
 warmup = 0
@@ -163,7 +164,7 @@ describe("candidates.worker_id backfill (migration)", () => {
     db.exec(`INSERT INTO candidates (study_id, n, idea_id, thread_id, sha, parent_sha, summary, stage, submitted_at) VALUES ('s1', 1, 1, 'thr_a', 'a', 'b', 'x', 'decided', 0), ('s1', 2, 2, NULL, 'c', 'd', 'y', 'decided', 0), ('s1', 3, 3, NULL, 'e', 'f', 'z', 'decided', 0)`);
     db.exec(`INSERT INTO events (study_id, at, kind, actor, data_json) VALUES ('s1', 1, 'worker.phase', 'plugin', '{"worker":8,"thread":null,"idea":2,"from":"editing","to":"waiting","candidate":2}')`);
     db.exec(`UPDATE candidates SET worker_id = NULL`);
-    for (const sql of MIGRATIONS.slice(-2)) db.exec(sql);
+    for (const sql of MIGRATIONS.filter((m) => m.startsWith("UPDATE candidates SET worker_id"))) db.exec(sql);
     expect(db.prepare(`SELECT n, worker_id FROM candidates ORDER BY n`).all()).toEqual([
       { n: 1, worker_id: 7 },
       { n: 2, worker_id: 8 },
@@ -190,8 +191,8 @@ describe("v0.2.1 (fake host)", () => {
   });
   afterEach(() => engine.live.dispose());
 
-  async function running(ideas: string[], maxWorkers = 2): Promise<string> {
-    await engine.proposeStudy("thr_study", "proj_1", spec({ maxWorkers }));
+  async function running(ideas: string[], maxWorkers = 2, single: "auto" | "on" | "off" = "auto"): Promise<string> {
+    await engine.proposeStudy("thr_study", "proj_1", spec({ maxWorkers, single }));
     await engine.calibrate(SLUG, "human");
     await engine.waitForCalibration(SLUG, 5_000);
     ideas.forEach((title, i) => engine.addIdea(SLUG, { title, theme: `t${i}`, pinned: false }, "human"));
@@ -244,7 +245,8 @@ describe("v0.2.1 (fake host)", () => {
   });
 
   it("the status line counts the candidate on the bench as measured, and only the ones behind it as queued", async () => {
-    const id = await running(["Idea A", "Idea B"], 2);
+    // Parallel gates (v0.2.2's single-machine mode would hold c/2 at the gate until c/1 is measured).
+    const id = await running(["Idea A", "Idea B"], 2, "off");
     const lines: string[] = [];
     host.onMeasure = () => {
       const c1 = store.candidateByN(id, 1);

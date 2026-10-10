@@ -9,6 +9,7 @@ import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost
 import { applyProposal, type Promotion } from "./harvest-math.ts";
 import { Harvester, harvestReadyText } from "./harvest.ts";
 import { checkHealth } from "./health.ts";
+import type { DispatchDecision, DispatchQuery } from "./ports.ts";
 import { LiveRecorder } from "./live.ts";
 import { classifyItem, type Activity } from "./live-model.ts";
 import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
@@ -1721,11 +1722,74 @@ export class Engine {
     return `${this.store.candidateCount(study.id)}/${spec.budget.max_candidates} candidates · bench ${formatDuration(b.bench_seconds)} of ${spec.budget.max_bench_hours} h${spec.budget.deadline ? ` · deadline ${spec.budget.deadline}` : ""}`;
   }
 
+  // ------------------------------------------------------ quiet bench
+
+  /** When each held worker thread was first held (bounded wait: at most one measurement). */
+  private quietHeld = new Map<string, { at: number; studyId: string }>();
+
+  /**
+   * The message.dispatch hook (server.ts). Quiet bench: while a measurement
+   * of a study with `oracle.quiet_bench` runs on a machine, a NEW turn of an
+   * autoresearch worker whose environment is on that machine waits. Turns
+   * already running (join-turn) always proceed, and so does everything that
+   * isn't a worker. A held turn waits for at most one measurement: once any
+   * measurement on that machine has ended since it was first held, it starts
+   * even if the next one already began, so a busy bench never starves workers.
+   * Pipeline.withBench asks BB to re-decide when a quiet measurement ends.
+   * Must decide in milliseconds: a few indexed SQLite reads.
+   */
+  dispatchDecision(q: DispatchQuery): DispatchDecision {
+    if (this.ctx.disposed || q.attempt !== "start-turn") return { action: "proceed" };
+    const row = this.store.threadById(q.threadId);
+    // A worker's first turn arrives during its spawn call, before the row has the thread id.
+    const spawning = !row && q.spawnedByPlugin === true;
+    if (!spawning && (!row || row.role !== "worker" || !(LIVE_WORKER_STATES as readonly string[]).includes(row.state))) return { action: "proceed" };
+    const own = row ? this.store.study(row.study_id) : undefined;
+    const hostId = q.hostId ?? own?.host_id ?? null;
+    if (!hostId) return { action: "proceed" };
+    const now = this.ctx.now();
+    const busy = this.store.openBenchIntervals(hostId).find((i) => {
+      if (i.kind === "gate") return false;
+      const study = this.store.study(i.study_id);
+      if (!study) return false;
+      try {
+        return this.store.spec(study).oracle.quiet_bench;
+      } catch {
+        return false;
+      }
+    });
+    const held = this.quietHeld.get(q.threadId);
+    const lastEnd = this.store.lastMeasureEnd(hostId);
+    if (!busy || (held !== undefined && lastEnd !== null && lastEnd >= held.at)) {
+      if (held !== undefined) {
+        this.quietHeld.delete(q.threadId);
+        // Recorded on the worker's study, or (a worker still spawning) on the study that was measuring.
+        if (this.store.study(own?.id ?? held.studyId)) this.store.event(own?.id ?? held.studyId, "quiet.released", "plugin", { thread: q.threadId, host: hostId, waited_ms: now - held.at, during: busy ? busy.kind : null, spawning });
+      }
+      return { action: "proceed" };
+    }
+    const study = this.store.study(busy.study_id)!;
+    const what = busy.candidate_id !== null ? `c/${this.store.candidate(busy.candidate_id)?.n ?? "?"}'s measurement` : `a ${busy.kind === "measure" ? "measurement" : `${busy.kind} run`}`;
+    const host = this.store.benchHost(study.id, hostId)?.name ?? "this machine";
+    if (held === undefined) {
+      this.quietHeld.set(q.threadId, { at: now, studyId: own?.id ?? study.id });
+      this.store.event(own?.id ?? study.id, "quiet.held", "plugin", { thread: q.threadId, host: hostId, study: study.slug, kind: busy.kind, candidate: busy.candidate_id, spawning });
+    }
+    return {
+      action: "wait",
+      reason: `Autoresearch quiet bench: waits for ${what} on ${host} (study ${study.slug}) to end, then starts. Turns already running are not interrupted.`,
+      // A safety net in case a recheck is missed: BB asks again then.
+      sendAt: now + 10 * 60_000,
+    };
+  }
+
   // ------------------------------------------------------ reconciliation
 
   /** Run once on load, after every handler is registered. Safe to repeat. */
   async reconcile(): Promise<{ requeued: number; workers: number; calibrations: number }> {
     const { requeued } = this.pipeline.reconcile();
+    // Worker turns held by a previous instance (quiet bench) are re-decided: no measurement runs now.
+    this.ctx.bb.recheckDispatch().catch(() => undefined);
     let calibrations = 0;
     for (const study of this.store.studies(["calibrating"])) {
       if (study.calibration_status === "running" && !this.calibrations.has(study.id)) {

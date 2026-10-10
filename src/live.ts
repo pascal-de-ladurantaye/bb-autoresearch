@@ -46,7 +46,7 @@ import { clip, safeJson } from "./prompts.ts";
 import { REPLAY_VIEW_KINDS, type ReplayBundle } from "./replay.ts";
 import { titleKey, upNext } from "./scheduler.ts";
 import type { StudySpec } from "./spec.ts";
-import { statusLine } from "./views.ts";
+import { gatesOnBench, singleMachineView, statusLine } from "./views.ts";
 
 export { feedItems } from "./live-feed.ts";
 
@@ -392,6 +392,8 @@ export const LIVE_VIEW_KINDS = [
   "candidate.requeued",
   "candidate.verdict",
   "gate.flaky",
+  "gate.started",
+  "gate.finished",
   "measure.started",
   "measure.progress",
   "measure.finished",
@@ -517,9 +519,11 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const windowStart = now - UTILIZATION_WINDOW_S * 1000;
   const intervals = store.benchIntervals(s.id, { since: windowStart });
   const runningFrom = runningStart(store, s);
+  const testing = gatesOnBench(engine, s);
   const bench: LiveBenchHost[] = store.benchHosts(s.id).map((h) => {
     const m = measuringRows.find((c) => c.bench_host_id === h.host_id);
     const started = m ? lastAt(events, "measure.started", m.id) : null;
+    const g = testing.find((x) => x.hostId === h.host_id);
     return {
       hostId: h.host_id,
       name: h.name,
@@ -528,12 +532,19 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
       deferredUntil: h.deferred_until !== null && h.deferred_until > now ? h.deferred_until : null,
       current: m
         ? { kind: "measure" as const, n: m.n, stage: m.stage, pairs: cardByN.get(m.n)?.pairs ?? null, startedAt: started ?? m.queued_at ?? m.submitted_at }
-        : h.drift_status === "running"
-          ? { kind: "drift" as const, startedAt: lastHostAt(events, "drift.started", h.host_id) }
-          : null,
+        : g
+          ? { kind: "gate" as const, n: g.n, startedAt: g.startedAt }
+          : h.drift_status === "running"
+            ? { kind: "drift" as const, startedAt: lastHostAt(events, "drift.started", h.host_id) }
+            : null,
       ...utilization(intervals.filter((i) => i.host_id === h.host_id).map((i) => ({ start: i.started_at, end: i.ended_at })), now, runningFrom),
     };
   });
+
+  // Single-machine mode: candidates waiting to test share the bench queue, in its order (oldest first).
+  const sm = spec ? singleMachineView(engine, s) : null;
+  const waitingTests = sm?.serialized ? inFlight.filter((c) => c.stage === "gating" && !testing.some((g) => g.candidateId === c.id)) : [];
+  const benchQueue = [...waitingTests, ...queuedRows].sort((a, b) => (a.queued_at ?? a.submitted_at) - (b.queued_at ?? b.submitted_at) || a.id - b.id);
 
   // Up next: the queue in the scheduler's own pick order (theme cap and no-repeat rule included).
   const w = s.target_workers ?? engine.maxWorkers(s);
@@ -573,13 +584,15 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
     },
     workers,
     cards,
-    queue: queuedRows.map((c) => c.n),
+    queue: benchQueue.map((c) => c.n),
+    queueTests: benchQueue.filter((c) => c.stage === "gating").map((c) => c.n),
+    singleMachine: sm?.serialized ? { text: sm.text, quietBench: sm.quietBench } : null,
     bench,
     ideas: {
       next: order.slice(0, NEXT_IDEAS).map(({ idea: i, blocked }) => ({ id: i.id, title: clip(i.title, 160), theme: i.theme, pinned: i.pinned === 1, source: i.source, blocked })),
       total: order.length,
     },
-    feed: feedItems(events, { metric, ideas, hostName: (id) => store.benchHost(s.id, id)?.name ?? id, candidateN: candidateNumbers(store, s.id), noise: spec?.oracle.noise ?? "noisy" }).slice(-FEED_LIMIT),
+    feed: feedItems(events, { metric, ideas, hostName: (id) => store.benchHost(s.id, id)?.name ?? id, candidateN: candidateNumbers(store, s.id), noise: spec?.oracle.noise ?? "noisy", gatesOnBench: Boolean(sm?.serialized) }).slice(-FEED_LIMIT),
     bands,
   };
 }
@@ -700,6 +713,10 @@ export function replayBundle(engine: Engine, s: StudyRow): ReplayBundle {
     workers: store.threads(s.id, { role: "worker" }).map((w) => ({ key: w.id, threadId: w.thread_id, ideaId: w.idea_id, spawnedAt: w.spawned_at })),
     candidates: candidates.map((c) => ({ id: c.id, n: c.n, ideaId: c.idea_id, threadId: c.thread_id, workerKey: c.worker_id, title: c.idea_id !== null ? clip(titles.get(c.idea_id) ?? "", 120) : clip(c.summary.split("\n")[0] ?? "", 120) })),
     intervals: store.benchIntervals(s.id).map((i) => ({ hostId: i.host_id, start: i.started_at, end: i.ended_at })),
+    singleMachine: (() => {
+      const sm = spec ? singleMachineView(engine, s) : null;
+      return sm?.serialized ? { text: sm.text, quietBench: sm.quietBench } : null;
+    })(),
     events,
     bands,
   };

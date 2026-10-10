@@ -77,5 +77,5 @@ Harvest freezes best (in-flight candidates finish; new submissions are refused),
 
 - Up to `max_workers` workers at once; W adapts as min(max_workers, ceil(think/eval)+1), and no worker spawns while the bench queue is at least W deep.
 - The server's own machine is the edit host (workers, gates). Bench hosts are `local` (plugin checkouts here) or BB machines with their own clone, fed by git bundles; queued candidates go oldest first to whichever bench host is free, online and healthy.
-- `noisy` and `expensive` oracles take the bench lock: one measurement at a time per bench host; gates run in parallel outside it.
+- `noisy` and `expensive` oracles take the bench lock: one measurement at a time per bench host; gates run in parallel outside it, except in single-machine mode (`oracle.single_machine`, on by default when a bench host is the edit machine): then gates take that lock too, in one oldest-first queue with measurements, so a gate never overlaps a measurement, and T_eval is gate + measure time. With `oracle.quiet_bench`, a new worker turn on that machine waits (for at most one measurement) while a measurement runs.
 - The spec lives in plugin storage, not the repo. Proposing a revised spec after start makes it pending until the human approves it (`approve` without an oracle change, `calibrate` with one).

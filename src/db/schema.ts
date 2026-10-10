@@ -432,4 +432,8 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE candidates ADD COLUMN worker_id INTEGER`,
   `UPDATE candidates SET worker_id = (SELECT t.id FROM threads t WHERE t.study_id = candidates.study_id AND t.role = 'worker' AND t.thread_id = candidates.thread_id ORDER BY t.id LIMIT 1) WHERE worker_id IS NULL AND thread_id IS NOT NULL`,
   `UPDATE candidates SET worker_id = (SELECT json_extract(e.data_json, '$.worker') FROM events e WHERE e.study_id = candidates.study_id AND e.kind = 'worker.phase' AND json_extract(e.data_json, '$.candidate') = candidates.n AND json_type(e.data_json, '$.worker') = 'integer' ORDER BY e.id LIMIT 1) WHERE worker_id IS NULL`,
+  // ---- Single-machine mode ----
+  /** Seconds the candidate's gates ran (with single-machine mode they held the bench lock). */
+  `ALTER TABLE candidates ADD COLUMN gate_seconds REAL NOT NULL DEFAULT 0`,
+  `CREATE INDEX bench_intervals_open ON bench_intervals (host_id, ended_at)`,
 ];

@@ -21,7 +21,7 @@ export function BenchHostList({ hosts, queueDepth }: { hosts: BenchHostView[]; q
             </span>
           </div>
           <div className="text-xs text-muted-foreground">
-            {h.measuring !== null ? `measuring c/${h.measuring}` : "idle"}
+            {h.measuring !== null ? `measuring c/${h.measuring}` : h.gating !== null ? `testing c/${h.gating} (single-machine mode: tests hold the bench)` : "idle"}
             {h.progress ? ` · ${h.progress}` : ""} · queue {queueDepth} · best build {h.bestBuildSha ? shortSha(h.bestBuildSha) : "not cached"}
             {h.mode === "clone" ? ` · ${h.bundles} bundle(s), ${Math.round(h.bundleBytes / 1024)} KiB` : ""}
             {h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toLocaleTimeString()}` : ""}

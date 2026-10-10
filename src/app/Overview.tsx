@@ -202,8 +202,10 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
           ) : null}
         </div>
         <p className="text-xs text-muted-foreground">
-          {o.noise} oracle · {o.noise === "deterministic" ? `single runs, tolerance ${frac(o.calibration.mde)}` : `win threshold (MDE) ${frac(o.calibration.mde)}`} · think ≈ {duration(o.tThink)} · eval ≈ {duration(o.tEval)} · bench busy {ratio(u.ratio)} of running time · best <Mono>{shortSha(o.bestSha)}</Mono> on <Mono>studies/{o.slug}/best</Mono>
+          {o.noise} oracle · {o.noise === "deterministic" ? `single runs, tolerance ${frac(o.calibration.mde)}` : `win threshold (MDE) ${frac(o.calibration.mde)}`} · think ≈ {duration(o.tThink)} · eval ≈ {duration(o.tEval)}
+          {o.evalTimes?.serialized ? ` (tests ${duration(o.evalTimes.gate)} + measurement ${duration(o.evalTimes.measure)})` : ""} · bench busy {ratio(u.ratio)} of running time{o.evalTimes?.serialized && u.gateSeconds > 0 ? ` (${duration(u.gateSeconds)} of it testing)` : ""} · best <Mono>{shortSha(o.bestSha)}</Mono> on <Mono>studies/{o.slug}/best</Mono>
         </p>
+        {o.singleMachine?.serialized ? <p className="text-xs text-muted-foreground">{o.singleMachine.text}</p> : null}
         <Usage u={o.usage} />
       </Section>
 

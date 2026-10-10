@@ -25,10 +25,12 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
       {b.error ? <TabState loading={false} error={b.error} retry={b.refetch} label="the bench" /> : null}
       <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
         <Stat label="Bench utilization" help="utilization" value={ratio(u.ratio)} hint={`${ratio(u.steadyRatio)} since the first submission`} />
-        <Stat label="Busy" value={duration(u.busySeconds)} hint={`of ${duration(u.runningSeconds)} running`} />
+        <Stat label="Busy" value={duration(u.busySeconds)} hint={`of ${duration(u.runningSeconds)} running${u.gateSeconds > 0 ? `, ${duration(u.gateSeconds)} testing` : ""}`} />
         <Stat label="Queue" value={v.queue.length} hint={u.overlaps ? `${u.overlaps} overlapping interval(s)` : "no overlaps"} />
         <Stat label="Gate runs" value={`${v.gates.flaky} flaky · ${v.gates.failed} failed`} hint="last 200 gate events" />
       </div>
+
+      {v.singleMachine && (v.singleMachine.on || v.singleMachine.quietBench) ? <p className="text-xs text-muted-foreground">{v.singleMachine.text}</p> : null}
 
       <Section title={`Bench hosts (${v.hosts.length})`}>{v.hosts.length ? <BenchHostList hosts={v.hosts} queueDepth={v.queue.length} /> : <EmptyState>Bench hosts are set when the study is calibrated.</EmptyState>}</Section>
 

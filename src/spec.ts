@@ -138,6 +138,20 @@ export const specSchema = z
         max_bundle_mib: z.number().min(1).max(4096).default(256),
         /** Notify the human when a bench host stays offline this long. */
         offline_grace_minutes: z.number().min(0.5).max(24 * 60).default(10),
+        /**
+         * Single-machine mode: gates take the same per-host bench lock as
+         * measurements, in one queue with them, so tests never run while a
+         * candidate is timed. "auto" turns it on when a bench host is the edit
+         * machine (and the noise class takes the bench lock). Scheduling, not
+         * measurement: not part of the oracle hash.
+         */
+        single_machine: z.enum(["auto", "on", "off"]).default("auto"),
+        /**
+         * While a measurement runs on a host, hold the start of new worker turns
+         * whose environment is on that host (running turns are not interrupted).
+         * Not part of the oracle hash.
+         */
+        quiet_bench: z.boolean().default(false),
         /** Hidden workload on the bench host, run only on candidates about to be promoted. Agents see pass/fail only. */
         holdout: z
           .object({
@@ -316,6 +330,15 @@ export function validateSemantics(spec: StudySpec): SpecResult {
   if (spec.oracle.noise === "noisy" && spec.oracle.gate.length === 0) {
     warnings.push("oracle.gate is empty: candidates are measured without a correctness check");
   }
+  if (spec.oracle.single_machine === "on" && spec.oracle.noise === "deterministic") {
+    warnings.push('oracle.single_machine = "on" with a deterministic oracle: its measurements don\'t take the machine-wide bench lock, so gates only wait for this study\'s own measurements');
+  }
+  if (spec.oracle.single_machine === "on" && spec.oracle.gate.length === 0) {
+    warnings.push('oracle.single_machine = "on" has nothing to serialize: oracle.gate is empty');
+  }
+  if (spec.oracle.quiet_bench && spec.oracle.noise === "deterministic") {
+    warnings.push("oracle.quiet_bench with a deterministic oracle holds worker turns during measurements that don't need a quiet machine");
+  }
   if (errors.length) return { ok: false, errors };
   return { ok: true, spec, warnings };
 }
@@ -327,7 +350,8 @@ export function validateSemantics(spec: StudySpec): SpecResult {
 export function normalizeSpec(spec: StudySpec): StudySpec {
   const guardrail = (spec.guardrail ?? []).map((g) => ({ ...g, direction: g.direction ?? "lower", max_total_regression: g.max_total_regression ?? g.max_regression }));
   const scope = { ...spec.scope, ignore: spec.scope.ignore ?? [...DEFAULT_IGNORE] };
-  return { ...spec, guardrail, scope };
+  const oracle = { ...spec.oracle, single_machine: spec.oracle.single_machine ?? "auto", quiet_bench: spec.oracle.quiet_bench ?? false };
+  return { ...spec, guardrail, scope, oracle };
 }
 
 function canonical(value: unknown): string {
@@ -347,8 +371,9 @@ function canonical(value: unknown): string {
  */
 export function oracleHash(spec: StudySpec, protectedContentHash = ""): string {
   // Bench operations (health thresholds, drift schedule, transfer cap, offline
-  // grace) don't change how a commit is judged, so tuning them is not a new segment.
-  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, ...oracle } = spec.oracle;
+  // grace) and scheduling (single-machine mode, quiet bench) don't change how a
+  // commit is judged, so tuning them is not a new segment.
+  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, ...oracle } = spec.oracle;
   const judged = {
     metric: spec.metric,
     guardrail: spec.guardrail,

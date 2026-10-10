@@ -43,6 +43,8 @@ export interface ReplayBundle {
   end: number;
   now: number;
   spec: { maxCandidates: number; maxSubmissions: number; maxWorkers: number; noise?: NoiseClass };
+  /** Single-machine mode as configured now (not historical): gates hold the bench lock. */
+  singleMachine?: { text: string; quietBench: boolean } | null;
   hosts: Array<{ hostId: string; name: string }>;
   ideas: Array<{ id: number; title: string; theme: string; source: string; variationOf: number | null }>;
   /** Worker rows (threads.id is the lane key). */
@@ -65,6 +67,8 @@ export const REPLAY_VIEW_KINDS = [
   "candidate.requeued",
   "candidate.verdict",
   "gate.flaky",
+  "gate.started",
+  "gate.finished",
   "measure.started",
   "measure.progress",
   "measure.finished",
@@ -101,6 +105,7 @@ const FEED_KINDS = new Set([
   "candidate.requeued",
   "candidate.verdict",
   "gate.flaky",
+  "gate.started",
   "measure.started",
   "measure.progress",
   "measure.finished",
@@ -166,11 +171,13 @@ export interface ReplayState {
   pauseReason: string | null;
   w: number | null;
   drift: Record<string, number>;
+  /** Single-machine mode: the candidate whose gates hold a host's bench lock, and since when. */
+  gates: Record<string, { n: number; at: number }>;
   hostStatus: Record<string, { status: "online" | "offline" | "unknown"; healthOk: boolean | null }>;
 }
 
 function empty(): ReplayState {
-  return { i: 0, lastEventId: 0, workers: {}, cands: {}, candCount: 0, latestByWorker: {}, submissions: {}, ideas: {}, best: null, movedAt: null, wins: [], state: "draft", runningSince: null, pauseReason: null, w: null, drift: {}, hostStatus: {} };
+  return { i: 0, lastEventId: 0, workers: {}, cands: {}, candCount: 0, latestByWorker: {}, submissions: {}, ideas: {}, best: null, movedAt: null, wins: [], state: "draft", runningSince: null, pauseReason: null, w: null, drift: {}, gates: {}, hostStatus: {} };
 }
 
 function clone(s: ReplayState): ReplayState {
@@ -188,6 +195,7 @@ function clone(s: ReplayState): ReplayState {
     ideas: rec(s.ideas),
     wins: [...s.wins],
     drift: { ...s.drift },
+    gates: rec(s.gates),
     hostStatus: rec(s.hostStatus),
   };
 }
@@ -250,7 +258,7 @@ export class ReplayModel {
     // The feed, told once over the whole study (only the kinds the live view's feed reads).
     this.feed = feedItems(
       this.events.filter((e) => FEED_KINDS.has(e.kind)),
-      { metric: bundle.metric, ideas: new Map(bundle.ideas.map((i) => [i.id, { title: i.title }] as const)), hostName: (id) => this.hostName.get(id) ?? id, candidateN: new Map(bundle.candidates.map((c) => [c.id, c.n] as const)), noise: bundle.spec.noise ?? "noisy" },
+      { metric: bundle.metric, ideas: new Map(bundle.ideas.map((i) => [i.id, { title: i.title }] as const)), hostName: (id) => this.hostName.get(id) ?? id, candidateN: new Map(bundle.candidates.map((c) => [c.id, c.n] as const)), noise: bundle.spec.noise ?? "noisy", gatesOnBench: Boolean(bundle.singleMachine) },
     );
     this.feedMaxId = [];
     let m = 0;
@@ -420,6 +428,14 @@ export class ReplayModel {
       case "drift.checked":
         if (str(d.host)) delete s.drift[str(d.host)!];
         break;
+      case "gate.started": {
+        const gn = num(d.n);
+        if (str(d.host) && gn !== null) s.gates[str(d.host)!] = { n: gn, at: e.at };
+        break;
+      }
+      case "gate.finished":
+        if (str(d.host) && s.gates[str(d.host)!]?.n === num(d.n)) delete s.gates[str(d.host)!];
+        break;
       case "bench.online":
       case "bench.offline":
         if (str(d.host)) s.hostStatus[str(d.host)!] = { healthOk: s.hostStatus[str(d.host)!]?.healthOk ?? null, status: e.kind === "bench.online" ? "online" : "offline" };
@@ -501,6 +517,10 @@ export class ReplayModel {
           action: w.action,
         };
       });
+    // Single-machine mode: candidates waiting to test share the bench queue (oldest first).
+    const testingN = new Set(Object.values(s.gates).map((g) => g.n));
+    const waitingTests = b.singleMachine ? inFlight.filter((c) => c.stage === "gating" && !testingN.has(c.n)) : [];
+    const benchQueue = [...waitingTests, ...queued].sort((x, y) => (x.queuedAt ?? x.submittedAt) - (y.queuedAt ?? y.submittedAt) || x.id - y.id);
     const bench: LiveBenchHost[] = b.hosts.map((h) => {
       const m = inFlight.find((c) => c.host === h.hostId && (c.stage === "measuring" || c.stage === "confirming" || c.stage === "promoting"));
       const st = s.hostStatus[h.hostId];
@@ -513,9 +533,11 @@ export class ReplayModel {
         deferredUntil: null,
         current: m
           ? { kind: "measure" as const, n: m.n, stage: m.stage, pairs: cardByN.get(m.n)?.pairs ?? null, startedAt: m.startedAt ?? m.queuedAt ?? m.submittedAt }
-          : s.drift[h.hostId] !== undefined
-            ? { kind: "drift" as const, startedAt: s.drift[h.hostId]! }
-            : null,
+          : s.gates[h.hostId] !== undefined && s.cands[s.gates[h.hostId]!.n]?.stage === "gating"
+            ? { kind: "gate" as const, n: s.gates[h.hostId]!.n, startedAt: s.gates[h.hostId]!.at }
+            : s.drift[h.hostId] !== undefined
+              ? { kind: "drift" as const, startedAt: s.drift[h.hostId]! }
+              : null,
         ...utilization(intervals, t, s.runningSince),
       };
     });
@@ -543,7 +565,7 @@ export class ReplayModel {
       studyId: b.studyId,
       slug: b.slug,
       state: s.state,
-      statusLine: replayStatusLine(s.state, workers.length, measuring, { queued: queued.length, inTests }, s.pauseReason),
+      statusLine: replayStatusLine(s.state, workers.length, measuring, { queued: queued.length, inTests }, s.pauseReason, Object.values(s.gates).filter((g) => s.cands[g.n]?.stage === "gating").map((g) => `c/${g.n}`)),
       metric,
       noise: b.spec.noise ?? "noisy",
       now: t,
@@ -561,7 +583,9 @@ export class ReplayModel {
       counts: { candidates: s.candCount, maxCandidates: b.spec.maxCandidates, workers: workers.length, targetWorkers: w, queue: queued.length },
       workers,
       cards,
-      queue: queued.map((c) => c.n),
+      queue: benchQueue.map((c) => c.n),
+      queueTests: benchQueue.filter((c) => c.stage === "gating").map((c) => c.n),
+      singleMachine: b.singleMachine ?? null,
       bench,
       ideas: { next: order.slice(0, NEXT_IDEAS).map(({ idea, blocked }) => ({ id: idea.id, title: clip(idea.title, 160), theme: idea.theme, pinned: idea.pinned === 1, source: idea.source, blocked })), total: order.length },
       feed: this.feedUpTo(s.lastEventId),
@@ -621,10 +645,10 @@ export function nextMilestone(milestones: readonly Milestone[], t: number, kind:
 }
 
 /** The status line at a replayed moment (the live one also reads the harvest and pause details from the database). */
-export function replayStatusLine(state: string, workers: number, measuring: readonly string[], waiting: { queued: number; inTests: number }, pauseReason: string | null): string {
+export function replayStatusLine(state: string, workers: number, measuring: readonly string[], waiting: { queued: number; inTests: number }, pauseReason: string | null, testing: readonly string[] = []): string {
   switch (state) {
     case "running":
-      return runningStatusText(workers, measuring, waiting.queued, waiting.inTests);
+      return runningStatusText(workers, measuring, waiting.queued, waiting.inTests, testing);
     case "paused":
       return `Paused: ${clip(pauseReason ?? "no reason recorded", 200)}.${workers ? ` ${workers} worker${workers === 1 ? "" : "s"} finishing.` : ""}`;
     case "harvesting":

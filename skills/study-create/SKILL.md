@@ -31,7 +31,7 @@ Pick the noise class:
 - `noisy`: wall-clock time, latency, throughput. Paired, interleaved runs with a bootstrap CI of the median and a sequential test. Calibration measures the noise first.
 - `expensive`: one run takes many minutes. One screening run per candidate against the calibrated per-run noise; a promising run is confirmed with `confirm_runs` (default 3) fresh runs.
 
-Pick the bench hosts (`oracle.bench_hosts`): `["local"]` (default) measures in plugin checkouts on this machine. Any other entry is a BB machine name or host id (see `bb host list`); that machine keeps its own clone and receives commits as git bundles. A dedicated, quiet machine of the production architecture is best. Ask whether there is a **holdout** workload that lives only on the bench host (a different input set): it is run on every win before promotion, and agents only learn pass/fail.
+Pick the bench hosts (`oracle.bench_hosts`): `["local"]` (default) measures in plugin checkouts on this machine. Any other entry is a BB machine name or host id (see `bb host list`); that machine keeps its own clone and receives commits as git bundles. A dedicated, quiet machine of the production architecture is best. When the bench host is this machine (the laptop case), **single-machine mode** (`oracle.single_machine`, default `"auto"`) turns on: gates take the same bench lock as measurements, one at a time, so tests never run while a candidate is timed. Size the gate for that: its time now counts as bench time per candidate. `quiet_bench = true` also holds new worker turns while a measurement runs. Ask whether there is a **holdout** workload that lives only on the bench host (a different input set): it is run on every win before promotion, and agents only learn pass/fail.
 
 Run `measure` once yourself to check the METRIC lines parse. If the harness lives in the repo, list its paths under `protected` (its content hash becomes part of the oracle).
 
@@ -72,6 +72,8 @@ bench_hosts = ["local"]          # or BB machine names/ids: own clone, git bundl
 timeout_minutes = 20             # per command (runs as a host job; up to 1440)
 max_bundle_mib = 256             # optional: largest git bundle sent to a bench host
 offline_grace_minutes = 10       # optional: notify when a bench host stays offline
+single_machine = "auto"          # optional: auto | on | off. On: gates share the bench lock with measurements (auto: when a bench host is this machine)
+quiet_bench = false              # optional: hold new worker turns on the bench machine while a measurement runs
 
 [oracle.holdout]                 # optional: hidden workload on the bench host
 measure = "/srv/holdout/parse.sh"   # prints METRIC lines like measure

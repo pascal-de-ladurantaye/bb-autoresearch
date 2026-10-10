@@ -170,6 +170,8 @@ export interface CandidateRow {
   band_json: string | null;
   /** The worker row (threads.id) that submitted it; null for candidates not linked to a worker row. */
   worker_id: number | null;
+  /** Seconds its gates ran (single-machine mode: holding the bench lock). */
+  gate_seconds: number;
 }
 
 export interface FindingRow {
@@ -194,12 +196,15 @@ export interface EventRow {
   data_json: string;
 }
 
+/** What held the bench lock: a measurement, a profile, calibration, a drift check, a harvest measurement, or (single-machine mode) a gate. */
+export type BenchIntervalKind = "measure" | "profile" | "calibration" | "drift" | "harvest" | "gate";
+
 export interface BenchIntervalRow {
   id: number;
   study_id: string;
   host_id: string;
   lock_key: string;
-  kind: "measure" | "profile" | "calibration" | "drift" | "harvest";
+  kind: BenchIntervalKind;
   candidate_id: number | null;
   started_at: number;
   ended_at: number | null;
@@ -785,6 +790,15 @@ export class Store {
     return this.db.prepare(`SELECT * FROM bench_intervals WHERE study_id = ? AND COALESCE(ended_at, ?) >= ? ORDER BY started_at, id`).all(studyId, this.now(), opts.since ?? 0) as BenchIntervalRow[];
   }
   /** Close intervals left open by a crash (reconcile). */
+  /** Intervals on `hostId` (every study) still holding the lock. */
+  openBenchIntervals(hostId: string): BenchIntervalRow[] {
+    return this.db.prepare(`SELECT * FROM bench_intervals WHERE host_id = ? AND ended_at IS NULL ORDER BY started_at, id`).all(hostId) as BenchIntervalRow[];
+  }
+  /** When the last interval on `hostId` other than a gate ended (quiet bench). */
+  lastMeasureEnd(hostId: string): number | null {
+    const r = this.db.prepare(`SELECT MAX(ended_at) AS t FROM bench_intervals WHERE host_id = ? AND kind != 'gate' AND ended_at IS NOT NULL`).get(hostId) as { t: number | null };
+    return r.t;
+  }
   closeOpenBenchIntervals(): number {
     return this.db.prepare(`UPDATE bench_intervals SET ended_at = started_at WHERE ended_at IS NULL`).run().changes;
   }

@@ -38,7 +38,7 @@ import {
 import { checkHealth } from "./health.ts";
 import { BenchError, strategyFor } from "./noise.ts";
 import type { GuardrailEstimate } from "./guardrails.ts";
-import { errText, IN_FLIGHT_STAGES, segmentGuardrailCalibration, withBench, type Pipeline } from "./pipeline.ts";
+import { errText, IN_FLIGHT_STAGES, segmentGuardrailCalibration, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { DryRunPublisher, type PrDraft } from "./publisher.ts";
 import { prBody, studyReport } from "./report.ts";
@@ -382,15 +382,18 @@ export class Harvester {
   private async gates(study: StudyRow, spec: StudySpec, sha: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (!spec.oracle.gate.length) return { ok: true };
     const runner = this.ctx.bb.hostRunner(study.host_id!);
-    const dir = await runner.checkout(study.repo_path!, `${study.slug}-harvest-gate`, sha);
-    for (const command of spec.oracle.gate) {
-      const job = { cwd: dir, command, timeoutMs: spec.oracle.timeout_minutes * 60_000, label: "harvest gate" };
-      const r = await runner.run(job);
-      if (r.exitCode === 0) continue;
-      const retry = await runner.run(job);
-      if (retry.exitCode !== 0) return { ok: false, reason: `gate failed: ${clip(command, 200)} exited ${retry.exitCode}: ${clip(tail(retry), 400)}` };
-    }
-    return { ok: true };
+    // Single-machine mode: harvest gates hold the edit host's bench lock too.
+    return await withGateLock(this.ctx, study, null, async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      const dir = await runner.checkout(study.repo_path!, `${study.slug}-harvest-gate`, sha);
+      for (const command of spec.oracle.gate) {
+        const job = { cwd: dir, command, timeoutMs: spec.oracle.timeout_minutes * 60_000, label: "harvest gate" };
+        const r = await runner.run(job);
+        if (r.exitCode === 0) continue;
+        const retry = await runner.run(job);
+        if (retry.exitCode !== 0) return { ok: false, reason: `gate failed: ${clip(command, 200)} exited ${retry.exitCode}: ${clip(tail(retry), 400)}` };
+      }
+      return { ok: true };
+    });
   }
 
   private async measureTotal(harvestId: number, spec: StudySpec, signal: AbortSignal): Promise<void> {

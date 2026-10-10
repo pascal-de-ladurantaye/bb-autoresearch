@@ -7,7 +7,7 @@
 // improvement is positive when it is better, in the metric's own terms).
 import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type PluginCliRegistration } from "@get-bb/plugin-sdk";
 import { EngineError, type Caller, type Engine } from "./engine.ts";
-import { errText } from "./pipeline.ts";
+import { errText, evalTimes } from "./pipeline.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import { ciText, magnitudePct, sharePct, signedPct, verdictCause } from "./present.ts";
 import {
@@ -19,6 +19,7 @@ import {
   oracleView,
   overview,
   segmentView,
+  singleMachineView,
   studySummary,
   usageView,
   utilization,
@@ -506,15 +507,17 @@ function listStudies(engine: Engine, json: boolean | undefined): CliOut {
 
 function schedulerLine(engine: Engine, s: StudyRow): string {
   const t = engine.ctx.store.study(s.id)!;
-  const tEval = engine.pipeline.recentEvalSeconds(t);
+  const times = evalTimes(engine.ctx.store, t);
+  const tEval = times.tEval;
   const tThink = engine.thinkSeconds(t);
-  return `W ${t.target_workers ?? "?"} of max ${engine.maxWorkers(t)}${t.max_workers_override !== null ? " (human override)" : ""} · bench queue ${engine.benchDepth(t.id)} · think ≈ ${tThink === null ? "?" : formatDuration(tThink)} · eval ≈ ${tEval === null ? "?" : formatDuration(tEval)}`;
+  const parts = times.serialized ? ` (tests ${times.gate === null ? "?" : formatDuration(times.gate)} + measurement ${times.measure === null ? "?" : formatDuration(times.measure)}, single-machine mode)` : "";
+  return `W ${t.target_workers ?? "?"} of max ${engine.maxWorkers(t)}${t.max_workers_override !== null ? " (human override)" : ""} · bench queue ${engine.benchDepth(t.id)} · think ≈ ${tThink === null ? "?" : formatDuration(tThink)} · eval ≈ ${tEval === null ? "?" : formatDuration(tEval)}${parts}`;
 }
 
 function utilizationLine(engine: Engine, s: StudyRow): string {
   const u = utilization(engine, s);
   const pct = (x: number | null) => (x === null ? "n/a" : `${(x * 100).toFixed(1)}%`);
-  return `busy ${formatDuration(u.busySeconds)} of ${formatDuration(u.runningSeconds)} running (${pct(u.ratio)}; ${pct(u.steadyRatio)} since the first submission) · overlapping measurements ${u.overlaps}`;
+  return `busy ${formatDuration(u.busySeconds)} of ${formatDuration(u.runningSeconds)} running (${pct(u.ratio)}; ${pct(u.steadyRatio)} since the first submission)${u.gateSeconds > 0 ? ` · ${formatDuration(u.gateSeconds)} of it gates (single-machine mode)` : ""} · overlapping bench intervals ${u.overlaps}`;
 }
 
 function usageLine(engine: Engine, s: StudyRow): string {
@@ -541,7 +544,7 @@ function benchLines(engine: Engine, s: StudyRow): string[] {
     (h) =>
       `  ${h.name} [${h.mode === "clone" ? "own clone via git bundles" : "local checkouts"}] ${h.status}` +
       ` · health ${h.healthOk === null ? "not checked" : h.healthOk ? "ok" : `FAILING (${h.problems.join("; ")})`}${h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toISOString().slice(11, 19)}` : ""}` +
-      ` · ${h.measuring !== null ? `measuring c/${h.measuring}` : "idle"} · drift ${h.driftStatus ?? "not run"} (${h.evalsSinceDrift}/${h.driftEvery} evals)` +
+      ` · ${h.measuring !== null ? `measuring c/${h.measuring}` : h.gating !== null ? `testing c/${h.gating} (gates hold the bench)` : "idle"} · drift ${h.driftStatus ?? "not run"} (${h.evalsSinceDrift}/${h.driftEvery} evals)` +
       ` · cached best build ${h.bestBuildSha ? h.bestBuildSha.slice(0, 10) : "none"}${h.lastTransfer ? ` · last bundle ${h.lastTransfer}` : ""}${h.healthSummary ? `\n      ${h.healthSummary}` : ""}`,
   );
 }
@@ -628,6 +631,7 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
         ["Scope", `editable ${spec.scope.editable.join(", ")} · protected ${spec.scope.protected.join(", ") || "none"}`],
         ["Oracle", `build ${spec.oracle.build ? "`" + clip(spec.oracle.build, 80) + "`" : "none"} · gate ${spec.oracle.gate.map((g) => "`" + clip(g, 60) + "`").join(", ") || "none"} · measure \`${clip(spec.oracle.measure, 80)}\`${spec.oracle.holdout ? " · holdout: configured (hidden from agents)" : ""}`],
         ["Segment", segmentLine(engine, s)],
+        ["Single machine", singleMachineView(engine, s)?.text ?? "n/a"],
         ["Repo", `${s.repo_path} (host ${s.host_id}) · study thread ${s.study_thread_id ?? "none"}`],
         ["Best", `${s.best_sha?.slice(0, 10) ?? "not set"} (branch studies/${s.slug}/best) · base ${s.base_sha?.slice(0, 10) ?? "?"}`],
       ]),

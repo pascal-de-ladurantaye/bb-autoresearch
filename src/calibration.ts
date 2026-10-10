@@ -11,7 +11,8 @@ import { guardrailWarnings, worstGuardrailCalibration, type GuardrailCalibration
 import { checkHealth } from "./health.ts";
 import { parseMeasureOutput } from "./metrics.ts";
 import { strategyFor, BenchError, type CalibrationOutcome } from "./noise.ts";
-import { withBench, type Pipeline } from "./pipeline.ts";
+import { studySingleMachine, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
+import { singleMachineText } from "./single-machine.ts";
 import { clip } from "./prompts.ts";
 import { ignoreIncludePathspecs } from "./scope.ts";
 import type { HostRunner } from "./host/runner.ts";
@@ -87,19 +88,24 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   const hash = oracleHash(spec, protectedHash);
   const scopeWarnings = await trackedIgnoredWarning(runner, repo, baseSha, spec.scope.ignore ?? []);
 
-  // 3. Gates on the baseline.
+  // 3. Gates on the baseline (single-machine mode: holding the edit host's bench lock, like every gate).
   const gateStarted = ctx.now();
   if (spec.oracle.gate.length) {
-    const dir = await runner.checkout(repo, `${study.slug}-gate`, baseSha);
-    for (const command of spec.oracle.gate) {
-      const r = await runner.exec({ cwd: dir, command, timeoutMs });
-      if (r.exitCode !== 0) {
-        problems.push(`gate is red on the baseline: ${clip(command, 200)} exited ${r.exitCode}${r.timedOut ? " (timeout)" : ""}: ${clip(`${r.stdout}\n${r.stderr}`.trim(), 600)}`);
-        return finish({ baselineSha: baseSha, oracleHash: hash, gateSeconds: (ctx.now() - gateStarted) / 1000 });
+    const red = await withGateLock(ctx, study, null, async () => {
+      const dir = await runner.checkout(repo, `${study.slug}-gate`, baseSha);
+      for (const command of spec.oracle.gate) {
+        const r = await runner.exec({ cwd: dir, command, timeoutMs });
+        if (r.exitCode !== 0) return `gate is red on the baseline: ${clip(command, 200)} exited ${r.exitCode}${r.timedOut ? " (timeout)" : ""}: ${clip(`${r.stdout}\n${r.stderr}`.trim(), 600)}`;
       }
+      return null;
+    });
+    if (red) {
+      problems.push(red);
+      return finish({ baselineSha: baseSha, oracleHash: hash, gateSeconds: (ctx.now() - gateStarted) / 1000 });
     }
   }
   const gateSeconds = (ctx.now() - gateStarted) / 1000;
+  const single = studySingleMachine(store, study, spec);
 
   // 4. A/A measurement on two checkouts of the baseline on every bench host, each holding its own lock.
   const strategy = strategyFor(spec.oracle.noise);
@@ -132,7 +138,13 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   const noiseFloor = Math.max(...ok.map((r) => r.outcome.noiseFloor));
   const mde = Math.max(...ok.map((r) => r.outcome.mde));
   const evalSeconds = Math.max(...ok.map((r) => r.outcome.evalSeconds));
-  const gateLine = spec.oracle.gate.length ? ` Gates take ${gateSeconds.toFixed(1)} s on the edit host.` : "";
+  const serialized = single.on && spec.oracle.gate.length > 0;
+  const gateLine = spec.oracle.gate.length
+    ? serialized
+      ? ` Gates take ${gateSeconds.toFixed(1)} s on the edit host, holding the bench, so each candidate occupies the bench about ${(evalSeconds + gateSeconds).toFixed(1)} s.`
+      : ` Gates take ${gateSeconds.toFixed(1)} s on the edit host.`
+    : "";
+  const singleLine = single.on || spec.oracle.quiet_bench ? ` ${singleMachineText(single, spec, hosts.find((h) => h.host_id === study.host_id)?.name ?? null)}` : "";
   const hostLines = ok.length > 1 ? ` Per host: ${ok.map((r) => `${r.h.name} MDE ${(r.outcome.mde * 100).toFixed(2)}%`).join(", ")}.` : "";
   const holdoutLine = spec.oracle.holdout ? " Holdout runs on every bench host." : "";
   const guardrails = worstGuardrailCalibration(ok.map((r) => r.outcome.guardrails ?? []));
@@ -144,8 +156,8 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     noiseFloor,
     mde,
     evalSeconds,
-    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine,
-    details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length },
+    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine + singleLine,
+    details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length, singleMachine: single.on, quietBench: spec.oracle.quiet_bench },
     hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [] })),
     guardrails,
     warnings: [...guardrailWarnings(guardrails), ...scopeWarnings],
