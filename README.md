@@ -68,6 +68,7 @@ wait.
    wins are confirmed (and checked against a hidden holdout when configured)
    before they are squashed onto best. CLI: `bb study start <slug>`.
 4. **Watch and steer.**
+   - Live (the default tab while the study runs): one lane per worker with its idea, phase (reading, editing, testing, waiting for the bench, being measured, verdict received, refining, finishing), time in phase and submissions used; candidate cards moving from Submitted through Tests, Queue and Bench to a verdict or Promoted, with pair progress and the improvement once known; each bench host with what it measures, the queue and how busy it was; the ideas up next; a feed of what just happened, grouped by candidate; and one worker's transcript at a time (select its lane). It is read only, follows realtime updates, and respects reduced motion. **Open beside the study thread** (or the **Live** button on the study thread's header badge, or "Study live view" in a thread's right-panel launcher) shows the same view in the thread's split pane, so you can watch while talking to the strategist.
    - Overview: Needs you; best vs base in words with raw values and CI; what's running; the trajectory; secondary metrics, and each guardrail's cumulative position against its total limit with the CI and the room left; controls (pause, resume, max workers, harvest, archive); notices, each with the action it asks for.
    - Ideas: add, reorder, pin, veto (with a reason).
    - Candidates: verdict, improvement, CI and guardrail status per row (ok, near limit, inconclusive, BROKEN, and whether the step or the total is the problem); each opens every recorded metric, samples, diffs, and the worker thread.
@@ -142,7 +143,9 @@ the threat model in the design).
 | Path | What |
 |---|---|
 | `server.ts` | Factory: storage, host client, tools, RPC, CLI, events, the engine service (reconcile, then tick) |
-| `app.tsx`, `src/app/` | Studies nav panel (with the needs-you count), study page (Overview, Ideas, Candidates, Findings, Oracle, Bench, Harvest), confirmed actions, header badge, rpc data hooks |
+| `app.tsx`, `src/app/` | Studies nav panel (with the needs-you count), study page (Live, Overview, Ideas, Candidates, Findings, Oracle, Bench, Harvest), confirmed actions, header badge, rpc data hooks |
+| `src/app/live/` | The Live view (Live tab and the thread-pane Live panel): lanes, pipeline cards, bench strip, feed, transcript, motion, realtime deltas |
+| `src/live-model.ts`, `src/live.ts` | Live view model shared by server and app (phases, columns, deltas, replay), and the server side: phase recorder, throttled deltas, view and feed |
 | `src/present.ts` | The improvement convention (better is positive), shared by the page, CLI, report and agent messages |
 | `host.ts`, `src/host/` | `bb.host` entry and ops: git (snapshot, prepare, compose/revert, logs), background jobs, bundles, bench clones, health, exports |
 | `src/engine.ts` | Lifecycle, control loop, worker/strategist tools, budgets, rate limits, notices, harvest control, reconciliation |
