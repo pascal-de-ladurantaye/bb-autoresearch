@@ -5,7 +5,7 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: bb-autoresearch
 brandSublabel: BB plugin design
-pills: v0.2.1 | M0-M3 built | Live view and replay | v0.2.1 wording and linking fixes | Toy-validated | Exit criteria partly validated
+pills: v0.2.2 | M0-M3 built | Live view and replay | Single-machine mode | Toy-validated | Exit criteria partly validated
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -30,7 +30,7 @@ The last pass before release closed two guardrail gaps and three usability issue
 
 After the release, a **Live** view was added (part 1 of 2): while a study runs, the study page opens on a Live tab, and the same view can sit beside the study thread in its split pane. Every change it shows is recorded as an event, so a later replay can rebuild it at any time (see "Implementation notes: live view (part 1)"). Part 2 added a CI band per measurement that narrows pair by pair to the sequential test's decision (computed from the samples with the decision's own seeded bootstrap, so it shows exactly the CI the verdict saw), a "last action" line per worker, a visible "best moved" moment, and a replay of any study with a timeline scrubber (see "Implementation notes: live view (part 2)").
 
-Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes").
+Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes"); v0.2.2 adds single-machine mode (gates take turns with measurements on a machine that is both edit and bench host, and an optional quiet bench that holds new worker turns while it measures) and commits in the studied repository as the repository's own git identity (see "Implementation notes: single-machine mode").
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
@@ -1523,6 +1523,61 @@ Small fixes before the marketplace submission; no new features. Same platform pi
 - **Single runs.** A point CI (deterministic) reads "single run, no CI" and "+20.0% (single run)" in tables, never "+20.0% to +20.0%". Measurement progress is per class (`progressText`): pairs for noisy, "running best" / "running the candidate" / "run 1 of 1" for deterministic, "run 2 of ≤4" for expensive; the live view carries the noise class (`LiveView.noise`, the replay bundle's `spec.noise`). The deterministic band reads "Single run: +2.00% vs best, better by more than the 0.50% tolerance: win", and the feed says "measured: one run each".
 - **Status line and Overview.** A candidate on the bench is counted as measured, not queued: "Running: 2 workers editing, measuring c/1, 1 queued for the bench, 1 in tests." (`runningStatusText`, shared by the live status line and replay). The Overview's "Now" hint depends on the state: "no workers before the study starts" only for draft and calibrating; paused, harvesting and archived say what they mean.
 - **Lanes link through the worker row.** `candidates.worker_id` (append-only migration) records the `threads` row that submitted a candidate; the live view, the recorder's phases, the Overview's workers and replay link lanes to candidates through it, with the BB thread id as the fallback. The migration backfills existing rows from the BB thread id, then from `worker.phase` events (which record each worker's latest candidate). A worker row without a BB thread id now shows its submissions and "c/N measuring" (it showed "submission 0 of 1" and never its candidate). The submit event carries `worker_row`.
+
+## Implementation notes: single-machine mode
+
+v0.2.2. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+### Why
+
+On a laptop the edit host is also the bench host. Gates (tests, type checks, renders) ran in parallel outside the bench lock, so a 2-3 minute gate could run next to a 15 s timing run and add noise to it. The health check before a measurement only defers it when the machine is already loaded; it can't stop a gate that starts a second later.
+
+### The shared lock
+
+- **Detection** (`src/single-machine.ts`). `[oracle] single_machine = "auto"` (default) is on when one of the study's resolved bench hosts is the edit host (`"local"`, the default, or the edit machine's own name or id) and the noise class takes the bench lock (`noisy`, `expensive`). Before the bench hosts are resolved (a draft), the spec entries decide: empty or `"local"` means the same machine. `"on"` forces it (gates take the edit host's lock key even when no bench host shares it, which only serializes gates with each other; a spec warning says so), `"off"` disables it. Deterministic oracles stay off under `auto` (their measurements don't take the machine-wide lock) and get a warning under `"on"`.
+- **One queue** (`Pipeline.launch`). Gating candidates of single-machine studies join the bench work list with the queued candidates of every study. The list is sorted by when each candidate started waiting: `queued_at` for a measurement (and for a candidate re-gated after best moved, which keeps its place), `submitted_at` for a first gate. Each lock key gets one holder per pass: a gate takes its edit host's key, a measurement the first free, online, healthy host of its study. A key is busy while a measurement, a drift check or a serialized gate is launched on it. Calibration, profiles and harvest measurements take the same `HostMutex`, so they never overlap either.
+- **The whole gate stage holds the lock.** Rebase (`prepareCandidate`) and gates run inside `withBench(..., "gate", candidate)`, so a candidate is never gated against a best that moved while it waited. Gate-less specs don't take the lock.
+- **Calibration and harvest.** The base gates in calibration and every harvest gate run through `withGateLock`: under the lock in single-machine mode, directly otherwise. The calibration report says how long a candidate occupies the bench (gate + one evaluation) and what the mode does.
+- **Bench intervals.** Gate spans are `bench_intervals` rows of kind `gate`. Utilization counts them (the views also report how much of the busy time was gates) and the overlap audit checks them against measurements on the same lock key. `gate.started` and `gate.finished` events (single-machine mode only) let the live view and replay show "testing c/N" on the bench host.
+- **Scheduling.** `evalTimes` (pipeline.ts): with serialized gates, `T_eval` is the mean of gate + measure seconds over the last 20 decided candidates that used the bench (gate failures included: their gate occupied it), falling back to calibration's eval + gate seconds. `candidates.gate_seconds` records gate time always. Backpressure already counted gating candidates as bench queue; in single-machine mode they are the part of the queue waiting to test. Gate time doesn't count against `max_bench_hours` (that budget stays measurement time).
+
+### Quiet bench
+
+- **What it does.** `[oracle] quiet_bench = true`: while a measurement (or calibration, drift, harvest or profile run) of such a study holds a machine's bench lock, the `message.dispatch` hook answers `wait` for a new turn (`attempt: "start-turn"`) of an autoresearch worker whose environment is on that machine, with a reason naming the candidate, the host and the study, and a 10-minute `sendAt` as a safety net. `withBench` calls `bb.experimental_hooks.recheck("message.dispatch")` when the measurement ends; reconciliation calls it once on load.
+- **What it doesn't.** Running turns (`join-turn`) are never held, and nothing else is: the study thread, human threads, other plugins' threads. It holds turn starts only; a turn already running keeps running its tools.
+- **Bounded wait (decision).** A held turn starts once any measurement on that machine has ended since it was first held, even if the next one already began. Without that, a saturated bench would hold workers until the queue drained (no submissions, so it would, but only then). Each held thread's first hold time is kept in memory; a plugin reload forgets it, which at worst holds a turn for one more measurement.
+- **Spawns (found in the smoke test).** A worker's first turn is dispatched while `threads.spawn` is still in flight, before the worker row knows its thread id, so the first version proceeded for every spawn. The hook now also holds a thread whose `originPluginId` is this plugin (only workers are spawned by the plugin). `quiet.held` and `quiet.released` events record each hold.
+- Neither setting is part of the oracle hash: toggling them applies with `bb study approve`, without recalibration.
+
+### Surfaces
+
+The Oracle tab has a "Single-machine mode: on/off" section with the reason and what it does; the calibration report, `bb study show` ("Single machine" and the scheduler line's "tests + measurement") and the Overview say the same. Bench hosts on the Overview and Bench tab read "testing c/N (single-machine mode: tests hold the bench)" while a gate holds them; the status line says "testing c/N on the bench"; the Live bench strip shows the gate as the host's current work, marks queued candidates waiting to test ("c/4 tests"), and its feed says "c/4 waits to run its tests on the bench", then "tests started on <host>, holding the bench".
+
+### Commit identity
+
+`[git] identity = "repo" | "plugin"` (default `"repo"`, not part of the oracle hash). The host ops used to force `autoresearch <autoresearch@bb.local>` on every commit they made in the studied repository. Now the snapshot, prepare, reword (promotion) and compose (harvest) ops take an explicit identity. `Pipeline.commitIdentity` resolves it on the edit host with a new `gitIdentity` host op (`git config user.name` / `user.email` in the repo, without the plugin's environment: repo-local, then global), caches it for a minute, and passes it to every commit. No identity configured: the plugin's, a calibration warning, and one `git.identity` notice. Bench hosts never commit; they receive the edit host's commits as bundles, so their clones carry exactly the same author and committer (tested with real git).
+
+### Data model
+
+Append-only migrations: `candidates.gate_seconds`, and an index on `bench_intervals (host_id, ended_at)` for the hook's open-interval lookup. New events: `gate.started`, `gate.finished`, `quiet.held`, `quiet.released`, `git.identity`. New bench interval kind: `gate`.
+
+### Smoke test (BB 0.45, one MacBook, a toy repo under /tmp, a temporary project)
+
+- **Toy.** A Python `toy.run()` (a bubble sort, a list-based unique count, a recursive fib). Metric: wall-clock ms, the best of as many runs as fit in about 1 s (about 16 s per evaluation, noise floor 1.6-3.8% per pair). Gate: the unit tests, then every core burning CPU for 3 s (about 3.2 s). Noisy, `n_min` 4, `n_max` 8; `max_workers = 2`; `max_candidates` 4-5; `single_machine` left at `auto`, `quiet_bench = true`. A repo-local git identity was set in the toy repo.
+- **Three studies.** `toy-sm` (0.25 s measurements, to check the path quickly), `toy-sm2` and `toy-sm3` (16 s measurements). 14 candidates: 12 wins, 2 conflicts.
+- **No overlaps.** Across the three studies, 34 bench intervals on one lock key (3 calibration gates, 3 calibrations, 15 candidate gates, 13 measurements; a re-gate after best moved, the measurement it cut short, and two conflicted candidates' sub-second gates included): a self-join on the lock key finds 0 overlapping pairs, and `bb study show` reports 0 overlapping bench intervals.
+- **FIFO, live.** In `toy-sm`, c/2 was submitted while c/1 was being measured; its gate started 2 ms after the measurement ended. In `toy-sm2`, c/2 arrived during c/1's gate and gated right after it, before c/1's measurement (queued later); after c/1 won, c/2 was re-gated against the new best. In `toy-sm3`, c/2 arrived 0.5 s after c/1 was queued, so c/1's measurement went first and c/2's gate waited 21 s.
+- **Utilization.** `toy-sm`: busy 26.5% of Running time (44.4% since the first submission), 13 s of the 21 s busy were gates. `toy-sm2`: 67.2% (85.0% since the first submission), 16 s of 101 s gates. `toy-sm3`: 60.1% (75.6%), 13 s of 97 s gates. The scheduler line read "eval ≈ 24 s (tests 3.2 s + measurement 21 s, single-machine mode)".
+- **Quiet bench.** `toy-sm2` ran on the first build and held nothing: two workers spawned during measurements started at once (the spawn case above). After the fix, in `toy-sm3` both workers spawned during a measurement were held (17.4 s and 19.0 s) and started within 50 ms of the measurement's end.
+- **Identity.** Every commit on the three `studies/<slug>/best` branches and under `refs/studies/<slug>/c/*` was authored and committed as the toy repo's own identity.
+- **Cleanup.** The studies were archived with their threads, the temporary project and `/tmp` files deleted, and the released plugin reinstalled from GitHub.
+
+### Not done, and known issues
+
+- **Gates run one at a time** in single-machine mode, even though gates don't disturb each other's results. A readers-writer lock (gates share, measurements exclusive) would let several gates run between measurements; one queue is simpler and is what the measurements need.
+- **Quiet bench holds turn starts only.** A worker whose turn is already running (and runs its own tests) keeps competing with the measurement; the health check before each measurement is still the guard for that.
+- **Replay shows today's setting.** The replay bundle carries the current single-machine setting, not the one in force at each moment (gate events are only recorded when it was on, so the bench strip is still right).
+- **A held spawn is attributed by origin.** BB's hook context doesn't carry plugin metadata, so a thread is recognized as a spawning worker by `originPluginId` alone.
 
 ## Credits
 
