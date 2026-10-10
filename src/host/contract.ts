@@ -254,6 +254,15 @@ export const hostContract = defineRpcContract({
     input: z.object({ repoPath: absPath, sha, message: z.string().min(1).max(8192), identity: gitIdentity.optional() }).strict(),
     output: z.object({ sha }).strict(),
   },
+  /**
+   * Hash of the protected paths at `sha` (the oracle hash folds it in): the
+   * whole tree, filtered with the scope check's own glob matcher, as sorted
+   * `mode sha path` lines. `files` is how many entries matched.
+   */
+  protectedHash: {
+    input: z.object({ repoPath: absPath, sha, globs: z.array(z.string().min(1).max(400)).max(64) }).strict(),
+    output: z.object({ hash: z.string(), files: z.number().int() }).strict(),
+  },
   /** The identity git resolves in `repoPath` (`user.name` / `user.email`: repo-local, then global), or nulls when none is configured. */
   gitIdentity: {
     input: z.object({ repoPath: absPath }).strict(),

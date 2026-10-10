@@ -2,6 +2,7 @@
 // fs, and git on PATH. host.ts wires these to RPC handlers; tests and the
 // in-process LocalHostRunner call them directly.
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, platform } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,7 +19,7 @@ import type {
   SnapshotInput,
   SnapshotResult,
 } from "./contract.ts";
-import { ignoreExcludePathspecs, ignoreIncludePathspecs } from "../scope.ts";
+import { ignoreExcludePathspecs, ignoreIncludePathspecs, matchesAny } from "../scope.ts";
 
 /** The plugin's own identity: `[git] identity = "plugin"`, and the fallback when a repo has none. */
 export const PLUGIN_IDENTITY: GitIdentity = { name: "autoresearch", email: "autoresearch@bb.local" };
@@ -29,6 +30,47 @@ export function identityEnv(identity: GitIdentity = PLUGIN_IDENTITY): Record<str
 }
 
 const GIT_IDENTITY: Record<string, string> = identityEnv(PLUGIN_IDENTITY);
+
+/** What the protected-content hash is when the globs match nothing at the baseline (distinct from any real content). */
+export const NO_PROTECTED_FILES = "no-protected-files";
+
+/**
+ * Hash of the protected paths at `sha`. `git ls-tree` doesn't expand `**` or
+ * other wildcards in pathspecs, so list the whole tree and filter it with the
+ * same matcher the scope check uses. Sorted `mode sha path` lines, sha256.
+ */
+export async function protectedHash(repoPath: string, sha: string, globs: readonly string[]): Promise<{ hash: string; files: number }> {
+  if (!globs.length) return { hash: "", files: 0 };
+  const out = await gitRaw(repoPath, ["ls-tree", "-r", "-z", "--full-tree", sha]);
+  const entries: Array<{ path: string; line: string }> = [];
+  for (const entry of out.split("\0")) {
+    if (!entry) continue;
+    const tab = entry.indexOf("\t");
+    if (tab < 0) continue;
+    const [mode, , objectSha] = entry.slice(0, tab).split(" ");
+    const path = entry.slice(tab + 1);
+    if (matchesAny(path, globs)) entries.push({ path, line: `${mode} ${objectSha} ${path}` });
+  }
+  if (!entries.length) return { hash: NO_PROTECTED_FILES, files: 0 };
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { hash: createHash("sha256").update(entries.map((e) => e.line).join("\n")).digest("hex").slice(0, 16), files: entries.length };
+}
+
+/** git with argv and the full stdout, untrimmed (NUL-separated listings). */
+async function gitRaw(cwd: string, args: string[]): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, env: { ...process.env, ...GIT_IDENTITY }, stdio: ["ignore", "pipe", "pipe"] });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout.on("data", (c: Buffer) => out.push(c));
+    child.stderr.on("data", (c: Buffer) => err.push(c));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) reject(new Error(`git ${args.join(" ")} failed (${code}): ${Buffer.concat(err).toString("utf8").slice(-2000)}`));
+      else resolve(Buffer.concat(out).toString("utf8"));
+    });
+  });
+}
 
 /** The identity git resolves in `repoPath` (repo-local config, then global and system), without the plugin's environment. */
 export async function gitIdentityOf(repoPath: string): Promise<{ name: string | null; email: string | null }> {

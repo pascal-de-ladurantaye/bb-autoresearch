@@ -3,7 +3,6 @@
 // the cost of one evaluation per host, recorded as a segment (the segment
 // takes the worst host). Changing the oracle mid-run calibrates again on the
 // current best and starts a new segment.
-import { createHash } from "node:crypto";
 import { BenchTransferError } from "./bench.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, StudyRow } from "./db/store.ts";
@@ -37,10 +36,6 @@ export interface CalibrationReport {
   /** Things the human should know that don't fail calibration (a guardrail too noisy to be judged). */
   warnings: string[];
   finishedAt: number;
-}
-
-function quoteGlob(g: string): string {
-  return `':(glob)${g.replace(/'/gu, "")}'`;
 }
 
 export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: string): Promise<CalibrationReport> {
@@ -81,12 +76,13 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   }
 
   // 2. Oracle hash includes the content of protected paths at the baseline.
-  let protectedHash = "";
-  if (spec.scope.protected.length) {
-    const ls = await runner.exec({ cwd: repo, command: `git ls-tree -r ${baseSha} -- ${spec.scope.protected.map(quoteGlob).join(" ")}`, timeoutMs: 60_000 });
-    protectedHash = createHash("sha256").update(ls.stdout).digest("hex").slice(0, 16);
-  }
-  const hash = oracleHash(spec, protectedHash);
+  // (git ls-tree doesn't expand `**` pathspecs, so the host filters the whole tree with the scope matcher.)
+  const prot = await runner.protectedHash(repo, baseSha, spec.scope.protected);
+  const hash = oracleHash(spec, prot.hash);
+  const protectedWarnings =
+    spec.scope.protected.length && prot.files === 0
+      ? [`[scope] protected (${spec.scope.protected.join(", ")}) matches no files at the baseline: a typo? The benchmark harness, if it lives in the repo, is then neither protected nor part of the oracle hash.`]
+      : [];
   const scopeWarnings = await trackedIgnoredWarning(runner, repo, baseSha, spec.scope.ignore ?? []);
 
   // 3. Gates on the baseline (single-machine mode: holding the edit host's bench lock, like every gate).
@@ -165,7 +161,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length, singleMachine: single.on, quietBench: spec.oracle.quiet_bench, commitIdentity: `${identity.name} <${identity.email}>`, commitIdentitySource: identity.source },
     hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [] })),
     guardrails,
-    warnings: [...guardrailWarnings(guardrails), ...scopeWarnings, ...(identity.source === "fallback" ? [identityText(identity)] : [])],
+    warnings: [...guardrailWarnings(guardrails), ...scopeWarnings, ...protectedWarnings, ...(identity.source === "fallback" ? [identityText(identity)] : [])],
   });
 }
 

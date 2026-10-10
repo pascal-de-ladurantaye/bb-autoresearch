@@ -125,6 +125,8 @@ export interface HostRunner {
   rewordCommit(repoPath: string, sha: string, message: string, identity?: GitIdentity): Promise<string>;
   /** The identity git resolves in `repoPath` on this host (nulls when none is configured). */
   gitIdentity(repoPath: string): Promise<{ name: string | null; email: string | null }>;
+  /** Hash of the protected paths at `sha` (see ops.protectedHash). */
+  protectedHash(repoPath: string, sha: string, globs: readonly string[]): Promise<{ hash: string; files: number }>;
   checkout(repoPath: string, key: string, sha: string): Promise<string>;
   removeCheckouts(repoPath: string, keyPrefix: string): Promise<number>;
   diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number): Promise<DiffSummary>;
@@ -180,6 +182,9 @@ export class BbHostRunner implements HostRunner {
   }
   async gitIdentity(repoPath: string) {
     return await this.client.call("gitIdentity", { repoPath }, this.opts(60_000));
+  }
+  async protectedHash(repoPath: string, sha: string, globs: readonly string[]) {
+    return await this.client.call("protectedHash", { repoPath, sha, globs: [...globs] }, this.opts());
   }
   async checkout(repoPath: string, key: string, sha: string) {
     return (await this.client.call("checkout", { repoPath, key, sha }, this.opts())).path;
@@ -280,6 +285,9 @@ export class LocalHostRunner implements HostRunner {
   }
   gitIdentity(repoPath: string) {
     return ops.gitIdentityOf(repoPath);
+  }
+  protectedHash(repoPath: string, sha: string, globs: readonly string[]) {
+    return ops.protectedHash(repoPath, sha, globs);
   }
   async checkout(repoPath: string, key: string, sha: string) {
     return (await ops.checkout(this.dataDir, repoPath, key, sha)).path;

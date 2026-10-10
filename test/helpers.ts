@@ -335,6 +335,12 @@ export class FakeHost implements HostRunner {
   /** The identity git resolves in the repo on this host (nulls: none configured). */
   repoIdentity: { name: string | null; email: string | null } = { name: "Repo Owner", email: "owner@example.com" };
   gitIdentityCalls = 0;
+  /** Protected-content hash per baseline tree (default: a fixed value with one file). */
+  protectedHashes = new Map<string, { hash: string; files: number }>();
+  async protectedHash(_repo: string, sha: string, globs: readonly string[]) {
+    if (!globs.length) return { hash: "", files: 0 };
+    return this.protectedHashes.get(this.treeOf(sha)) ?? { hash: "fakeprotected", files: 1 };
+  }
   async gitIdentity(_repo: string) {
     this.gitIdentityCalls += 1;
     return { ...this.repoIdentity };

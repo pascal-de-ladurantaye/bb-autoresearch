@@ -25,6 +25,7 @@ export default experimental_defineHostEntry({
     prepareCandidate: async (input) => await ops.prepareCandidate(input),
     rewordCommit: async ({ repoPath, sha, message, identity }) => await ops.rewordCommit(repoPath, sha, message, identity),
     gitIdentity: async ({ repoPath }) => await ops.gitIdentityOf(repoPath),
+    protectedHash: async ({ repoPath, sha, globs }) => await ops.protectedHash(repoPath, sha, globs),
     checkout: async ({ repoPath, key, sha }, ctx) => await ops.checkout(ctx.experimental_paths.dataDir, repoPath, key, sha),
     diffSummary: async ({ repoPath, from, to, maxPatchBytes }) => await ops.diffSummary(repoPath, from, to, maxPatchBytes),
     removeCheckouts: async ({ repoPath, keyPrefix }, ctx) =>
