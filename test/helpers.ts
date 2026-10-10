@@ -332,11 +332,24 @@ export class FakeHost implements HostRunner {
     this.maybeFail("deleteRef");
     return this.refs.delete(ref);
   }
+  /** The identity git resolves in the repo on this host (nulls: none configured). */
+  repoIdentity: { name: string | null; email: string | null } = { name: "Repo Owner", email: "owner@example.com" };
+  gitIdentityCalls = 0;
+  async gitIdentity(_repo: string) {
+    this.gitIdentityCalls += 1;
+    return { ...this.repoIdentity };
+  }
+  /** The identity every commit-making call was given (op name, then "name <email>" or "default"). */
+  commitIdentities: Array<{ op: string; identity: string }> = [];
+  private noteIdentity(op: string, identity: { name: string; email: string } | undefined) {
+    this.commitIdentities.push({ op, identity: identity ? `${identity.name} <${identity.email}>` : "default" });
+  }
   /** Every snapshot call's input. */
   snapshotInputs: SnapshotInput[] = [];
   async snapshot(input: SnapshotInput): Promise<SnapshotResult> {
     this.maybeFail("snapshot");
     this.snapshotInputs.push(input);
+    this.noteIdentity("snapshot", input.identity);
     const next = this.nextSnapshotFor.get(input.worktreePath) ?? this.nextSnapshot;
     this.nextSnapshotFor.delete(input.worktreePath);
     const tree = next.tree ?? fakeSha();
@@ -352,13 +365,15 @@ export class FakeHost implements HostRunner {
   }
   async prepareCandidate(input: PrepareInput): Promise<PrepareResult> {
     this.maybeFail("prepareCandidate");
+    this.noteIdentity("prepareCandidate", input.identity);
     if (this.conflicts.has(input.candidateSha)) return { status: "conflict", paths: ["src/a.ts"], detail: "CONFLICT" };
     const tree = this.treeOf(input.candidateSha);
     const sha = this.commit(tree, input.bestSha, input.message);
     return { status: "ok", sha, tree };
   }
-  async rewordCommit(_repo: string, sha: string, message: string) {
+  async rewordCommit(_repo: string, sha: string, message: string, identity?: { name: string; email: string }) {
     this.maybeFail("rewordCommit");
+    this.noteIdentity("rewordCommit", identity);
     const c = this.commits.get(sha)!;
     return this.commit(c.tree, c.parent, message);
   }

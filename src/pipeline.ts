@@ -30,6 +30,7 @@ import { HostJobLostError, RunAbortedError, type HostRunner } from "./host/runne
 import { BenchError, strategyFor, type Bench, type MeasureOutcome, type RunResult, type Side } from "./noise.ts";
 import { clip, formatDuration, messageText, safeJson, verdictMessage, type AgentMessage } from "./prompts.ts";
 import { checkScope } from "./scope.ts";
+import { identityText, resolveCommitIdentity, type CommitIdentity } from "./identity.ts";
 import { singleMachineMode, type SingleMachineMode } from "./single-machine.ts";
 import { bestBranch, candidateRef, formatPct, type StudySpec } from "./spec.ts";
 import { applyConfirmation, decideVerdict, outcomeEstimates, type VerdictResult } from "./verdict.ts";
@@ -197,6 +198,8 @@ export class Pipeline {
   private exitEpoch = new Map<string, number>();
   /** The expensive class's confirmation runs of a win, kept until promotion (the next baseline). */
   private pendingBaselines = new Map<number, { hostId: string; runs: RunResult[] }>();
+  /** Commit identity per study, resolved on the edit host (see identity.ts), and when. */
+  private identities = new Map<string, { at: number; id: CommitIdentity }>();
   /** Latest progress per bench lock key, for the study page. */
   private progressByKey = new Map<string, { studyId: string; hostId: string; text: string; at: number }>();
 
@@ -204,6 +207,32 @@ export class Pipeline {
     private readonly ctx: Ctx,
     private readonly hooks: PipelineHooks,
   ) {}
+
+  /**
+   * Who the plugin's commits in the study's repository are by: resolved on
+   * the edit host (cached for a minute), passed explicitly to every commit.
+   * A repo without an identity falls back to the plugin's, with one notice.
+   */
+  async commitIdentity(study: StudyRow): Promise<CommitIdentity> {
+    const cached = this.identities.get(study.id);
+    const now = this.ctx.now();
+    if (cached && now - cached.at < 60_000) return cached.id;
+    const id = await resolveCommitIdentity(this.runner(study), study.repo_path!, this.ctx.store.spec(study));
+    this.identities.set(study.id, { at: now, id });
+    const key = `${id.source}:${id.name} <${id.email}>`;
+    const last = this.ctx.store.events(study.id, { kinds: ["git.identity"], limit: 1 })[0];
+    if (!last || !last.data_json.includes(JSON.stringify(key).slice(1, -1))) {
+      this.ctx.store.event(study.id, "git.identity", "plugin", { key, source: id.source });
+      if (id.source === "fallback") void this.hooks.notify(study, "git.identity", `\`${study.slug}\`: ${identityText(id)}`);
+    }
+    return id;
+  }
+
+  /** Forget cached commit identities (spec change, tests). */
+  forgetIdentity(studyId?: string): void {
+    if (studyId) this.identities.delete(studyId);
+    else this.identities.clear();
+  }
 
   /** The edit host: snapshots, prepare, gates, promotion refs. */
   private runner(study: StudyRow): HostRunner {
@@ -259,6 +288,7 @@ export class Pipeline {
       return { ok: false, text: `The study's candidate budget is spent (${spec.budget.max_candidates}). Call study_record_finding with what you learned, then study_finish.` };
     }
     if (!study.best_sha) return { ok: false, text: "Study has no best commit yet." };
+    const identity = await this.commitIdentity(study);
     const n = store.nextCandidateNumber(study.id);
     const firstLine = clip(summary.split("\n")[0] ?? "", 120);
     const snap = await this.runner(study).snapshot({
@@ -268,6 +298,7 @@ export class Pipeline {
       baseSha: worker.fork_sha,
       bestSha: study.best_sha,
       ignore: [...(spec.scope.ignore ?? [])],
+      identity: { name: identity.name, email: identity.email },
     });
     // A worker that rebased onto a newer best forks from there now.
     const forkSha = snap.forkSha ?? worker.fork_sha;
@@ -536,6 +567,7 @@ export class Pipeline {
       forkSha: c.parent_sha,
       candidateSha: c.sha,
       message: `autoresearch c/${c.n}: ${clip(c.summary.split("\n")[0] ?? "", 120)}`,
+      identity: gitId(await this.commitIdentity(study)),
     });
     if (prepared.status === "conflict") {
       const reasons = [`does not apply onto current best ${best.slice(0, 10)}: ${prepared.paths.slice(0, 10).join(", ") || clip(prepared.detail, 300)}`];
@@ -1077,7 +1109,7 @@ export class Pipeline {
       `Autoresearch-Candidate: c/${c.n}`,
       `Autoresearch-Source: ${c.sha}`,
     ].join("\n");
-    const promoted = await runner.rewordCommit(study.repo_path!, c.prepared_sha!, message);
+    const promoted = await runner.rewordCommit(study.repo_path!, c.prepared_sha!, message, gitId(await this.commitIdentity(study)));
     store.updateCandidate(c.id, { promoted_sha: promoted });
     const r = await runner.updateRef(study.repo_path!, branch, promoted, c.against_sha);
     if (!r.ok && r.current !== promoted) {
@@ -1198,6 +1230,11 @@ function withNotice(notice: string | null, text: string | AgentMessage): string 
   return typeof text === "string" ? `${notice}\n\n${text}` : { summary: text.summary, detail: `${notice}\n\n${text.detail}` };
 }
 
+
+/** The name and email of a resolved commit identity (what the host ops take). */
+export function gitId(id: CommitIdentity): { name: string; email: string } {
+  return { name: id.name, email: id.email };
+}
 
 export function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);

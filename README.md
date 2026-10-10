@@ -115,6 +115,20 @@ The Oracle tab, the calibration report and `bb study show` say whether
 single-machine mode is on and why; the Overview, Bench and Live views show
 "testing c/N" on the bench host while a gate holds it.
 
+### Commit identity
+
+The plugin commits in the studied repository: worker snapshots, candidates,
+promotions on `studies/<slug>/best`, and harvest branches. `[git] identity`
+says as whom:
+
+| Value | Commits are authored and committed as |
+|---|---|
+| `"repo"` (default) | The identity git resolves in the repository on the edit host (`user.name` / `user.email`, repo-local then global), so a work repo carries your work identity. With none configured, `autoresearch <autoresearch@bb.local>`, and the calibration report and a notice say so. |
+| `"plugin"` | Always `autoresearch <autoresearch@bb.local>`. |
+
+It's resolved on the edit host and passed explicitly to every commit, so a
+bench host's clone sees exactly the same commits. Not part of the oracle hash.
+
 Every number reads the same everywhere: **better is positive, in the
 metric's own terms** ("74.7% fewer ops (4.0×)", "+74.7%"), with raw values
 next to it. Nothing is pushed before you publish. Every candidate stays under

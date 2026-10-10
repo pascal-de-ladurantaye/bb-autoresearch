@@ -13,6 +13,7 @@ import type {
   DiffSummary,
   ExecInput,
   ExecResult,
+  GitIdentity,
   HealthReport,
   HostContract,
   JobInput,
@@ -121,7 +122,9 @@ export interface HostRunner {
   deleteRef(repoPath: string, ref: string): Promise<boolean>;
   snapshot(input: SnapshotInput): Promise<SnapshotResult>;
   prepareCandidate(input: PrepareInput): Promise<PrepareResult>;
-  rewordCommit(repoPath: string, sha: string, message: string): Promise<string>;
+  rewordCommit(repoPath: string, sha: string, message: string, identity?: GitIdentity): Promise<string>;
+  /** The identity git resolves in `repoPath` on this host (nulls when none is configured). */
+  gitIdentity(repoPath: string): Promise<{ name: string | null; email: string | null }>;
   checkout(repoPath: string, key: string, sha: string): Promise<string>;
   removeCheckouts(repoPath: string, keyPrefix: string): Promise<number>;
   diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number): Promise<DiffSummary>;
@@ -172,8 +175,11 @@ export class BbHostRunner implements HostRunner {
   async prepareCandidate(input: PrepareInput) {
     return await this.client.call("prepareCandidate", input, this.opts());
   }
-  async rewordCommit(repoPath: string, sha: string, message: string) {
-    return (await this.client.call("rewordCommit", { repoPath, sha, message }, this.opts())).sha;
+  async rewordCommit(repoPath: string, sha: string, message: string, identity?: GitIdentity) {
+    return (await this.client.call("rewordCommit", { repoPath, sha, message, ...(identity ? { identity } : {}) }, this.opts())).sha;
+  }
+  async gitIdentity(repoPath: string) {
+    return await this.client.call("gitIdentity", { repoPath }, this.opts(60_000));
   }
   async checkout(repoPath: string, key: string, sha: string) {
     return (await this.client.call("checkout", { repoPath, key, sha }, this.opts())).path;
@@ -269,8 +275,11 @@ export class LocalHostRunner implements HostRunner {
   prepareCandidate(input: PrepareInput) {
     return ops.prepareCandidate(input);
   }
-  async rewordCommit(repoPath: string, sha: string, message: string) {
-    return (await ops.rewordCommit(repoPath, sha, message)).sha;
+  async rewordCommit(repoPath: string, sha: string, message: string, identity?: GitIdentity) {
+    return (await ops.rewordCommit(repoPath, sha, message, identity)).sha;
+  }
+  gitIdentity(repoPath: string) {
+    return ops.gitIdentityOf(repoPath);
   }
   async checkout(repoPath: string, key: string, sha: string) {
     return (await ops.checkout(this.dataDir, repoPath, key, sha)).path;

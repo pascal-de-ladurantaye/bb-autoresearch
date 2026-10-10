@@ -632,6 +632,10 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
         ["Oracle", `build ${spec.oracle.build ? "`" + clip(spec.oracle.build, 80) + "`" : "none"} · gate ${spec.oracle.gate.map((g) => "`" + clip(g, 60) + "`").join(", ") || "none"} · measure \`${clip(spec.oracle.measure, 80)}\`${spec.oracle.holdout ? " · holdout: configured (hidden from agents)" : ""}`],
         ["Segment", segmentLine(engine, s)],
         ["Single machine", singleMachineView(engine, s)?.text ?? "n/a"],
+        ["Commits", (() => {
+          const d = safeJson<{ details?: { commitIdentity?: string; commitIdentitySource?: string } }>(s.calibration_json)?.details;
+          return `[git] identity = "${spec.git.identity}"${d?.commitIdentity ? ` · at calibration: ${d.commitIdentity} (${d.commitIdentitySource === "repo" ? "the repository's identity" : d.commitIdentitySource === "fallback" ? "fallback: the repository has no identity configured" : "the plugin's"})` : ""}`;
+        })()],
         ["Repo", `${s.repo_path} (host ${s.host_id}) · study thread ${s.study_thread_id ?? "none"}`],
         ["Best", `${s.best_sha?.slice(0, 10) ?? "not set"} (branch studies/${s.slug}/best) · base ${s.base_sha?.slice(0, 10) ?? "?"}`],
       ]),

@@ -38,7 +38,8 @@ import {
 import { checkHealth } from "./health.ts";
 import { BenchError, strategyFor } from "./noise.ts";
 import type { GuardrailEstimate } from "./guardrails.ts";
-import { errText, IN_FLIGHT_STAGES, segmentGuardrailCalibration, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
+import { errText, gitId, IN_FLIGHT_STAGES, segmentGuardrailCalibration, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
+import type { ComposeInput, ComposeResult } from "./host/contract.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { DryRunPublisher, type PrDraft } from "./publisher.ts";
 import { prBody, studyReport } from "./report.ts";
@@ -378,6 +379,12 @@ export class Harvester {
     }
   }
 
+  /** composeCommits on the edit host, authored as the study's commit identity (identity.ts). */
+  private async compose(study: StudyRow, input: Omit<ComposeInput, "identity">): Promise<ComposeResult> {
+    const identity = gitId(await this.pipeline.commitIdentity(study));
+    return await this.ctx.bb.hostRunner(study.host_id!).composeCommits({ ...input, identity });
+  }
+
   /** Gates on the edit host for a harvest commit (one retry for flaky gates). */
   private async gates(study: StudyRow, spec: StudySpec, sha: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (!spec.oracle.gate.length) return { ok: true };
@@ -432,7 +439,7 @@ export class Harvester {
     const commits = safeJson<string[]>(cs.commits_json) ?? [];
     const runner = this.ctx.bb.hostRunner(study.host_id!);
     this.detail(h, `#${cs.k}: reverting from best`);
-    const composed = await runner.composeCommits({
+    const composed = await this.compose(study, {
       repoPath: study.repo_path!,
       onto: h.best_sha!,
       steps: [...commits].reverse().map((sha) => ({ sha, revert: true })),
@@ -441,7 +448,7 @@ export class Harvester {
     const nodes = this.nodes(harvestId);
     const me = nodes.find((n) => n.id === cs.id)!;
     const conflictOk = async (steps: Array<{ sha: string; revert: boolean }>) =>
-      (await runner.composeCommits({ repoPath: study.repo_path!, onto: h.best_sha!, steps, message: "autoresearch harvest probe" })).status === "ok";
+      (await this.compose(study, { repoPath: study.repo_path!, onto: h.best_sha!, steps, message: "autoresearch harvest probe" })).status === "ok";
     if (composed.status === "conflict") {
       const dep = await this.revertBlockers(harvestId, cs, laterDependents(me, nodes, composed.paths).ids, conflictOk);
       for (const id of dep.ids) this.addDependency(id, cs.id, `reverting #${cs.k} from best conflicts in ${composed.paths.slice(0, 5).join(", ") || "?"}${dep.exact ? " unless this one is reverted too" : " (not isolated: treated as dependent)"}`);
@@ -450,7 +457,7 @@ export class Harvester {
     }
     this.store.updateChangeset(cs.id, { ablation_sha: composed.sha });
     const gateOk = async (steps: Array<{ sha: string; revert: boolean }>) => {
-      const c = await runner.composeCommits({ repoPath: study.repo_path!, onto: h.best_sha!, steps, message: "autoresearch harvest probe" });
+      const c = await this.compose(study, { repoPath: study.repo_path!, onto: h.best_sha!, steps, message: "autoresearch harvest probe" });
       return c.status === "ok" && (await this.gates(study, spec, c.sha)).ok;
     };
     const gate = await this.gates(study, spec, composed.sha);
@@ -516,7 +523,7 @@ export class Harvester {
         .flatMap((m) => safeJson<string[]>(m.commits_json) ?? [])
         .sort((a, b) => order.get(a)! - order.get(b)!)
         .map((sha) => ({ sha, revert: false }));
-    const ok = async (steps: Array<{ sha: string; revert: boolean }>) => (await runner.composeCommits({ repoPath: study.repo_path!, onto: h.base_sha!, steps, message: "autoresearch harvest probe" })).status === "ok";
+    const ok = async (steps: Array<{ sha: string; revert: boolean }>) => (await this.compose(study, { repoPath: study.repo_path!, onto: h.base_sha!, steps, message: "autoresearch harvest probe" })).status === "ok";
     const mine = picks([s]);
     if (!(await ok([...picks(earlier), ...mine]))) return { ids: earlier.map((c) => c.id), exact: false };
     const needed: number[] = [];
@@ -577,7 +584,7 @@ export class Harvester {
       const order = new Map((safeJson<Promotion[]>(h.promotions_json) ?? []).map((p, i) => [p.sha, i] as const));
       commits.sort((a, b) => order.get(b)! - order.get(a)!);
       this.detail(h, `stack ${rec.stack}: reverting ${members.length} changesets together`);
-      const composed = await this.ctx.bb.hostRunner(study.host_id!).composeCommits({
+      const composed = await this.compose(study, {
         repoPath: study.repo_path!,
         onto: h.best_sha!,
         steps: commits.map((sha) => ({ sha, revert: true })),
@@ -616,7 +623,7 @@ export class Harvester {
         }
         const commits = safeJson<string[]>(cs.commits_json) ?? [];
         this.detail(h, `#${cs.k}: applying on ${cs.pr_base === "base" ? "the base" : cs.pr_base}`);
-        const composed = await runner.composeCommits({ repoPath: study.repo_path!, onto: baseSha, steps: commits.map((sha) => ({ sha, revert: false })), message: commitMessage(study, h, cs) });
+        const composed = await this.compose(study, { repoPath: study.repo_path!, onto: baseSha, steps: commits.map((sha) => ({ sha, revert: false })), message: commitMessage(study, h, cs) });
         if (composed.status === "conflict") {
           if (cs.pr_base === "base" || cs.stack === null) {
             const nodes = this.nodes(harvestId);

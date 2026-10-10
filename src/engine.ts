@@ -249,6 +249,8 @@ export class Engine {
       this.store.updateStudy(study.id, { spec_version: pending, pending_spec_version: null });
       this.store.event(study.id, "spec.applied", actor, { version: pending, from: study.spec_version, recalibrated: false });
     });
+    // [git] identity may have changed (not part of the oracle hash).
+    this.pipeline.forgetIdentity(study.id);
     this.publish(study.id);
     this.kick();
     return `${slug}: spec v${pending} applied (oracle unchanged, segment ${study.segment} continues).`;

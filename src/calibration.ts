@@ -13,6 +13,7 @@ import { parseMeasureOutput } from "./metrics.ts";
 import { strategyFor, BenchError, type CalibrationOutcome } from "./noise.ts";
 import { studySingleMachine, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
 import { singleMachineText } from "./single-machine.ts";
+import { identityText } from "./identity.ts";
 import { clip } from "./prompts.ts";
 import { ignoreIncludePathspecs } from "./scope.ts";
 import type { HostRunner } from "./host/runner.ts";
@@ -106,6 +107,9 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   }
   const gateSeconds = (ctx.now() - gateStarted) / 1000;
   const single = studySingleMachine(store, study, spec);
+  // Who the plugin's commits in the repo are by, read fresh on the edit host.
+  pipeline.forgetIdentity(study.id);
+  const identity = await pipeline.commitIdentity(study);
 
   // 4. A/A measurement on two checkouts of the baseline on every bench host, each holding its own lock.
   const strategy = strategyFor(spec.oracle.noise);
@@ -144,6 +148,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
       ? ` Gates take ${gateSeconds.toFixed(1)} s on the edit host, holding the bench, so each candidate occupies the bench about ${(evalSeconds + gateSeconds).toFixed(1)} s.`
       : ` Gates take ${gateSeconds.toFixed(1)} s on the edit host.`
     : "";
+  const identityLine = ` ${identityText(identity)}`;
   const singleLine = single.on || spec.oracle.quiet_bench ? ` ${singleMachineText(single, spec, hosts.find((h) => h.host_id === study.host_id)?.name ?? null)}` : "";
   const hostLines = ok.length > 1 ? ` Per host: ${ok.map((r) => `${r.h.name} MDE ${(r.outcome.mde * 100).toFixed(2)}%`).join(", ")}.` : "";
   const holdoutLine = spec.oracle.holdout ? " Holdout runs on every bench host." : "";
@@ -156,11 +161,11 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     noiseFloor,
     mde,
     evalSeconds,
-    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine + singleLine,
-    details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length, singleMachine: single.on, quietBench: spec.oracle.quiet_bench },
+    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine + singleLine + identityLine,
+    details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length, singleMachine: single.on, quietBench: spec.oracle.quiet_bench, commitIdentity: `${identity.name} <${identity.email}>`, commitIdentitySource: identity.source },
     hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [] })),
     guardrails,
-    warnings: [...guardrailWarnings(guardrails), ...scopeWarnings],
+    warnings: [...guardrailWarnings(guardrails), ...scopeWarnings, ...(identity.source === "fallback" ? [identityText(identity)] : [])],
   });
 }
 

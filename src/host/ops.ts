@@ -10,6 +10,7 @@ import type {
   ComposeInput,
   ComposeResult,
   DiffSummary,
+  GitIdentity,
   ExecInput,
   ExecResult,
   PrepareInput,
@@ -19,12 +20,32 @@ import type {
 } from "./contract.ts";
 import { ignoreExcludePathspecs, ignoreIncludePathspecs } from "../scope.ts";
 
-const GIT_IDENTITY: Record<string, string> = {
-  GIT_AUTHOR_NAME: "autoresearch",
-  GIT_AUTHOR_EMAIL: "autoresearch@bb.local",
-  GIT_COMMITTER_NAME: "autoresearch",
-  GIT_COMMITTER_EMAIL: "autoresearch@bb.local",
-};
+/** The plugin's own identity: `[git] identity = "plugin"`, and the fallback when a repo has none. */
+export const PLUGIN_IDENTITY: GitIdentity = { name: "autoresearch", email: "autoresearch@bb.local" };
+
+/** Author and committer environment for a commit. */
+export function identityEnv(identity: GitIdentity = PLUGIN_IDENTITY): Record<string, string> {
+  return { GIT_AUTHOR_NAME: identity.name, GIT_AUTHOR_EMAIL: identity.email, GIT_COMMITTER_NAME: identity.name, GIT_COMMITTER_EMAIL: identity.email };
+}
+
+const GIT_IDENTITY: Record<string, string> = identityEnv(PLUGIN_IDENTITY);
+
+/** The identity git resolves in `repoPath` (repo-local config, then global and system), without the plugin's environment. */
+export async function gitIdentityOf(repoPath: string): Promise<{ name: string | null; email: string | null }> {
+  const read = async (key: string) => {
+    const r = await new Promise<{ code: number; out: string }>((resolve, reject) => {
+      const env = { ...process.env };
+      for (const k of Object.keys(GIT_IDENTITY)) delete env[k];
+      const child = spawn("git", ["config", "--get", key], { cwd: repoPath, env, stdio: ["ignore", "pipe", "ignore"] });
+      const out: Buffer[] = [];
+      child.stdout.on("data", (c: Buffer) => out.push(c));
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code: code ?? -1, out: Buffer.concat(out).toString("utf8").trim() }));
+    });
+    return r.code === 0 && r.out && !/[<>\n]/u.test(r.out) ? r.out.slice(0, 200) : null;
+  };
+  return { name: await read("user.name"), email: await read("user.email") };
+}
 
 class Tail {
   private chunks: Buffer[] = [];
@@ -189,7 +210,7 @@ export async function snapshot(input: SnapshotInput): Promise<SnapshotResult> {
   const staged = await git(cwd, ["diff", "--cached", "--quiet"], { allowFail: true });
   let committed = false;
   if (staged.code === 1) {
-    await git(cwd, ["commit", "--no-verify", "--no-gpg-sign", "-q", "-m", input.message]);
+    await git(cwd, ["commit", "--no-verify", "--no-gpg-sign", "-q", "-m", input.message], { env: identityEnv(input.identity) });
     committed = true;
   }
   const sha = (await git(cwd, ["rev-parse", "HEAD"])).stdout;
@@ -240,17 +261,17 @@ export async function prepareCandidate(input: PrepareInput): Promise<PrepareResu
     if (r.code !== 0 || !lines[0]) throw new Error(`git merge-tree failed (${r.code}): ${r.stderr.slice(-2000)}`);
     tree = lines[0];
   }
-  const sha = (await git(repoPath, ["commit-tree", tree, "-p", input.bestSha, "-m", input.message])).stdout;
+  const sha = (await git(repoPath, ["commit-tree", tree, "-p", input.bestSha, "-m", input.message], { env: identityEnv(input.identity) })).stdout;
   return { status: "ok", sha, tree };
 }
 
-export async function rewordCommit(repoPath: string, sha: string, message: string): Promise<{ sha: string }> {
+export async function rewordCommit(repoPath: string, sha: string, message: string, identity?: GitIdentity): Promise<{ sha: string }> {
   const tree = (await git(repoPath, ["rev-parse", `${sha}^{tree}`])).stdout;
   const parents = (await git(repoPath, ["rev-list", "--parents", "-n", "1", sha])).stdout.split(" ").slice(1);
   const args = ["commit-tree", tree];
   for (const p of parents) args.push("-p", p);
   args.push("-m", message);
-  return { sha: (await git(repoPath, args)).stdout };
+  return { sha: (await git(repoPath, args, { env: identityEnv(identity) })).stdout };
 }
 
 export async function diffSummary(repoPath: string, from: string, to: string, maxPatchBytes: number): Promise<DiffSummary> {
@@ -336,9 +357,9 @@ export async function composeCommits(input: ComposeInput): Promise<ComposeResult
     if (r.code === 1) return { status: "conflict", at: step.sha, revert: step.revert, paths: lines.slice(1, 200), detail: r.stderr.slice(-2000) };
     if (r.code !== 0 || !lines[0]) throw new Error(`git merge-tree failed (${r.code}): ${r.stderr.slice(-2000)}`);
     tree = lines[0];
-    current = (await git(repoPath, ["commit-tree", tree, "-p", current, "-m", "autoresearch harvest step"])).stdout;
+    current = (await git(repoPath, ["commit-tree", tree, "-p", current, "-m", "autoresearch harvest step"], { env: identityEnv(input.identity) })).stdout;
   }
-  const sha = (await git(repoPath, ["commit-tree", tree, "-p", input.onto, "-m", input.message])).stdout;
+  const sha = (await git(repoPath, ["commit-tree", tree, "-p", input.onto, "-m", input.message], { env: identityEnv(input.identity) })).stdout;
   return { status: "ok", sha, tree };
 }
 

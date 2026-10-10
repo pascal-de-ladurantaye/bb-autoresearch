@@ -23,7 +23,8 @@ export default experimental_defineHostEntry({
     deleteRef: async ({ repoPath, ref }) => await ops.deleteRef(repoPath, ref),
     snapshot: async (input) => await ops.snapshot(input),
     prepareCandidate: async (input) => await ops.prepareCandidate(input),
-    rewordCommit: async ({ repoPath, sha, message }) => await ops.rewordCommit(repoPath, sha, message),
+    rewordCommit: async ({ repoPath, sha, message, identity }) => await ops.rewordCommit(repoPath, sha, message, identity),
+    gitIdentity: async ({ repoPath }) => await ops.gitIdentityOf(repoPath),
     checkout: async ({ repoPath, key, sha }, ctx) => await ops.checkout(ctx.experimental_paths.dataDir, repoPath, key, sha),
     diffSummary: async ({ repoPath, from, to, maxPatchBytes }) => await ops.diffSummary(repoPath, from, to, maxPatchBytes),
     removeCheckouts: async ({ repoPath, keyPrefix }, ctx) =>

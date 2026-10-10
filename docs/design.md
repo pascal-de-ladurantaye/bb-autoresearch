@@ -256,6 +256,9 @@ deadline = "2026-10-16"
 strategist = { provider = "claude-code" }
 worker = { provider = "codex" }
 max_submissions_per_worker = 3
+
+[git]
+identity = "repo"               # repo | plugin: who the plugin's commits in the repo are by
 ```
 
 `measure` prints `METRIC name=value` lines, plus optional `DIAG` lines (phase timings, profile summaries) that are passed to agents as diagnostics.
@@ -405,6 +408,7 @@ The tool set depends on the role. `bb.agents.configure` selects tools from the t
 - Workers' managed worktrees share the project's object store on the edit host, so candidates are visible locally without pushing.
 - A remote bench host keeps its own clone of the project. Candidates reach it as a `git bundle` covering `best..candidate`, sent through host RPC. That's small for typical diffs and well under the 32 MiB input limit.
 - **Nothing is pushed to origin before harvest.**
+- **Commit identity.** The plugin's commits in the repository (worker snapshots, prepared candidates, promotions, harvest commits) are authored and committed as `[git] identity` says. `"repo"` (the default) is the identity git resolves in the repository on the edit host (`user.name` and `user.email`, repo-local config first, then global), so a work repo carries the user's work identity; with none configured the plugin falls back to `autoresearch <autoresearch@bb.local>` and says so in the calibration report and a notice. `"plugin"` always uses that identity. The server resolves it on the edit host and passes it explicitly to every commit, so bench clones, which only receive commits as bundles, see exactly the edit host's commits. It isn't part of the oracle hash.
 
 ## Harvest
 

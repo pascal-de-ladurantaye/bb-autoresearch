@@ -259,6 +259,19 @@ export const specSchema = z
       })
       .strict()
       .prefault({}),
+    /** Commits the plugin makes in the studied repository (not part of the oracle hash). */
+    git: z
+      .object({
+        /**
+         * "repo": author and commit as the identity git resolves in the repo
+         * (user.name / user.email, repo-local then global), falling back to the
+         * plugin's when none is configured. "plugin": always
+         * `autoresearch <autoresearch@bb.local>`.
+         */
+        identity: z.enum(["repo", "plugin"]).default("repo"),
+      })
+      .strict()
+      .prefault({}),
     /** Harvest: grouping, ablation and PR drafting (not part of the oracle hash). */
     harvest: z
       .object({
@@ -351,7 +364,8 @@ export function normalizeSpec(spec: StudySpec): StudySpec {
   const guardrail = (spec.guardrail ?? []).map((g) => ({ ...g, direction: g.direction ?? "lower", max_total_regression: g.max_total_regression ?? g.max_regression }));
   const scope = { ...spec.scope, ignore: spec.scope.ignore ?? [...DEFAULT_IGNORE] };
   const oracle = { ...spec.oracle, single_machine: spec.oracle.single_machine ?? "auto", quiet_bench: spec.oracle.quiet_bench ?? false };
-  return { ...spec, guardrail, scope, oracle };
+  const git = { ...(spec.git ?? {}), identity: spec.git?.identity ?? "repo" };
+  return { ...spec, guardrail, scope, oracle, git };
 }
 
 function canonical(value: unknown): string {

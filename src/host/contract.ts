@@ -8,6 +8,18 @@ import { z } from "zod";
 
 const absPath = z.string().min(1).refine((p) => p.startsWith("/"), "must be an absolute path");
 const sha = z.string().regex(/^[0-9a-f]{7,64}$/u, "must be a git sha");
+/**
+ * Who a commit the plugin makes is authored and committed by. The server
+ * resolves it once on the edit host (the repo's own git identity, or the
+ * plugin's) and passes it explicitly, so every host that commits uses the same one.
+ */
+export const gitIdentity = z
+  .object({
+    name: z.string().min(1).max(200).refine((v) => !/[<>\n]/u.test(v), "no angle brackets or newlines"),
+    email: z.string().min(1).max(200).refine((v) => !/[<>\n]/u.test(v), "no angle brackets or newlines"),
+  })
+  .strict();
+export type GitIdentity = z.infer<typeof gitIdentity>;
 const ref = z.string().min(1).max(512);
 const key = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,120}$/u);
 const bundleId = z.string().regex(/^[a-f0-9]{16,64}$/u);
@@ -80,6 +92,8 @@ export const snapshotInput = z
      * them are never committed. Changes to tracked files always are.
      */
     ignore: z.array(z.string().min(1).max(200)).max(64).optional(),
+    /** Author and committer of the snapshot commit (default: the plugin's identity). */
+    identity: gitIdentity.optional(),
   })
   .strict();
 export const snapshotOutput = z
@@ -107,6 +121,7 @@ export const prepareInput = z
     forkSha: sha,
     candidateSha: sha,
     message: z.string().min(1).max(8192),
+    identity: gitIdentity.optional(),
   })
   .strict();
 export const prepareOutput = z.discriminatedUnion("status", [
@@ -195,6 +210,7 @@ export const composeInput = z
     /** Applied in order: a pick replays `sha`'s change, a revert undoes it. */
     steps: z.array(z.object({ sha, revert: z.boolean() }).strict()).min(1).max(500),
     message: z.string().min(1).max(16_384),
+    identity: gitIdentity.optional(),
   })
   .strict();
 export const composeOutput = z.discriminatedUnion("status", [
@@ -235,8 +251,13 @@ export const hostContract = defineRpcContract({
   prepareCandidate: { input: prepareInput, output: prepareOutput },
   /** Re-message a commit (same tree, same parents). Used for the promotion commit message. */
   rewordCommit: {
-    input: z.object({ repoPath: absPath, sha, message: z.string().min(1).max(8192) }).strict(),
+    input: z.object({ repoPath: absPath, sha, message: z.string().min(1).max(8192), identity: gitIdentity.optional() }).strict(),
     output: z.object({ sha }).strict(),
+  },
+  /** The identity git resolves in `repoPath` (`user.name` / `user.email`: repo-local, then global), or nulls when none is configured. */
+  gitIdentity: {
+    input: z.object({ repoPath: absPath }).strict(),
+    output: z.object({ name: z.string().nullable(), email: z.string().nullable() }).strict(),
   },
   /** Check out `sha` into a plugin-owned detached worktree keyed by `key`; returns its path. */
   checkout: {

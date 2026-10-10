@@ -119,6 +119,9 @@ usage_tight_percent = 90         # a provider window at this % halves W
 measure_standalone = true        # also measure each PR's effect on its base (bench time)
 group_timeout_minutes = 10       # wait this long for study_propose_harvest, then one changeset per win
 remote = "origin"                # the GitHub remote `--publish` pushes to
+
+[git]
+identity = "repo"                # optional: "repo" commits as the repo's git identity (falls back to the plugin's); "plugin" as autoresearch <autoresearch@bb.local>
 ```
 
 The plugin commits each worker's worktree for it (`git add`), so a repo without a complete `.gitignore` would otherwise get build outputs committed into candidates, where they conflict. `[scope] ignore` lists them, gitignore-style: a pattern without a slash matches at any depth (`*.pyc`, `__pycache__/`), one with a slash is anchored at the repo root (`/out/`), and a trailing slash means a directory. Untracked files matching it are never committed; changes to tracked files always are; a candidate that adds a matching file anyway (the worker committed it itself) is rejected with instructions. If the repo keeps sources in a directory the defaults name (a `build/` of scripts, say), set `ignore` without that pattern; calibration warns when the base tracks files that match.
