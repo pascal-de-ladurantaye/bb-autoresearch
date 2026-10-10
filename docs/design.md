@@ -3,9 +3,9 @@ eyebrow: BB plugin design
 title: Autoresearch for BB
 subtitle: A BB plugin for long-running, measured code-optimization studies. Short-lived agent workers propose changes in parallel. The plugin owns the loop, the measurements, and every keep or discard decision.
 brand: AR
-brandLabel: autoresearch
+brandLabel: bb-autoresearch
 brandSublabel: BB plugin design
-pills: Draft | M0-M3 built | Guardrails and pre-release fixes | Exit criteria partly validated
+pills: v0.1.0 | M0-M3 built | Toy-validated | Exit criteria partly validated
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -27,6 +27,8 @@ All four milestones are built (BB 0.45, plugin SDK 0.6.14). Each was smoke-teste
 After M3, a dedicated human interface pass reworked the Studies page, the study thread messages, notices and the CLI around one way of expressing improvement, and moved approval and publishing into the app (see "Implementation notes: human interface").
 
 The last pass before release closed two guardrail gaps and three usability issues (see "Implementation notes: guardrails and pre-release fixes"). Guardrails now have a cumulative limit against the segment base next to the per-step one, and both are judged on a confidence interval like the primary metric. In simulation that cut false rejections of real wins by a noisy guardrail from 13.3% to 0.0%, with real regressions still rejected. Worker snapshots no longer commit build outputs (`[scope] ignore`), the new-study composer opens on the current project, and archiving a study can archive its study thread too.
+
+Released as `bb-autoresearch` v0.1.0 (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch.
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
@@ -804,7 +806,7 @@ What M2 added, and every place it differs from the design or from M1. Same platf
   - Any other entry is a BB machine name or host id, resolved against `bb.sdk.hosts.list()` when `study_propose` runs. Unknown or ambiguous names are spec errors that list the known machines. That machine gets **clone mode**, even when it is the server's own machine: this is how the live smoke test took the full remote path.
   - The resolved list is stored per spec version (`spec_versions.bench_json`) and becomes the study's `bench_hosts` rows when that version is approved.
 - **Edit host.** Workers, snapshots, gates, and promotion refs stay on the server's machine. Remote edit hosts aren't built.
-- **Bench clone.** Each clone-mode host keeps a bare clone per study at `<dataDir>/bench/<slug>/repo.git`, where `dataDir` is the host entry's `experimental_paths.dataDir` (on the test machine, `~/.bb/plugins/autoresearch/host-data/`). Measurement checkouts are worktrees of that clone, `<dataDir>/checkouts/<slug>-bench-{best,cand,drift,profile}`. Every received commit is pinned as `refs/bench/s/<sha>`, and `gc.auto` is off. `bb study archive` cancels the study's jobs, removes the checkouts, and deletes the clone.
+- **Bench clone.** Each clone-mode host keeps a bare clone per study at `<dataDir>/bench/<slug>/repo.git`, where `dataDir` is the host entry's `experimental_paths.dataDir` (on the test machine, `~/.bb/plugins/bb-autoresearch/host-data/`). Measurement checkouts are worktrees of that clone, `<dataDir>/checkouts/<slug>-bench-{best,cand,drift,profile}`. Every received commit is pinned as `refs/bench/s/<sha>`, and `gc.auto` is off. `bb study archive` cancels the study's jobs, removes the checkouts, and deletes the clone.
 - **Per-study clone (decision).** A clone per project would save bootstrap transfers across studies, but a per-study clone can be deleted safely when the study is archived.
 
 ### Transfer
@@ -969,7 +971,7 @@ New events: `bench.transfer`, `bench.unhealthy`, `bench.healthy`, `bench.offline
   - A holdout script outside the repo (a different interval), and the guardrail `precision_digits` (higher is better, 5%).
   - `max_workers = 2`, `max_candidates = 5`, `drift.every = 2`.
 - **Spec v2, no oracle change.** Spec v1 asked for worker permission mode `auto`, which the default provider (pi) refuses. The study thread proposed spec v2 without it, `bb study approve` applied it without recalibration, and `bb study resume` continued.
-- **Bundles.** All bundles went to the bench-owned clone `~/.bb/plugins/autoresearch/host-data/bench/toy-m2/repo.git`, a bare repository with no alternates, outside `/tmp/ar-m2-toy`, with checkouts as its own worktrees. Each bundle was one chunk and took about 0.4–0.5 s.
+- **Bundles.** All bundles went to the bench-owned clone `~/.bb/plugins/bb-autoresearch/host-data/bench/toy-m2/repo.git`, a bare repository with no alternates, outside `/tmp/ar-m2-toy`, with checkouts as its own worktrees. Each bundle was one chunk and took about 0.4–0.5 s.
 
   | Bundle | Size |
   |---|---|

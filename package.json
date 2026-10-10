@@ -1,10 +1,11 @@
 {
-  "name": "bb-plugin-autoresearch",
+  "name": "bb-autoresearch",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
   "description": "Long-running, measured code-optimization studies: short-lived agent workers propose changes, the plugin measures every candidate and decides what to keep.",
   "license": "MIT",
+  "author": "Pascal de Ladurantaye <pascal.de.ladurantaye@gmail.com>",
+  "homepage": "https://github.com/pascal-de-ladurantaye/bb-autoresearch",
   "keywords": [
     "bb-plugin"
   ],

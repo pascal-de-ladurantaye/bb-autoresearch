@@ -145,6 +145,9 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
             : [],
       }));
     },
+    pluginId() {
+      return bb.pluginId;
+    },
     appUrl() {
       return bb.server.experimental_appUrl ?? null;
     },

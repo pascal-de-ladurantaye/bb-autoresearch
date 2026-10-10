@@ -101,7 +101,7 @@ function linkedFindings(ctx: Ctx, study: StudyRow, cs: ChangesetRow): string[] {
 function studyLink(ctx: Ctx, study: StudyRow, tab = "harvest"): string {
   const url = ctx.bb.appUrl();
   const path = `studies/${study.slug}/${tab}`;
-  return url ? `${url.replace(/\/$/u, "")}/plugins/autoresearch/${path}` : `BB Studies page \`${path}\``;
+  return url ? `${url.replace(/\/$/u, "")}/plugins/${ctx.bb.pluginId()}/${path}` : `BB Studies page \`${path}\``;
 }
 
 /** PR body for one changeset: what and why, measured contribution, standalone effect, findings, study link. */

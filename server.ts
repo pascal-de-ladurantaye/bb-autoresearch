@@ -1,4 +1,4 @@
-// bb-plugin-autoresearch — server entry. Wiring only; behavior lives in src/.
+// bb-autoresearch — server entry. Wiring only; behavior lives in src/.
 //
 // Order matters for reconciliation: register every handler (tools, CLI,
 // events, rpc) first, then reconcile running studies from the background service

@@ -34,7 +34,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     host.refs.set("main", base);
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1 })(fake.bb);
     harness = fake.harness;
   });

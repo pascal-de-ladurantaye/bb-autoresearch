@@ -1,5 +1,5 @@
 // The "Studies" nav panel: a list of studies at the root, and a study page
-// at /plugins/autoresearch/studies/<slug>[/<tab>[/<candidate>]].
+// at /plugins/bb-autoresearch/studies/<slug>[/<tab>[/<candidate>]].
 //
 // Information hierarchy: the header says the state and what the study is
 // doing now; "Needs you" comes first on the Overview; then best vs base,

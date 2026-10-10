@@ -508,6 +508,9 @@ export class FakePort implements BbPort {
     this.usageCalls += 1;
     return this.usage;
   }
+  pluginId() {
+    return "bb-autoresearch";
+  }
   appUrl() {
     return null;
   }

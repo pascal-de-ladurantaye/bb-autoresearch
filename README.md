@@ -1,4 +1,4 @@
-# bb-plugin-autoresearch
+# bb-autoresearch
 
 A BB plugin for long-running, measured code-optimization studies. Short-lived
 agent workers propose changes in parallel; the plugin owns the loop, the
@@ -13,10 +13,17 @@ sections record how the code works and every deviation from the design.
 ## Install
 
 ```sh
+bb plugin install https://github.com/pascal-de-ladurantaye/bb-autoresearch
+```
+
+The plugin id is `bb-autoresearch`; it shows up in BB as **Autoresearch**.
+To install from a checkout instead:
+
+```sh
 pnpm install
 bb plugin build
-bb plugin install . --yes      # from this checkout
-bb plugin enable autoresearch
+bb plugin install . --yes
+bb plugin enable bb-autoresearch
 ```
 
 Requires BB ≥ 0.45, git ≥ 2.38 on every machine a study uses (for
@@ -156,8 +163,12 @@ the threat model in the design).
 pnpm test          # vitest: backend, real-git host and harvest tests, rpc, jsdom frontend
 pnpm typecheck     # tsc --noEmit
 bb plugin build
-bb plugin install . --yes && bb plugin reload autoresearch
+bb plugin install . --yes && bb plugin reload bb-autoresearch
 ```
 
 Tests never depend on the machine's load: real-git tests use `localRunner()`
 (test/helpers.ts), which injects fixed health readings.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

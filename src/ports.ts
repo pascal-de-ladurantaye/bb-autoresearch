@@ -83,6 +83,8 @@ export interface BbPort {
   threadTokens(threadId: string): Promise<number | null>;
   /** Provider usage windows; empty when BB can't say. */
   usageLimits(providerId?: string): Promise<ProviderUsage[]>;
+  /** This plugin's id (the package name minus `bb-plugin-`), used in app links. */
+  pluginId(): string;
   /** The configured public app URL (for links in PR bodies and reports), if any. */
   appUrl(): string | null;
   log(level: "info" | "warn" | "error", message: string): void;
