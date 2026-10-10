@@ -481,7 +481,7 @@ export async function candidateDetail(engine: Engine, s: StudyRow, n: number) {
 export function threadBadge(
   engine: Engine,
   threadId: string,
-): { kind: "study" | "worker"; slug: string; text: string; tone: "running" | "paused" | "idle" | "attention"; needsYou: number; label: string } | null {
+): { kind: "study" | "worker"; slug: string; state: string; text: string; tone: "running" | "paused" | "idle" | "attention"; needsYou: number; label: string } | null {
   const { store } = engine.ctx;
   const row = store.threadById(threadId);
   if (!row) return null;
@@ -498,14 +498,14 @@ export function threadBadge(
       needs.length ? `needs you: ${needs[0]!.short}${needs.length > 1 ? ` +${needs.length - 1}` : ""}` : null,
     ].filter(Boolean);
     const text = parts.join(" · ");
-    return { kind: "study", slug: s.slug, tone, text, needsYou: needs.length, label: `Study ${s.slug}: ${text}` };
+    return { kind: "study", slug: s.slug, state: s.state, tone, text, needsYou: needs.length, label: `Study ${s.slug}: ${text}` };
   }
   const spec = specOf(engine, s);
   const phase = workerPhase(engine, s, threadId);
   const where =
     phase.phase === "queued" && phase.position !== null ? `queued ${ordinal(phase.position)}` : phase.phase === "thinking" ? (row.state === "active" ? "working" : row.state) : phase.phase;
   const text = `${s.slug} · idea #${row.idea_id ?? "?"} · submission ${row.submissions}/${spec?.agents.max_submissions_per_worker ?? "?"} · ${where}`;
-  return { kind: "worker", slug: s.slug, tone: s.state === "running" ? "running" : s.state === "paused" ? "paused" : "idle", text, needsYou: 0, label: `Worker for study ${text}` };
+  return { kind: "worker", slug: s.slug, state: s.state, tone: s.state === "running" ? "running" : s.state === "paused" ? "paused" : "idle", text, needsYou: 0, label: `Worker for study ${text}` };
 }
 
 function ordinal(n: number): string {

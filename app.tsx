@@ -1,5 +1,6 @@
-// Autoresearch frontend: the Studies nav panel (study list and study page)
-// and the thread-header badge for study and worker threads.
+// Autoresearch frontend: the Studies nav panel (study list and study page),
+// the thread-header badge for study and worker threads, and the Live panel
+// in a thread's right split pane.
 //
 // Compiled by `bb plugin build` into dist/app.js + dist/app.css. React and
 // @get-bb/plugin-sdk/app are provided by the BB app at load time (never
@@ -7,6 +8,8 @@
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import { StudiesAccessory, StudiesPanel } from "./src/app/StudiesPage.tsx";
 import { ThreadBadge } from "./src/app/ThreadBadge.tsx";
+import { LivePanel } from "./src/app/live/LivePanel.tsx";
+import { LIVE_PANEL_ACTION } from "./src/app/live/openBeside.ts";
 
 /** The plugin's flask glyph (same shape as assets/flask.svg). */
 function FlaskIcon({ className }: { className?: string }) {
@@ -34,5 +37,13 @@ export default definePluginApp((app) => {
     id: "study-badge",
     title: "Autoresearch study",
     component: ThreadBadge,
+  });
+  // The Live view beside a study thread (or a worker thread): the panel resolves its study from the thread.
+  app.slots.threadPanelAction({
+    id: LIVE_PANEL_ACTION,
+    title: "Study live view",
+    icon: "autoresearch-flask",
+    layout: "flush",
+    component: LivePanel,
   });
 });

@@ -21,17 +21,17 @@ export type WorkerPhase = (typeof WORKER_PHASES)[number];
 /** What the agent is doing, from its thread's tool items. */
 export type Activity = "reading" | "editing" | "testing";
 
-/** Words and glyphs for each phase: state is always in words and shapes, never color alone. */
+/** Words and glyphs (BB icon names) for each phase: state is always in words and shapes, never color alone. */
 export const PHASE_INFO: Record<WorkerPhase, { label: string; icon: string; step: number }> = {
-  starting: { label: "starting", icon: "Loader", step: 0 },
-  reading: { label: "reading the code", icon: "BookOpen", step: 1 },
-  editing: { label: "editing", icon: "Pencil", step: 2 },
-  testing: { label: "testing locally", icon: "FlaskConical", step: 3 },
-  waiting: { label: "waiting for the bench", icon: "Hourglass", step: 4 },
-  measuring: { label: "being measured", icon: "Gauge", step: 5 },
+  starting: { label: "starting", icon: "Clock", step: 0 },
+  reading: { label: "reading the code", icon: "Eye", step: 1 },
+  editing: { label: "editing", icon: "Edit", step: 2 },
+  testing: { label: "testing locally", icon: "Beaker", step: 3 },
+  waiting: { label: "waiting for the bench", icon: "TimeSchedule", step: 4 },
+  measuring: { label: "being measured", icon: "ChartColumn", step: 5 },
   verdict: { label: "verdict received", icon: "Mail", step: 6 },
-  refining: { label: "refining", icon: "RefreshCw", step: 2 },
-  finishing: { label: "finishing", icon: "Flag", step: 7 },
+  refining: { label: "refining", icon: "Repeat", step: 2 },
+  finishing: { label: "finishing", icon: "Sent", step: 7 },
   done: { label: "done", icon: "Check", step: 8 },
 };
 
@@ -135,12 +135,12 @@ export const COLUMNS = ["submitted", "gates", "queue", "bench", "verdict", "prom
 export type Column = (typeof COLUMNS)[number];
 
 export const COLUMN_INFO: Record<Column, { label: string; icon: string }> = {
-  submitted: { label: "Submitted", icon: "Upload" },
-  gates: { label: "Tests", icon: "ListChecks" },
-  queue: { label: "Queue", icon: "Hourglass" },
-  bench: { label: "Bench", icon: "Gauge" },
-  verdict: { label: "Verdict", icon: "Scale" },
-  promoted: { label: "Promoted", icon: "Trophy" },
+  submitted: { label: "Submitted", icon: "Sent" },
+  gates: { label: "Tests", icon: "Beaker" },
+  queue: { label: "Queue", icon: "Layers" },
+  bench: { label: "Bench", icon: "ChartColumn" },
+  verdict: { label: "Verdict", icon: "Target" },
+  promoted: { label: "Promoted", icon: "Star" },
 };
 
 /** Which column a candidate card sits in. A win is decided only once it is promoted onto best. */
