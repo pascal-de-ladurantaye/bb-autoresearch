@@ -413,4 +413,13 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE threads ADD COLUMN activity TEXT`,
   `ALTER TABLE threads ADD COLUMN activity_at INTEGER`,
   `ALTER TABLE threads ADD COLUMN activity_seq INTEGER NOT NULL DEFAULT 0`,
+  // ---- Live view, part 2 ----
+  /** The worker's last action, as a short sanitized label ("editing src/toy.py"), from its latest tool item, and the item's time. */
+  `ALTER TABLE threads ADD COLUMN last_action TEXT`,
+  `ALTER TABLE threads ADD COLUMN last_action_at INTEGER`,
+  /** The label last recorded as a worker.action event, and when (the event is rate-limited; replay reads the events). */
+  `ALTER TABLE threads ADD COLUMN action_recorded TEXT`,
+  `ALTER TABLE threads ADD COLUMN action_recorded_at INTEGER`,
+  /** The measurement's CI band (band.ts), stored when the measurement ends so views and replay don't recompute it. */
+  `ALTER TABLE candidates ADD COLUMN band_json TEXT`,
 ];

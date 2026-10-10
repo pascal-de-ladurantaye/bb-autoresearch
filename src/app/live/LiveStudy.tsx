@@ -4,14 +4,18 @@
 // Strictly read only: the only actions open things (a candidate, a worker's
 // transcript or thread, the Overview).
 import { ThreadChat, useBbNavigate } from "@get-bb/plugin-sdk/app";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
-import { COLUMN_INFO, COLUMNS, PHASE_INFO, PHASE_STEPS, STAGE_LABEL, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
+import { bandEnd, type MeasureBand } from "../../band.ts";
+import { COLUMN_INFO, COLUMNS, PHASE_INFO, PHASE_STEPS, REBASE_NOTICE_MS, STAGE_LABEL, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
+import { improvementText } from "../../present.ts";
 import { VERDICT } from "../format.ts";
 import { EmptyState, ErrorLine, FOCUS_RING, Skeleton, StatePill } from "../ui.tsx";
-import { FlipRoot, useFlash, useFlip } from "./motion.tsx";
+import { Measurement } from "./CiBand.tsx";
+import { animateIf, FlipRoot, useCountUp, useFlash, useFlip, useMotionGate } from "./motion.tsx";
+import { ReplayStudy } from "./Replay.tsx";
 import { clock, spokenDuration, useLiveStudy, useNow } from "./useLiveStudy.ts";
 
 export type LiveLayout = "wide" | "compact";
@@ -27,6 +31,32 @@ export interface LiveStudyProps {
   onOpenBeside?: (studyThreadId: string) => void;
   /** Show this worker's transcript first (the panel opened from a worker thread). */
   initialWorker?: number | null;
+  /** Replay instead of live: the position (ms since the study's first event; null = the start, or the end of a finished study). */
+  replay?: { at: number | null } | null;
+  /** Open the replay (from the live view, or its calm "not running" state). */
+  onReplay?: () => void;
+  /** The replay position moved (the page keeps it in the URL). */
+  onReplayMove?: (at: number) => void;
+  /** Leave the replay (back to live, or to the calm state). */
+  onExitReplay?: () => void;
+}
+
+export interface LiveBoardProps {
+  v: LiveView;
+  now: number;
+  layout: LiveLayout;
+  mode: "live" | "replay";
+  onOpenCandidate: (n: number) => void;
+  onOpenOverview: () => void;
+  onOpenBeside?: (studyThreadId: string) => void;
+  onReplay?: () => void;
+  initialWorker?: number | null;
+  error?: string | null;
+  retry?: () => void;
+  /** Above the board: the replay's scrubber. */
+  toolbar?: ReactNode;
+  /** Replay: the view moved forward continuously (motion only then, never when scrubbing). */
+  flowing?: boolean;
 }
 
 /** Recent verdict cards shown per column. */
@@ -52,119 +82,238 @@ function useWidth(): [(el: HTMLDivElement | null) => void, number | null] {
   return [useMemo(() => ref, []), width]; // eslint-disable-line react-hooks/exhaustive-deps
 }
 
-export function LiveStudy({ slug, layout: requested, onOpenCandidate, onOpenOverview, onOpenBeside, initialWorker = null }: LiveStudyProps) {
-  const [measure, width] = useWidth();
-  const layout: LiveLayout = requested === "wide" && width !== null && width > 0 && width < COMPACT_BELOW_PX ? "compact" : requested;
+export function LiveStudy(props: LiveStudyProps) {
+  if (props.replay) {
+    return (
+      <ReplayStudy
+        slug={props.slug}
+        layout={props.layout}
+        at={props.replay.at}
+        onMove={props.onReplayMove}
+        onExit={props.onExitReplay}
+        onOpenCandidate={props.onOpenCandidate}
+        onOpenOverview={props.onOpenOverview}
+        initialWorker={props.initialWorker ?? null}
+      />
+    );
+  }
+  return <LiveNow {...props} />;
+}
+
+/** The live view of a running study: RPC snapshot plus realtime deltas. */
+function LiveNow({ slug, layout, onOpenCandidate, onOpenOverview, onOpenBeside, initialWorker = null, onReplay }: LiveStudyProps) {
   const live = useLiveStudy(slug);
   const now = useNow(live.offset);
-  const [selected, setSelected] = useState<number | null>(initialWorker);
   const v = live.view;
+  if (!v) {
+    return live.error ? <ErrorLine error={live.error.includes("no study named") ? `No study named ${slug}.` : `Couldn't load the live view: ${live.error}`} retry={live.refetch} /> : <Skeleton lines={layout === "wide" ? 8 : 5} label="Loading the live view…" />;
+  }
+  return (
+    <LiveBoard
+      v={v}
+      now={now}
+      layout={layout}
+      mode="live"
+      onOpenCandidate={onOpenCandidate}
+      onOpenOverview={onOpenOverview}
+      onOpenBeside={onOpenBeside}
+      onReplay={onReplay}
+      initialWorker={initialWorker}
+      error={live.error ? `Live updates failed (showing the last data): ${live.error}` : null}
+      retry={live.refetch}
+      flowing
+    />
+  );
+}
+
+/** The board itself, for a view at `now` (live, or a replayed moment). Read only. */
+export function LiveBoard({ v, now, layout: requested, mode, onOpenCandidate, onOpenOverview, onOpenBeside, onReplay, initialWorker = null, error, retry, toolbar, flowing = false }: LiveBoardProps) {
+  const [measure, width] = useWidth();
+  const layout: LiveLayout = requested === "wide" && width !== null && width > 0 && width < COMPACT_BELOW_PX ? "compact" : requested;
+  const [selected, setSelected] = useState<number | null>(initialWorker);
   // The selected worker's thread: kept after the worker leaves, so its transcript stays readable.
   const [selectedThread, setSelectedThread] = useState<{ key: number; threadId: string; title: string } | null>(null);
   useEffect(() => {
     if (selected === null) return setSelectedThread(null);
-    const w = v?.workers.find((x) => x.key === selected);
+    const w = v.workers.find((x) => x.key === selected);
     if (w?.threadId) setSelectedThread({ key: w.key, threadId: w.threadId, title: `#${w.ideaId ?? "?"} ${w.ideaTitle}` });
-  }, [selected, v?.workers]);
-
-  if (!v) {
-    return (
-      <div ref={measure}>
-        {live.error ? <ErrorLine error={live.error.includes("no study named") ? `No study named ${slug}.` : `Couldn't load the live view: ${live.error}`} retry={live.refetch} /> : <Skeleton lines={layout === "wide" ? 8 : 5} label="Loading the live view…" />}
-      </div>
-    );
-  }
+  }, [selected, v.workers]);
   const inFlight = v.cards.some((c) => c.stage !== "decided");
-  const quiet = v.state !== "running" && !v.workers.length && !inFlight;
+  const quiet = mode === "live" && v.state !== "running" && !v.workers.length && !inFlight;
   const compact = layout === "compact";
+  const replay = mode === "replay";
   const lanes = (
     <WorkerLanes
-      workers={v.workers}
+      v={v}
       now={now}
       compact={compact}
       selected={selected}
       onSelect={(k) => setSelected((cur) => (cur === k ? null : k))}
       state={v.state}
-      transcript={selectedThread ? <Transcript t={selectedThread} gone={!v.workers.some((w) => w.key === selectedThread.key)} onClose={() => setSelected(null)} compact={compact} /> : null}
+      transcript={selectedThread ? <Transcript t={selectedThread} gone={!v.workers.some((w) => w.key === selectedThread.key)} onClose={() => setSelected(null)} compact={compact} replay={replay} /> : null}
     />
   );
+  const bands = <OnTheBench v={v} compact={compact} onOpenCandidate={onOpenCandidate} />;
   return (
-    <div ref={measure} data-layout={layout}>
-    <FlipRoot className={cn("space-y-4", compact && "space-y-3")}>
-      <LiveHeader v={v} compact={compact} onOpenBeside={requested === "wide" ? onOpenBeside : undefined} />
-      {live.error ? <ErrorLine error={`Live updates failed (showing the last data): ${live.error}`} retry={live.refetch} /> : null}
-      {quiet ? (
-        <CalmState v={v} onOpenOverview={onOpenOverview} onOpenCandidate={onOpenCandidate} now={now} compact={compact} />
-      ) : compact ? (
-        <div className="space-y-4">
-          {lanes}
-          <PipelineTrack v={v} now={now} compact onOpenCandidate={onOpenCandidate} />
-          <BenchStrip v={v} now={now} compact onOpenCandidate={onOpenCandidate} />
-          <IdeaQueue v={v} compact />
-          <Feed v={v} compact />
-        </div>
-      ) : (
-        <div className="space-y-5">
-          <PipelineTrack v={v} now={now} compact={false} onOpenCandidate={onOpenCandidate} />
-          <div className="grid gap-5 lg:grid-cols-3">
-            <div className="min-w-0 space-y-4 lg:col-span-2">{lanes}</div>
-            <div className="min-w-0 space-y-4">
-              <BenchStrip v={v} now={now} compact={false} onOpenCandidate={onOpenCandidate} />
-              <IdeaQueue v={v} compact={false} />
-              <Feed v={v} compact={false} />
+    <div ref={measure} data-layout={layout} data-mode={mode}>
+      <FlipRoot className={cn("space-y-4", compact && "space-y-3")} still={!flowing}>
+        <LiveHeader v={v} now={now} compact={compact} mode={mode} flowing={flowing} onOpenBeside={requested === "wide" && !replay ? onOpenBeside : undefined} onReplay={replay ? undefined : onReplay} />
+        {toolbar}
+        {error ? <ErrorLine error={error} retry={retry} /> : null}
+        {quiet ? (
+          <CalmState v={v} onOpenOverview={onOpenOverview} onOpenCandidate={onOpenCandidate} onReplay={onReplay} now={now} compact={compact} />
+        ) : compact ? (
+          <div className="space-y-4">
+            {lanes}
+            {bands}
+            <PipelineTrack v={v} now={now} compact onOpenCandidate={onOpenCandidate} />
+            <BenchStrip v={v} now={now} compact onOpenCandidate={onOpenCandidate} />
+            <IdeaQueue v={v} compact />
+            <Feed v={v} compact />
+          </div>
+        ) : (
+          <div className="space-y-5">
+            <PipelineTrack v={v} now={now} compact={false} onOpenCandidate={onOpenCandidate} />
+            {bands}
+            <div className="grid gap-5 lg:grid-cols-3">
+              <div className="min-w-0 space-y-4 lg:col-span-2">{lanes}</div>
+              <div className="min-w-0 space-y-4">
+                <BenchStrip v={v} now={now} compact={false} onOpenCandidate={onOpenCandidate} />
+                <IdeaQueue v={v} compact={false} />
+                <Feed v={v} compact={false} />
+              </div>
             </div>
           </div>
-        </div>
-      )}
-    </FlipRoot>
+        )}
+      </FlipRoot>
     </div>
+  );
+}
+
+// ------------------------------------------------------ on the bench (CI)
+
+/** The measurements' CI bands: on the bench now, then ones that just ended (newest first). */
+function OnTheBench({ v, compact, onOpenCandidate }: { v: LiveView; compact: boolean; onOpenCandidate: (n: number) => void }) {
+  const cards = useMemo(() => new Map(v.cards.map((c) => [c.n, c] as const)), [v.cards]);
+  const shown = useMemo(() => {
+    const live = (b: MeasureBand) => b.final === null;
+    return [...v.bands].sort((a, b) => Number(live(b)) - Number(live(a)) || (bandEnd(b) ?? 0) - (bandEnd(a) ?? 0)).slice(0, compact ? 2 : 3);
+  }, [v.bands, compact]);
+  if (!shown.length) return null;
+  const host = (n: number) => {
+    const id = cards.get(n)?.hostId;
+    return id ? (v.bench.find((h) => h.hostId === id)?.name ?? id) : null;
+  };
+  return (
+    <section className="space-y-2" aria-label="Measurements">
+      <SectionTitle icon="ChartColumn" count={shown.length}>
+        On the bench
+      </SectionTitle>
+      <div className={cn("grid gap-3", !compact && shown.length > 1 && "xl:grid-cols-2")}>
+        {shown.map((b) => (
+          <Measurement key={b.n} band={b} card={cards.get(b.n) ?? null} hostName={host(b.n)} metric={v.metric} compact={compact} onOpenCandidate={onOpenCandidate} />
+        ))}
+      </div>
+    </section>
   );
 }
 
 // ---------------------------------------------------------------- header
 
-function LiveHeader({ v, compact, onOpenBeside }: { v: LiveView; compact: boolean; onOpenBeside?: (threadId: string) => void }) {
-  const flash = useFlash(v.best.n);
+function LiveHeader({ v, now, compact, mode, flowing, onOpenBeside, onReplay }: { v: LiveView; now: number; compact: boolean; mode: "live" | "replay"; flowing: boolean; onOpenBeside?: (threadId: string) => void; onReplay?: () => void }) {
+  const motion = useMotionGate();
   const running = v.state === "running";
+  const replay = mode === "replay";
+  // The "best moved" moment: within a few seconds of the promotion (by the view's own clock, so replay shows it too).
+  const moved = v.best.movedAt !== null && now >= v.best.movedAt && now - v.best.movedAt < 4000;
+  const shown = useCountUp(v.best.value, flowing && moved && motion());
+  const text = shown !== null && v.best.value !== null && shown !== v.best.value ? improvementText(shown, v.metric) : v.best.text;
   return (
     <div className={cn("flex flex-wrap items-start gap-x-4 gap-y-2 rounded-lg border border-border bg-card px-3 py-2", compact && "px-2.5")}>
       <div className="min-w-0 flex-1 space-y-0.5">
         <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
           <span className="relative inline-flex size-2.5 shrink-0" aria-hidden>
-            {running ? <span className="absolute inline-flex size-full rounded-full bg-success/70 motion-safe:animate-ping" /> : null}
-            <span className={cn("relative inline-flex size-2.5 rounded-full", running ? "bg-success" : "bg-muted-foreground/50")} />
+            {running && !replay ? <span className="absolute inline-flex size-full rounded-full bg-success/70 motion-safe:animate-ping" /> : null}
+            <span className={cn("relative inline-flex size-2.5 rounded-full", replay ? "bg-foreground/60" : running ? "bg-success" : "bg-muted-foreground/50")} />
           </span>
-          <span>{running ? "Live" : "Not running"}</span>
+          <span>{replay ? "Replay" : running ? "Live" : "Not running"}</span>
           {compact ? <span className="truncate text-muted-foreground">{v.slug}</span> : null}
           <StatePill state={v.state} />
         </div>
-        <p className="min-h-5 text-xs text-muted-foreground" aria-live="polite">
+        <p className="min-h-5 text-xs text-muted-foreground" aria-live={replay ? "off" : "polite"}>
           {v.statusLine}
         </p>
       </div>
-      <div className={cn("text-right", compact && "text-left")}>
-        <div className={cn("rounded px-1 text-sm font-semibold tabular-nums transition-colors duration-700", flash && "bg-success/15 text-success")} aria-live="polite">
-          {v.best.text ? (
-            <>
-              <span className="mr-1 text-xs font-normal text-muted-foreground">best vs base</span>
-              {v.best.text}
-              {flash ? <span className="ml-1 text-xs font-medium">best moved</span> : null}
-            </>
-          ) : (
-            <span className="text-xs font-normal text-muted-foreground">no win yet</span>
-          )}
-        </div>
-        <div className="text-xs tabular-nums text-muted-foreground">
-          {v.counts.candidates} of {v.counts.maxCandidates} candidates · {v.counts.workers} worker{v.counts.workers === 1 ? "" : "s"} (up to {v.counts.targetWorkers})
+      <div className={cn("flex items-center gap-3", compact && "w-full justify-between")}>
+        {v.best.history.length ? <Trajectory history={v.best.history} now={now} moved={moved} /> : null}
+        <div className={cn("text-right", compact && "text-left")}>
+          <div className={cn("rounded px-1 text-sm font-semibold tabular-nums transition-colors duration-700", moved && "bg-success/15 text-success")} aria-live={replay ? "off" : "polite"} data-best-value={v.best.value ?? ""}>
+            {text ? (
+              <>
+                <span className="mr-1 text-xs font-normal text-muted-foreground">best vs base</span>
+                {text}
+                {moved ? (
+                  <span className="ml-1 inline-flex items-center gap-0.5 text-xs font-medium">
+                    <Icon name="Star" className="size-3" aria-hidden />
+                    best moved{v.best.n !== null ? `: c/${v.best.n}` : ""}
+                  </span>
+                ) : null}
+              </>
+            ) : (
+              <span className="text-xs font-normal text-muted-foreground">no win yet</span>
+            )}
+          </div>
+          <div className="text-xs tabular-nums text-muted-foreground">
+            {v.counts.candidates} of {v.counts.maxCandidates} candidates · {v.counts.workers} worker{v.counts.workers === 1 ? "" : "s"} (up to {v.counts.targetWorkers})
+          </div>
         </div>
       </div>
-      {onOpenBeside && v.studyThreadId ? (
-        <Button size="sm" variant="outline" className="shrink-0" onClick={() => onOpenBeside(v.studyThreadId!)}>
-          <Icon name="PanelRight" className="size-4" aria-hidden />
-          Open beside the study thread
-        </Button>
+      {onReplay || (onOpenBeside && v.studyThreadId) ? (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+          {onReplay ? (
+            <Button size="sm" variant="ghost" onClick={onReplay} aria-label="Replay this study from the start">
+              <Icon name="RotateCcw" className="size-4" aria-hidden />
+              Replay
+            </Button>
+          ) : null}
+          {onOpenBeside && v.studyThreadId ? (
+            <Button size="sm" variant="outline" className="shrink-0" onClick={() => onOpenBeside(v.studyThreadId!)}>
+              <Icon name="PanelRight" className="size-4" aria-hidden />
+              Open beside the study thread
+            </Button>
+          ) : null}
+        </div>
       ) : null}
     </div>
+  );
+}
+
+/** Best vs base after each promotion, as a step line; the newest step grows in when best moves. */
+function Trajectory({ history, now, moved }: { history: LiveView["best"]["history"]; now: number; moved: boolean }) {
+  const motion = useMotionGate();
+  const ref = useRef<SVGCircleElement | null>(null);
+  const count = useRef(history.length);
+  const w = 96;
+  const h = 26;
+  const t0 = history[0]!.at;
+  const t1 = Math.max(now, history.at(-1)!.at, t0 + 1);
+  const max = Math.max(...history.map((p) => p.value), 1e-9);
+  const min = Math.min(0, ...history.map((p) => p.value));
+  const x = (t: number) => 2 + ((t - t0) / (t1 - t0)) * (w - 4);
+  const y = (val: number) => h - 3 - ((val - min) / (max - min || 1)) * (h - 6);
+  let d = `M${x(t0)},${y(0)}`;
+  for (const p of history) d += ` H${x(p.at)} V${y(p.value)}`;
+  d += ` H${x(t1)}`;
+  useLayoutEffect(() => {
+    if (history.length > count.current) animateIf(motion(), ref.current, [{ transform: "scale(2.6)", opacity: 0.3 }, { transform: "scale(1)", opacity: 1 }], { duration: 900 });
+    count.current = history.length;
+  }, [history.length, motion]);
+  const last = history.at(-1)!;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="h-7 w-24 shrink-0" role="img" aria-label={`Trajectory: best moved ${history.length} time${history.length === 1 ? "" : "s"}`}>
+      <path d={d} fill="none" className="text-success" stroke="currentColor" strokeWidth={1.5} strokeLinejoin="round" />
+      <circle ref={ref} cx={x(last.at)} cy={y(last.value)} r={moved ? 3 : 2} className="text-success" fill="currentColor" style={{ transformBox: "fill-box", transformOrigin: "center" }} />
+    </svg>
   );
 }
 
@@ -180,7 +329,10 @@ function SectionTitle({ icon, children, count }: { icon: string; children: React
 
 // ---------------------------------------------------------- worker lanes
 
-function WorkerLanes({ workers, now, compact, selected, onSelect, state, transcript }: { workers: LiveWorker[]; now: number; compact: boolean; selected: number | null; onSelect: (key: number) => void; state: string; transcript: ReactNode }) {
+function WorkerLanes({ v, now, compact, selected, onSelect, state, transcript }: { v: LiveView; now: number; compact: boolean; selected: number | null; onSelect: (key: number) => void; state: string; transcript: ReactNode }) {
+  const workers = v.workers;
+  // "best moved: rebases on next submit", for a few seconds after a promotion.
+  const rebasing = v.best.movedAt !== null && now >= v.best.movedAt && now - v.best.movedAt < REBASE_NOTICE_MS ? new Set(v.best.rebases) : null;
   return (
     <section className="space-y-2" aria-label="Workers">
       <SectionTitle icon="Bot" count={workers.length}>
@@ -190,7 +342,7 @@ function WorkerLanes({ workers, now, compact, selected, onSelect, state, transcr
         <ul className="space-y-1.5">
           {workers.map((w) => (
             <li key={w.key}>
-              <Lane w={w} now={now} compact={compact} selected={selected === w.key} onSelect={() => onSelect(w.key)} />
+              <Lane w={w} now={now} compact={compact} selected={selected === w.key} onSelect={() => onSelect(w.key)} rebasing={rebasing?.has(w.key) ?? false} />
             </li>
           ))}
         </ul>
@@ -203,7 +355,7 @@ function WorkerLanes({ workers, now, compact, selected, onSelect, state, transcr
   );
 }
 
-function Lane({ w, now, compact, selected, onSelect }: { w: LiveWorker; now: number; compact: boolean; selected: boolean; onSelect: () => void }) {
+function Lane({ w, now, compact, selected, onSelect, rebasing }: { w: LiveWorker; now: number; compact: boolean; selected: boolean; onSelect: () => void; rebasing: boolean }) {
   const info = PHASE_INFO[w.phase];
   const inPhase = now - w.phaseAt;
   const total = now - w.spawnedAt;
@@ -215,7 +367,8 @@ function Lane({ w, now, compact, selected, onSelect }: { w: LiveWorker; now: num
       : w.candidate !== null
         ? `last: c/${w.candidate}`
         : null;
-  const label = `Worker on idea #${w.ideaId ?? "?"}, ${w.ideaTitle}: ${info.label} for ${spokenDuration(inPhase)}, submission ${w.submissions} of ${w.maxSubmissions}${waitingOn ? `, ${waitingOn}` : ""}. ${selected ? "Hide" : "Show"} its transcript.`;
+  const action = w.action && w.phase !== "starting" ? w.action : null;
+  const label = `Worker on idea #${w.ideaId ?? "?"}, ${w.ideaTitle}: ${info.label} for ${spokenDuration(inPhase)}, submission ${w.submissions} of ${w.maxSubmissions}${waitingOn ? `, ${waitingOn}` : ""}${action ? `. Last action: ${action.label}, ${spokenDuration(now - action.at)} ago` : ""}${rebasing ? ". Best moved: rebases on its next submission" : ""}. ${selected ? "Hide" : "Show"} its transcript.`;
   return (
     <button
       type="button"
@@ -256,8 +409,37 @@ function Lane({ w, now, compact, selected, onSelect }: { w: LiveWorker; now: num
           </>
         ) : null}
       </div>
+      {action || rebasing ? (
+        <div className="mt-1 flex min-w-0 items-center gap-2 text-xs">
+          {action ? (
+            <span className="flex min-w-0 flex-1 items-center gap-1 text-muted-foreground" data-action>
+              <Icon name="CornerDownRight" className="size-3 shrink-0" aria-hidden />
+              <span className="truncate font-mono text-[11px]" title={action.label}>
+                {action.label}
+              </span>
+              <span className="shrink-0 tabular-nums opacity-70">{clock(now - action.at)} ago</span>
+            </span>
+          ) : (
+            <span className="flex-1" />
+          )}
+          {rebasing ? <RebaseChip /> : null}
+        </div>
+      ) : null}
       <PhaseSteps phase={w.phase} />
     </button>
+  );
+}
+
+/** "best moved: rebases on next submit": fades in, stays a few seconds. */
+function RebaseChip() {
+  const motion = useMotionGate();
+  const ref = useRef<HTMLSpanElement | null>(null);
+  useLayoutEffect(() => animateIf(motion(), ref.current, [{ opacity: 0, transform: "translateY(-3px)" }, { opacity: 1, transform: "translateY(0)" }], { duration: 400 }), [motion]);
+  return (
+    <span ref={ref} className="inline-flex shrink-0 items-center gap-1 rounded-full border border-success/50 bg-success/10 px-1.5 py-px text-[11px] font-medium text-success" data-rebase>
+      <Icon name="Star" className="size-3" aria-hidden />
+      best moved: rebases on next submit
+    </span>
   );
 }
 
@@ -275,7 +457,7 @@ function PhaseSteps({ phase }: { phase: LiveWorker["phase"] }) {
   );
 }
 
-function Transcript({ t, gone, onClose, compact }: { t: { key: number; threadId: string; title: string }; gone: boolean; onClose: () => void; compact: boolean }) {
+function Transcript({ t, gone, onClose, compact, replay }: { t: { key: number; threadId: string; title: string }; gone: boolean; onClose: () => void; compact: boolean; replay: boolean }) {
   const nav = useBbNavigate();
   return (
     <section
@@ -288,7 +470,7 @@ function Transcript({ t, gone, onClose, compact }: { t: { key: number; threadId:
       <div className="flex flex-wrap items-center gap-2 px-1">
         <Icon name="MessageSquare" className="size-3.5 text-muted-foreground" aria-hidden />
         <span className="min-w-0 flex-1 truncate text-xs font-medium">Transcript · {t.title}</span>
-        {gone ? <span className="text-xs text-muted-foreground">worker finished</span> : null}
+        {gone && !replay ? <span className="text-xs text-muted-foreground">worker finished</span> : null}
         <Button size="sm" variant="ghost" onClick={() => nav.toThread(t.threadId)}>
           Open thread
         </Button>
@@ -296,6 +478,12 @@ function Transcript({ t, gone, onClose, compact }: { t: { key: number; threadId:
           <Icon name="X" className="size-4" aria-hidden />
         </Button>
       </div>
+      {replay ? (
+        <p className="flex items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground" role="note">
+          <Icon name="AlertCircle" className="size-3.5 shrink-0" aria-hidden />
+          Current transcript, not at this moment: transcripts aren't time-synced with the replay.
+        </p>
+      ) : null}
       <div className={cn("min-h-0 overflow-hidden rounded-md border border-border", compact ? "h-[22rem]" : "h-[28rem]")}>
         <ThreadChat key={t.threadId} threadId={t.threadId} variant="timeline" />
       </div>
@@ -537,6 +725,7 @@ function IdeaChip({ idea, compact }: { idea: LiveView["ideas"]["next"][number]; 
       <span className="min-w-0 flex-1 truncate">
         #{idea.id} {idea.title}
       </span>
+      {idea.blocked ? <span className="shrink-0 text-[11px] text-muted-foreground" title="The scheduler skips it for now">{idea.blocked}</span> : null}
       {idea.theme ? <span className="shrink-0 rounded-full bg-muted px-1.5 text-[11px] text-muted-foreground">{idea.theme}</span> : null}
     </li>
   );
@@ -628,7 +817,7 @@ function Feed({ v, compact }: { v: LiveView; compact: boolean }) {
 
 // ----------------------------------------------------------- calm state
 
-function CalmState({ v, onOpenOverview, onOpenCandidate, now, compact }: { v: LiveView; onOpenOverview: () => void; onOpenCandidate: (n: number) => void; now: number; compact: boolean }) {
+function CalmState({ v, onOpenOverview, onOpenCandidate, onReplay, now, compact }: { v: LiveView; onOpenOverview: () => void; onOpenCandidate: (n: number) => void; onReplay?: () => void; now: number; compact: boolean }) {
   const recent = [...v.cards].filter((c) => c.stage === "decided").sort((a, b) => (b.decidedAt ?? 0) - (a.decidedAt ?? 0)).slice(0, compact ? 4 : 6);
   const why =
     v.state === "paused"
@@ -644,9 +833,17 @@ function CalmState({ v, onOpenOverview, onOpenCandidate, now, compact }: { v: Li
     <div className="space-y-3">
       <EmptyState className="space-y-2 py-6">
         <p>{why}</p>
-        <Button size="sm" variant="outline" onClick={onOpenOverview}>
-          Open the Overview
-        </Button>
+        <div className="flex flex-wrap justify-center gap-2">
+          {onReplay && v.lastEventId > 0 && v.state !== "draft" ? (
+            <Button size="sm" onClick={onReplay}>
+              <Icon name="RotateCcw" className="size-4" aria-hidden />
+              Replay this study
+            </Button>
+          ) : null}
+          <Button size="sm" variant="outline" onClick={onOpenOverview}>
+            Open the Overview
+          </Button>
+        </div>
       </EmptyState>
       {recent.length ? (
         <section className="space-y-2" aria-label="Last verdicts">

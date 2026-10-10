@@ -51,6 +51,8 @@ export interface EngineConfig {
   tokenPollMs: number;
   /** Live view: minimum time a worker stays in an activity phase (reading, editing, testing) before a flip is recorded. */
   liveDwellMs?: number;
+  /** Live view: minimum time between two worker.action events of one worker (the "last action" line). */
+  liveActionMs?: number;
 }
 
 export interface Ctx {
@@ -60,6 +62,8 @@ export interface Ctx {
   rng: Rng;
   benchLock: HostMutex;
   config: EngineConfig;
+  /** Set when the plugin instance is disposed (reload): in-flight work stops quietly. */
+  disposed?: boolean;
 }
 
 export const DEFAULT_CONFIG: EngineConfig = {

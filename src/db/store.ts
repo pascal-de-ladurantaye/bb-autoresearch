@@ -125,6 +125,11 @@ export interface ThreadRow {
   activity: string | null;
   activity_at: number | null;
   activity_seq: number;
+  /** Live view: the latest action label (sanitized, at most 80 characters) and the one last recorded as a worker.action event. */
+  last_action: string | null;
+  last_action_at: number | null;
+  action_recorded: string | null;
+  action_recorded_at: number | null;
 }
 
 export interface CandidateRow {
@@ -161,6 +166,8 @@ export interface CandidateRow {
   bench_host_id: string | null;
   holdout: "pass" | "fail" | null;
   measure_restarts: number;
+  /** The measurement's CI band (band.ts), stored when it ended. */
+  band_json: string | null;
 }
 
 export interface FindingRow {
@@ -387,13 +394,48 @@ export interface AppendedEvent {
   data: Record<string, unknown>;
 }
 
+/**
+ * Thrown by a store whose plugin instance was disposed (reload, disable,
+ * shutdown). BB closes the database right after the dispose hooks, so work
+ * still in flight in the old instance (a measurement awaiting its bench run)
+ * must stop instead of touching the handle; this error says so quietly.
+ */
+export class StoreClosedError extends Error {
+  constructor() {
+    super("the plugin instance was disposed (reload): its store is closed");
+    this.name = "StoreClosedError";
+  }
+}
+
 export class Store {
   private listeners: Array<(e: AppendedEvent) => void> = [];
+  private closedAt: number | null = null;
+  /** Accesses refused after close (tests check that the old instance stopped). */
+  refusedAfterClose = 0;
 
   constructor(
-    readonly db: Database.Database,
+    private readonly handle: Database.Database,
     private readonly now: () => number = Date.now,
   ) {}
+
+  /** The database handle; throws StoreClosedError once the store is closed. */
+  get db(): Database.Database {
+    if (this.closedAt !== null) {
+      this.refusedAfterClose += 1;
+      throw new StoreClosedError();
+    }
+    return this.handle;
+  }
+
+  /** Stop all database access from this instance (plugin dispose). Idempotent. */
+  close(): void {
+    if (this.closedAt === null) this.closedAt = Date.now();
+    this.listeners = [];
+  }
+
+  get closed(): boolean {
+    return this.closedAt !== null;
+  }
 
   /** Observe every appended event (called synchronously, possibly inside a transaction). Returns an unsubscribe. */
   onEvent(fn: (e: AppendedEvent) => void): () => void {
@@ -752,6 +794,15 @@ export class Store {
     this.db
       .prepare(`INSERT INTO samples (study_id, candidate_id, run, pair, side, metric, value, host_id, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(row.study_id, row.candidate_id, row.run, row.pair, row.side, row.metric, row.value, row.host_id, this.now());
+  }
+  /** A candidate's samples after a sample id, in id order (the live CI band reads them incrementally). */
+  samplesAfter(candidateId: number, afterId = 0): Array<{ id: number; run: string; pair: number; side: string; metric: string; value: number; at: number }> {
+    return this.db.prepare(`SELECT id, run, pair, side, metric, value, at FROM samples WHERE candidate_id = ? AND id > ? ORDER BY id`).all(candidateId, afterId) as Array<{ id: number; run: string; pair: number; side: string; metric: string; value: number; at: number }>;
+  }
+  /** Lowest and highest sample id of a candidate, and how many (the band cache notices a restarted measurement). */
+  sampleBounds(candidateId: number): { min: number; max: number; count: number } {
+    const r = this.db.prepare(`SELECT COALESCE(MIN(id), 0) AS min, COALESCE(MAX(id), 0) AS max, COUNT(*) AS count FROM samples WHERE candidate_id = ?`).get(candidateId) as { min: number; max: number; count: number };
+    return r;
   }
   deleteSamples(candidateId: number): number {
     return this.db.prepare(`DELETE FROM samples WHERE candidate_id = ?`).run(candidateId).changes;

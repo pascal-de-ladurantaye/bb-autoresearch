@@ -512,9 +512,9 @@ export class FakePort implements BbPort {
     return { seq: items.length ? items[items.length - 1]!.seq : afterSeq, items };
   }
   /** Record a tool item on a fake thread (the live view classifies it). */
-  addActivity(threadId: string, kind: string, opts: { command?: string; tool?: string; at?: number } = {}) {
+  addActivity(threadId: string, kind: string, opts: { command?: string; tool?: string; at?: number; paths?: string[] } = {}) {
     const list = this.activity.get(threadId) ?? [];
-    list.push({ seq: (list.at(-1)?.seq ?? 0) + 1, at: opts.at ?? Date.now(), kind, command: opts.command ?? null, tool: opts.tool ?? null });
+    list.push({ seq: (list.at(-1)?.seq ?? 0) + 1, at: opts.at ?? Date.now(), kind, command: opts.command ?? null, tool: opts.tool ?? null, paths: opts.paths ?? null });
     this.activity.set(threadId, list);
   }
   usage: ProviderUsage[] = [];

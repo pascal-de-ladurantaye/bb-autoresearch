@@ -68,6 +68,11 @@ export interface MeasureContext {
   /** Calibrated guardrail noise by name (expensive: σ of one run; deterministic: the repeat difference). */
   guardrailNoise?: Record<string, number> | null;
   signal?: AbortSignal;
+  /**
+   * noisy: the generator for the sequential test's bootstrap at pair n (band.ts `ciRngFor`),
+   * so the live CI band can recompute the decision's exact CI from the samples. Default: `rng`.
+   */
+  ciRng?: (n: number) => Rng;
 }
 
 export type Decision = "win" | "lose" | "inconclusive";
@@ -261,7 +266,7 @@ export const noisyStrategy: NoiseStrategy = {
         mde: ctx.mde,
         confidence: p.confidence,
         iterations: p.bootstrap,
-        rng: ctx.rng,
+        rng: ctx.ciRng ? ctx.ciRng(improvements.length) : ctx.rng,
       });
       if (last.decision !== "continue") break;
     }

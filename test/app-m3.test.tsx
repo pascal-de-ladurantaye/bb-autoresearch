@@ -77,9 +77,9 @@ describe("frontend: M3 study tabs", () => {
 
   it("parses the new tab routes", async () => {
     const { parseSubPath } = await import("../src/app/StudiesPage.tsx");
-    expect(parseSubPath("toy-size/harvest")).toEqual({ slug: "toy-size", tab: "harvest", candidate: null });
+    expect(parseSubPath("toy-size/harvest")).toEqual({ slug: "toy-size", tab: "harvest", candidate: null, replay: null });
     expect(parseSubPath("toy-size/findings")).toMatchObject({ tab: "findings" });
-    expect(parseSubPath("toy-size/candidates/3")).toEqual({ slug: "toy-size", tab: "candidates", candidate: 3 });
+    expect(parseSubPath("toy-size/candidates/3")).toEqual({ slug: "toy-size", tab: "candidates", candidate: 3, replay: null });
     expect(parseSubPath("toy-size/nope")).toMatchObject({ tab: "overview" });
   });
 

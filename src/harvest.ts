@@ -114,6 +114,11 @@ export class Harvester {
     return this.ctx.store;
   }
 
+  /** Plugin dispose: stop every harvest job (the next instance resumes them). */
+  abortAll(): void {
+    for (const j of this.jobs.values()) j.controller.abort();
+  }
+
   running(harvestId: number): boolean {
     return this.jobs.has(harvestId);
   }
@@ -126,6 +131,7 @@ export class Harvester {
       try {
         await this.run(harvestId, controller.signal);
       } catch (e) {
+        if (this.ctx.disposed) return;
         const h = this.store.harvest(harvestId);
         if (!h) return;
         if (e instanceof HarvestCancelled || controller.signal.aborted) {

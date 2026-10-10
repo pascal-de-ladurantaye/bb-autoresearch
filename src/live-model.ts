@@ -8,7 +8,8 @@
 // candidate.verdict, best.promoted, idea.added/status). Realtime deltas are a
 // throttled projection of those rows, and `replaySkeleton` rebuilds the same
 // state from the rows alone at any time t, which is what a replay needs.
-import type { MetricInfo } from "./present.ts";
+import { bandProgress, type BandPoint, type MeasureBand } from "./band.ts";
+import { compoundOne, type MetricInfo } from "./present.ts";
 
 /** Pipeline stages a candidate moves through (mirrors db/schema.ts CANDIDATE_STAGES). */
 export type Stage = "submitted" | "gating" | "queued" | "measuring" | "confirming" | "promoting" | "decided";
@@ -197,6 +198,8 @@ export interface LiveWorker {
   candidateStage: Stage | null;
   /** Position in the bench queue (1 = next) while its candidate waits there. */
   queuePosition: number | null;
+  /** The last action, a short sanitized label ("editing src/toy.py"), as recorded by the last worker.action event. */
+  action: { label: string; at: number } | null;
 }
 
 export interface Pairs {
@@ -242,6 +245,8 @@ export interface LiveIdea {
   theme: string;
   pinned: boolean;
   source: string;
+  /** Why the scheduler can't pick it yet (theme cap, repeats a lost idea); null when it is in pick order. */
+  blocked: string | null;
 }
 
 export type FeedTone = "win" | "lose" | "warn" | "info" | "best";
@@ -266,7 +271,20 @@ export interface LiveView {
   /** Deltas at or below this event id are already in the view. */
   lastEventId: number;
   studyThreadId: string | null;
-  best: { text: string | null; n: number | null; at: number | null };
+  best: {
+    text: string | null;
+    n: number | null;
+    /** When the current best was decided. */
+    at: number | null;
+    /** Best vs base, better is positive (the header counts up to it when best moves). */
+    value: number | null;
+    /** When best last moved (the best.promoted event). */
+    movedAt: number | null;
+    /** Best vs base after each promotion (the trajectory sparkline). */
+    history: Array<{ at: number; n: number; value: number }>;
+    /** Lanes that rebase on their next submission because best moved (live workers other than the winner's). */
+    rebases: number[];
+  };
   counts: { candidates: number; maxCandidates: number; workers: number; targetWorkers: number; queue: number };
   workers: LiveWorker[];
   /** In-flight candidates and the most recent decided ones. */
@@ -276,6 +294,22 @@ export interface LiveView {
   bench: LiveBenchHost[];
   ideas: { next: LiveIdea[]; total: number };
   feed: LiveFeedItem[];
+  /** CI bands of the measurements on the bench, and of ones that just ended (BAND_LINGER_MS). */
+  bands: MeasureBand[];
+}
+
+/** How long a finished measurement's band stays on screen (its decision marked). */
+export const BAND_LINGER_MS = 30_000;
+/** How long lanes say "best moved: rebases on next submit". */
+export const REBASE_NOTICE_MS = 6_000;
+
+/** Pair progress, at least as far as the band got (bands follow samples, progress events are coarse). */
+export function mergeProgress(pairs: Pairs | null, band: MeasureBand | null | undefined): Pairs | null {
+  const b = band ? bandProgress(band) : null;
+  if (!b) return pairs;
+  if (!pairs) return null;
+  if (b.run !== pairs.run) return b.run === "confirm" && pairs.run === "measure" ? { run: "confirm", done: b.done, of: pairs.of } : pairs;
+  return b.done > pairs.done ? { ...pairs, done: Math.min(b.done, pairs.of || b.done) } : pairs;
 }
 
 // ------------------------------------------------------------ realtime deltas
@@ -290,7 +324,11 @@ export type LiveDelta =
   | { k: "pair"; id: number; t: number; c: number; run: "measure" | "confirm"; i: number; of: number }
   | { k: "verdict"; id: number; t: number; c: number; v: string; e: number | null }
   | { k: "best"; id: number; t: number; c: number }
-  | { k: "idea"; id: number; t: number; i: number; to: string };
+  | { k: "idea"; id: number; t: number; i: number; to: string }
+  /** A worker's last action changed (a short sanitized label). */
+  | { k: "action"; id: number; t: number; w: number; a: string }
+  /** A new point of a measurement's CI band (no event: bands come from samples). Applied whatever the snapshot's event id. */
+  | { k: "band"; id: number; t: number; c: number; run: "measure" | "confirm"; p: BandPoint };
 
 export interface LiveDeltaMessage {
   /** The study id. */
@@ -309,6 +347,10 @@ export function deltaKey(d: LiveDelta): string {
       return "best";
     case "idea":
       return `idea:${d.i}`;
+    case "action":
+      return `action:${d.w}`;
+    case "band":
+      return `band:${d.c}:${d.run}:${d.p.n}`;
     default:
       return `${d.k}:${d.c}`;
   }
@@ -359,6 +401,11 @@ export function deltaFromEvent(e: EventLike): LiveDelta | null {
     }
     case "idea.added":
       return num(d.idea) === null ? null : { k: "idea", id: e.id, t: e.at, i: num(d.idea)!, to: "queued" };
+    case "worker.action": {
+      const w = num(d.worker);
+      const a = str(d.label);
+      return w === null || !a ? null : { k: "action", id: e.id, t: e.at, w, a };
+    }
     case "idea.status":
       return num(d.idea) === null || !str(d.to) ? null : { k: "idea", id: e.id, t: e.at, i: num(d.idea)!, to: str(d.to)! };
     default:
@@ -386,7 +433,37 @@ export function applyDeltas(view: LiveView, msg: LiveDeltaMessage, effectText?: 
     cards[i] = fn(cards[i]!);
     return true;
   };
+  let bands = view.bands;
   for (const d of [...msg.d].sort((a, b) => a.id - b.id)) {
+    if (d.k === "band") {
+      // Bands come from samples, not events: a point is idempotent by its pair number.
+      const i = bands.findIndex((b) => b.n === d.c);
+      if (i < 0 || bands[i]!.kind !== "noisy") {
+        refetch = true;
+        continue;
+      }
+      const b = bands[i] as Extract<MeasureBand, { kind: "noisy" }>;
+      const runs = [...b.runs];
+      let r = runs.findIndex((x) => x.run === d.run);
+      if (r < 0) {
+        runs.push({ run: d.run, points: [], gr: {} });
+        r = runs.length - 1;
+      }
+      const pts = [...runs[r]!.points];
+      const at = pts.findIndex((p) => p.n === d.p.n);
+      if (at >= 0) pts[at] = d.p;
+      else if (d.p.n === pts.length + 1) pts.push(d.p);
+      else {
+        refetch = true;
+        continue;
+      }
+      runs[r] = { ...runs[r]!, points: pts };
+      if (bands === view.bands) bands = [...bands];
+      const nb = { ...b, runs };
+      bands[i] = nb;
+      card(d.c, (c) => ({ ...c, pairs: mergeProgress(c.pairs, nb) }));
+      continue;
+    }
     if (d.id <= view.lastEventId) continue;
     lastEventId = Math.max(lastEventId, d.id);
     switch (d.k) {
@@ -430,6 +507,13 @@ export function applyDeltas(view: LiveView, msg: LiveDeltaMessage, effectText?: 
       case "best":
         refetch = true;
         break;
+      case "action": {
+        const i = workers.findIndex((w) => w.key === d.w);
+        if (i < 0) break;
+        if (workers === view.workers) workers = [...workers];
+        workers[i] = { ...workers[i]!, action: { label: d.a, at: d.t } };
+        break;
+      }
       case "idea": {
         const known = ideas.next.some((x) => x.id === d.i);
         if (d.to !== "queued" && known) ideas = { next: ideas.next.filter((x) => x.id !== d.i), total: Math.max(0, ideas.total - 1) };
@@ -438,7 +522,17 @@ export function applyDeltas(view: LiveView, msg: LiveDeltaMessage, effectText?: 
       }
     }
   }
-  return { view: { ...view, cards, workers, ideas, lastEventId }, refetch };
+  // The bench strip follows its card's pair progress.
+  let bench = view.bench;
+  if (cards !== view.cards) {
+    bench = view.bench.map((h) => {
+      if (h.current?.kind !== "measure") return h;
+      const cur = h.current;
+      const c = cards.find((x) => x.n === cur.n);
+      return c && c.pairs !== cur.pairs && (c.stage === "measuring" || c.stage === "confirming" || c.stage === "promoting") ? { ...h, current: { ...cur, stage: c.stage, pairs: c.pairs } } : h;
+    });
+  }
+  return { view: { ...view, cards, workers, ideas, lastEventId, bands, bench }, refetch };
 }
 
 // ---------------------------------------------------------------- replay
@@ -469,6 +563,7 @@ export const REPLAY_KINDS = [
   "best.promoted",
   "idea.added",
   "idea.status",
+  "worker.action",
 ] as const;
 
 /**
@@ -559,3 +654,39 @@ export function replaySkeleton(events: readonly EventLike[], until = Number.POSI
   }
   return s;
 }
+
+// ------------------------------------------------- shared by live and replay
+
+/** The bench utilization window. */
+export const UTILIZATION_WINDOW_S = 600;
+
+/** Lanes that rebase on their next submission when best moves: live workers other than the winner's, past spawning and not finishing. */
+export function rebaseLanes(workers: ReadonlyArray<Pick<LiveWorker, "key" | "phase">>, winnerKey: number | null): number[] {
+  return workers.filter((w) => w.key !== winnerKey && w.phase !== "starting" && w.phase !== "finishing" && w.phase !== "done").map((w) => w.key);
+}
+
+/** Best vs base after each promotion, compounded in decision order. */
+export function bestHistory(wins: ReadonlyArray<{ n: number; at: number; effect: number }>, direction: "lower" | "higher"): Array<{ at: number; n: number; value: number }> {
+  let acc = 0;
+  return wins.map((w) => {
+    acc = compoundOne(acc, w.effect, direction);
+    return { at: w.at, n: w.n, value: acc };
+  });
+}
+
+/** Which measurements show a band: the ones on the bench, and ones that ended within BAND_LINGER_MS. */
+export function bandShown(stage: Stage, decidedAt: number | null, now: number): boolean {
+  if (stage === "measuring" || stage === "confirming" || stage === "promoting") return true;
+  return stage === "decided" && decidedAt !== null && now - decidedAt <= BAND_LINGER_MS;
+}
+
+/** How busy a bench host was over the window: its intervals clipped to [max(window start, running since), now]. */
+export function utilization(intervals: ReadonlyArray<{ start: number; end: number | null }>, now: number, runningFrom: number | null): { utilization: number | null; windowSeconds: number } {
+  const windowStart = now - UTILIZATION_WINDOW_S * 1000;
+  const from = Math.max(windowStart, runningFrom ?? windowStart);
+  const span = Math.max(0, now - from);
+  let busy = 0;
+  for (const i of intervals) busy += Math.max(0, Math.min(i.end ?? now, now) - Math.max(i.start, from));
+  return { utilization: span >= 5000 ? Math.min(1, busy / span) : null, windowSeconds: Math.round(span / 1000) };
+}
+

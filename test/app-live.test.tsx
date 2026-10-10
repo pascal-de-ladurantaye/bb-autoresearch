@@ -32,11 +32,11 @@ function liveFixture(over: Partial<LiveView> = {}): LiveView {
     now: t,
     lastEventId: 100,
     studyThreadId: "thr_study",
-    best: { text: "23.4% fewer ops", n: 1, at: t - 60_000 },
+    best: { text: "23.4% fewer ops", n: 1, at: t - 60_000, value: 0.234, movedAt: t - 60_000, history: [{ at: t - 60_000, n: 1, value: 0.234 }], rebases: [] },
     counts: { candidates: 4, maxCandidates: 6, workers: 2, targetWorkers: 3, queue: 1 },
     workers: [
-      { key: 1, threadId: "thr_w1", ideaId: 3, ideaTitle: "Memoize fib", theme: "algo", phase: "measuring", phaseAt: t - 42_000, spawnedAt: t - 300_000, submissions: 1, maxSubmissions: 2, candidate: 2, candidateStage: "measuring", queuePosition: null },
-      { key: 2, threadId: "thr_w2", ideaId: 4, ideaTitle: "Use a set", theme: "data", phase: "editing", phaseAt: t - 5_000, spawnedAt: t - 90_000, submissions: 0, maxSubmissions: 2, candidate: null, candidateStage: null, queuePosition: null },
+      { key: 1, threadId: "thr_w1", ideaId: 3, ideaTitle: "Memoize fib", theme: "algo", phase: "measuring", phaseAt: t - 42_000, spawnedAt: t - 300_000, submissions: 1, maxSubmissions: 2, candidate: 2, candidateStage: "measuring", queuePosition: null, action: null },
+      { key: 2, threadId: "thr_w2", ideaId: 4, ideaTitle: "Use a set", theme: "data", phase: "editing", phaseAt: t - 5_000, spawnedAt: t - 90_000, submissions: 0, maxSubmissions: 2, candidate: null, candidateStage: null, queuePosition: null, action: null },
     ],
     cards: [
       { n: 1, ideaId: 1, ideaTitle: "Closed form sum", workerKey: null, stage: "decided", column: "promoted", stageAt: t - 60_000, verdict: "win", effect: 0.234, effectText: "23.4% fewer ops", hostId: "host_test", pairs: { run: "confirm", done: 6, of: 6 }, rebases: 0, submittedAt: t - 200_000, decidedAt: t - 60_000 },
@@ -46,13 +46,14 @@ function liveFixture(over: Partial<LiveView> = {}): LiveView {
     ],
     queue: [3],
     bench: [{ hostId: "host_test", name: "local", status: "online", healthOk: true, deferredUntil: null, current: { kind: "measure", n: 2, stage: "measuring", pairs: { run: "measure", done: 3, of: 6 }, startedAt: t - 42_000 }, utilization: 0.73, windowSeconds: 600 }],
-    ideas: { next: [{ id: 7, title: "Vectorize the inner loop", theme: "algo", pinned: true, source: "human" }], total: 3 },
+    ideas: { next: [{ id: 7, title: "Vectorize the inner loop", theme: "algo", pinned: true, source: "human", blocked: null }], total: 3 },
     feed: [
       { id: 90, at: t - 50_000, candidate: 3, text: "c/3 tests started", tone: "info" },
       { id: 91, at: t - 42_000, candidate: 2, text: "c/2 on the bench (local)", tone: "info" },
       { id: 92, at: t - 20_000, candidate: 4, text: "c/4 lost: 0.4% more ops (worse)", tone: "lose" },
       { id: 93, at: t - 10_000, candidate: 3, text: "c/3 tests passed in 41 s, queued for the bench", tone: "info" },
     ],
+    bands: [],
     ...over,
   };
 }

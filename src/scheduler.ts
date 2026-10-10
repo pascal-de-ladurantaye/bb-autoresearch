@@ -93,6 +93,41 @@ export function pickIdea(queued: readonly IdeaRow[], running: readonly IdeaRow[]
   return null;
 }
 
+/** An idea in the order the scheduler will assign it, or why it waits. */
+export interface UpNext<T> {
+  idea: T;
+  /** Why it can't be picked now (theme cap, repeats a lost idea), or null when it is in pick order. */
+  blocked: string | null;
+}
+
+/**
+ * The queue in the order the scheduler will assign it: `pickIdea` applied
+ * repeatedly, each pick counting as running for the next (so the theme cap
+ * applies as it will when workers spawn). Ideas the policy skips follow in
+ * board order with the reason. Live view "Up next".
+ */
+export function upNext<T extends Pick<IdeaRow, "id" | "title" | "theme" | "pinned" | "priority" | "status" | "source" | "variation_of">>(queued: readonly T[], running: readonly Pick<IdeaRow, "theme">[], w: number, opts: PickOptions = {}): Array<UpNext<T>> {
+  const pool = queued.filter((i) => i.status === "queued");
+  const run = [...running];
+  const out: Array<UpNext<T>> = [];
+  const picked = new Set<number>();
+  for (;;) {
+    const next = pickIdea(pool.filter((i) => !picked.has(i.id)) as unknown as IdeaRow[], run as IdeaRow[], w, opts) as unknown as T | null;
+    if (!next) break;
+    picked.add(next.id);
+    out.push({ idea: next, blocked: null });
+    run.push(next);
+  }
+  const perTheme = Math.ceil(w / 2);
+  const lost = opts.lostTitles ?? new Set<string>();
+  const rest = pool.filter((i) => !picked.has(i.id)).sort((a, b) => b.pinned - a.pinned || b.priority - a.priority || a.id - b.id);
+  for (const idea of rest) {
+    const reason = repeatsLostIdea(idea, lost) ? "repeats an idea that lost" : idea.theme ? `waits: ${perTheme} running on ${idea.theme}` : "waits";
+    out.push({ idea, blocked: reason });
+  }
+  return out;
+}
+
 export interface BudgetState {
   candidates: number;
   maxCandidates: number;

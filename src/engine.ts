@@ -16,6 +16,7 @@ import { studyReport } from "./report.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
 import { ciText, compound, improvementText, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
+import { actionLabel, itemLabel } from "./action.ts";
 import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
 
@@ -73,6 +74,8 @@ export class Engine {
       maxWorkers: (study) => this.maxWorkers(study),
       bestMoved: (study, winner, promoted) => void this.notifyBestMoved(study, winner, promoted).catch((e) => this.ctx.bb.log("warn", `best-moved notice: ${errText(e)}`)),
       notify: (study, kind, text) => this.notify(study.id, kind, text),
+      onSample: (studyId, candidateId) => this.live.onSample(studyId, candidateId),
+      onMeasured: (candidateId) => this.live.storeBand(candidateId),
     });
     this.harvester = new Harvester(ctx, this.pipeline, {
       notify: (study, kind, text, opts) => this.notify(study.id, kind, text, opts),
@@ -84,6 +87,22 @@ export class Engine {
 
   private get store() {
     return this.ctx.store;
+  }
+
+  /**
+   * Plugin dispose (reload, disable, shutdown). BB closes the database right
+   * after the dispose hooks, but this instance may still have measurements,
+   * harvests and activity reads in flight. Stop them and close the store
+   * first, so nothing touches the closed handle and nothing is logged; the
+   * next instance reconciles (a measurement in progress restarts).
+   */
+  dispose(): void {
+    if (this.ctx.disposed) return;
+    this.ctx.disposed = true;
+    this.pipeline.cancelMeasurements(() => true, "plugin disposed");
+    this.harvester.abortAll();
+    this.live.dispose();
+    this.ctx.store.close();
   }
 
   study(slug: string): StudyRow {
@@ -1039,18 +1058,31 @@ export class Engine {
   /** Read new tool items of a worker's thread and record its activity (tests await this). */
   async readActivity(rowId: number): Promise<void> {
     for (let page = 0; page < 5; page++) {
-      const w = this.store.threadRow(rowId);
+      let w = this.store.threadRow(rowId);
       if (!w?.thread_id) return;
+      // Labels show paths relative to the worktree, so learn where it is (once).
+      if (!w.worktree_path) {
+        await this.resolveWorktree(w).catch(() => undefined);
+        w = this.store.threadRow(rowId)!;
+      }
       const limit = THREAD_EVENTS_PAGE;
-      const { seq, items } = await this.ctx.bb.threadActivity(w.thread_id, w.activity_seq, limit);
+      const { seq, items } = await this.ctx.bb.threadActivity(w.thread_id!, w.activity_seq, limit);
       if (seq <= w.activity_seq) return;
       let latest: { activity: Activity; at: number } | null = null;
       for (let i = items.length - 1; i >= 0 && !latest; i--) {
         const a = classifyItem(items[i]!);
         if (a) latest = { activity: a, at: items[i]!.at };
       }
-      this.store.updateThread(rowId, { activity_seq: seq, ...(latest ? { activity: latest.activity, activity_at: latest.at } : {}) });
-      if (latest) this.live.schedule(w.study_id);
+      // The "last action" line: a short, sanitized label of the latest item that says something.
+      const label = actionLabel(items, w.worktree_path);
+      let labelAt: number | null = null;
+      if (label) for (let i = items.length - 1; i >= 0 && labelAt === null; i--) if (itemLabel(items[i]!, w.worktree_path)) labelAt = items[i]!.at;
+      this.store.updateThread(rowId, {
+        activity_seq: seq,
+        ...(latest ? { activity: latest.activity, activity_at: latest.at } : {}),
+        ...(label ? { last_action: label, last_action_at: labelAt } : {}),
+      });
+      if (latest || label) this.live.schedule(w.study_id);
       if (items.length < limit) return;
     }
   }
@@ -1121,6 +1153,7 @@ export class Engine {
 
   /** One control-loop pass over running studies. Concurrent callers share one pass; a kick during a pass runs another. */
   tick(): Promise<void> {
+    if (this.ctx.disposed) return Promise.resolve();
     if (this.currentTick) {
       this.tickAgain = true;
       return this.currentTick;
@@ -1131,13 +1164,14 @@ export class Engine {
         do {
           this.tickAgain = false;
           for (const study of this.store.studies(["running", "paused", "harvesting"])) {
+            if (this.ctx.disposed) break;
             try {
               await this.tickStudy(study.id);
             } catch (e) {
-              this.ctx.bb.log("warn", `study ${study.slug}: ${errText(e)}`);
+              if (!this.ctx.disposed) this.ctx.bb.log("warn", `study ${study.slug}: ${errText(e)}`);
             }
           }
-        } while (this.tickAgain);
+        } while (this.tickAgain && !this.ctx.disposed);
       } finally {
         this.currentTick = null;
       }

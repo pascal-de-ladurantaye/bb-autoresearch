@@ -20,6 +20,9 @@ import { HarvestTab } from "./Harvest.tsx";
 import { IdeasTab } from "./Ideas.tsx";
 import { LiveStudy } from "./live/LiveStudy.tsx";
 import { requestOpenBeside } from "./live/openBeside.ts";
+import { replayPath } from "./live/routes.ts";
+
+export { replayPath } from "./live/routes.ts";
 import { OracleTab } from "./Oracle.tsx";
 import { OverviewTab } from "./Overview.tsx";
 import { EmptyState, ErrorLine, FOCUS_RING, Skeleton, StatePill, Tabs } from "./ui.tsx";
@@ -38,19 +41,22 @@ export function defaultTab(state: string): Tab {
   return state === "running" ? "live" : "overview";
 }
 
-export function parseSubPath(subPath: string): { slug: string | null; tab: Tab; candidate: number | null } {
-  const [slug, tab, n] = subPath.split("/").filter(Boolean);
+export function parseSubPath(subPath: string): { slug: string | null; tab: Tab; candidate: number | null; replay: { at: number | null } | null } {
+  const [slug, tab, n, at] = subPath.split("/").filter(Boolean);
   const okSlug = slug && /^[a-z0-9][a-z0-9-]{1,47}$/u.test(slug) ? slug : null;
   const t = (TABS as readonly string[]).includes(tab ?? "") ? (tab as Tab) : "overview";
   const num = n && /^\d+$/u.test(n) ? Number(n) : null;
-  return { slug: okSlug, tab: t, candidate: num };
+  // The Live tab's replay: <slug>/live/replay[/<ms since the study's first event>].
+  const replay = t === "live" && n === "replay" ? { at: at && /^\d{1,13}$/u.test(at) ? Number(at) : null } : null;
+  return { slug: okSlug, tab: t, candidate: num, replay };
 }
+
 
 export function StudiesPanel({ subPath }: { subPath: string }) {
   const route = parseSubPath(subPath);
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto box-border w-full max-w-6xl px-4 pb-6 pt-3 md:px-5 md:pt-4">{route.slug ? <StudyPage key={route.slug} slug={route.slug} tab={explicitTab(subPath)} candidate={route.candidate} /> : <StudyList />}</div>
+      <div className="mx-auto box-border w-full max-w-6xl px-4 pb-6 pt-3 md:px-5 md:pt-4">{route.slug ? <StudyPage key={route.slug} slug={route.slug} tab={explicitTab(subPath)} candidate={route.candidate} replay={route.replay} /> : <StudyList />}</div>
     </div>
   );
 }
@@ -213,7 +219,7 @@ function StudyList() {
   );
 }
 
-function StudyPage({ slug, tab: routeTab, candidate }: { slug: string; tab: Tab | null; candidate: number | null }) {
+function StudyPage({ slug, tab: routeTab, candidate, replay }: { slug: string; tab: Tab | null; candidate: number | null; replay: { at: number | null } | null }) {
   const nav = useBbNavigate();
   const rpc = useStudyRpc();
   const o = useLive((r) => r.call("study.overview", { slug }), [slug]);
@@ -304,6 +310,10 @@ function StudyPage({ slug, tab: routeTab, candidate }: { slug: string; tab: Tab 
               <LiveStudy
                 slug={slug}
                 layout="wide"
+                replay={replay}
+                onReplay={() => nav.toPluginPanel("studies", { subPath: replayPath(slug) })}
+                onReplayMove={(at) => nav.toPluginPanel("studies", { subPath: replayPath(slug, at), replace: true })}
+                onExitReplay={() => go("live")}
                 onOpenCandidate={(n) => go("candidates", n)}
                 onOpenOverview={() => go("overview")}
                 onOpenBeside={(threadId) => {
