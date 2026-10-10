@@ -134,8 +134,8 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
       const total = row?.data?.tokenUsage?.total?.totalTokens;
       return typeof total === "number" && Number.isFinite(total) ? total : null;
     },
-    async threadActivity(threadId, afterSeq, limit = 200) {
-      const rows = await bb.sdk.threads.events.list({ threadId, afterSeq: String(afterSeq), types: ["item/started"], order: "asc", limit: String(limit) });
+    async threadActivity(threadId, afterSeq, limit = 100) {
+      const rows = await bb.sdk.threads.events.list({ threadId, afterSeq: String(afterSeq), types: ["item/started"], order: "asc", limit: String(Math.min(100, limit)) });
       let seq = afterSeq;
       const items = [];
       for (const r of rows) {

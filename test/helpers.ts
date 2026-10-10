@@ -505,8 +505,9 @@ export class FakePort implements BbPort {
   /** Tool items per thread (item/started), as the live view reads them. */
   activity = new Map<string, ThreadActivityItem[]>();
   activityCalls = 0;
-  async threadActivity(threadId: string, afterSeq: number, limit = 200) {
+  async threadActivity(threadId: string, afterSeq: number, limit = 100) {
     this.activityCalls += 1;
+    if (limit > 100) throw new Error("HTTP 400: Thread event limit cannot exceed 100");
     const items = (this.activity.get(threadId) ?? []).filter((i) => i.seq > afterSeq).slice(0, limit);
     return { seq: items.length ? items[items.length - 1]!.seq : afterSeq, items };
   }

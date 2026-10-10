@@ -574,7 +574,7 @@ export class Pipeline {
     // Pair progress for the live view: completed pairs (noisy) or candidate runs, recorded as
     // measure.progress events at a coarse granularity (the first, then at most one per
     // PROGRESS_EVERY_MS, and the last before a decision) so replay can rebuild the bench strip.
-    const pairs = { run: "measure", done: 0, sides: new Map<string, Set<Side>>(), counted: new Set<string>(), lastAt: 0, recorded: 0 };
+    const pairs = { run: "measure", done: 0, sides: new Map<string, Set<Side>>(), counted: new Set<string>(), lastAt: 0, recorded: 0, byRun: {} as Record<string, number> };
     const recordProgress = (force: boolean) => {
       if (pairs.done === pairs.recorded) return;
       const now = this.ctx.now();
@@ -590,6 +590,7 @@ export class Pipeline {
         store.addSample({ study_id: study.id, candidate_id: c.id, run, pair: s.pair, side: s.side, metric, value, host_id: host.host_id });
       }
       if (run !== pairs.run) {
+        pairs.byRun[pairs.run] = pairs.done;
         pairs.run = run;
         pairs.done = 0;
         pairs.recorded = 0;
@@ -662,7 +663,7 @@ export class Pipeline {
     }
     const seconds = (this.ctx.now() - started) / 1000;
     store.addBenchSeconds(study.id, seconds);
-    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run });
+    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run, measure_pairs: pairs.run === "measure" ? pairs.done : (pairs.byRun.measure ?? 0), confirm_pairs: pairs.run === "confirm" ? pairs.done : 0 });
     const hostRow = store.benchHost(study.id, host.host_id)!;
     store.updateBenchHost(study.id, host.host_id, { evals_since_drift: hostRow.evals_since_drift + 1 });
     // Cache a run of best: reused as the baseline by single-run classes, and its DIAG lines go into briefs.

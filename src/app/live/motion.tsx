@@ -31,6 +31,12 @@ class FlipRegistry {
   expiry = new Map<string, ReturnType<typeof setTimeout>>();
   mounted = new Map<string, number>();
   ready = false;
+  /** Last time an animation frame ran (a hidden or occluded page renders none: animating there would freeze items mid-flight). */
+  lastFrame = Number.NEGATIVE_INFINITY;
+  rendering(): boolean {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return false;
+    return typeof performance === "undefined" || performance.now() - this.lastFrame < 2500;
+  }
   constructor(
     public root: HTMLElement | null,
     public reduced: boolean,
@@ -51,9 +57,18 @@ export function FlipRoot({ children, className }: { children: ReactNode; classNa
   registry.current.reduced = reduced;
   useLayoutEffect(() => {
     registry.current!.root = ref.current;
-    // Items present at the first paint don't fly in.
-    const t = setTimeout(() => (registry.current!.ready = true), 0);
-    return () => clearTimeout(t);
+    // Items present when the view first fills in don't fly in.
+    const t = setTimeout(() => (registry.current!.ready = true), 1500);
+    // A cheap heartbeat: one animation frame per second tells whether the page is rendering at all.
+    const probe = () => {
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => (registry.current!.lastFrame = performance.now()));
+    };
+    probe();
+    const beat = setInterval(probe, 1000);
+    return () => {
+      clearTimeout(t);
+      clearInterval(beat);
+    };
   }, []);
   return (
     <FlipContext.Provider value={registry.current}>
@@ -80,7 +95,7 @@ export function useFlip<T extends HTMLElement>(key: string): (el: T | null) => v
     const now = { x: r.left - o.x, y: r.top - o.y };
     const prev = reg.rects.get(key);
     reg.rects.set(key, now);
-    if (reg.reduced || typeof node.animate !== "function") return;
+    if (reg.reduced || typeof node.animate !== "function" || !reg.rendering()) return;
     if (prev) {
       const dx = prev.x - now.x;
       const dy = prev.y - now.y;

@@ -46,6 +46,8 @@ export class EngineError extends Error {
 }
 
 const LIVE_WORKER_STATES = ["spawning", "active", "finishing"] as const;
+/** BB caps a thread events page at 100 rows. */
+const THREAD_EVENTS_PAGE = 100;
 
 /** The last provider usage reading stored on the study. */
 export interface UsageReading {
@@ -62,6 +64,7 @@ export class Engine {
   readonly live: LiveRecorder;
   private activityReads = new Map<string, Promise<void>>();
   private activityAgain = new Set<string>();
+  private activitySeen = new Map<string, number>();
 
   constructor(readonly ctx: Ctx) {
     this.pipeline = new Pipeline(ctx, {
@@ -1010,7 +1013,9 @@ export class Engine {
   onThreadEvents(threadId: string, sequence: number): void {
     const row = this.store.threadById(threadId);
     if (!row || row.role !== "worker" || !(row.state === "active" || row.state === "spawning")) return;
-    if (sequence <= row.activity_seq) return;
+    // Only read when the thread moved past what was already read (BB notifies about every event, items or not).
+    if (sequence <= row.activity_seq || sequence <= (this.activitySeen.get(threadId) ?? 0)) return;
+    this.activitySeen.set(threadId, sequence);
     if (this.activityReads.has(threadId)) {
       this.activityAgain.add(threadId);
       return;
@@ -1022,7 +1027,10 @@ export class Engine {
         this.ctx.bb.log("warn", `worker activity ${threadId}: ${errText(e)}`);
       } finally {
         this.activityReads.delete(threadId);
-        if (this.activityAgain.delete(threadId)) this.onThreadEvents(threadId, Number.MAX_SAFE_INTEGER);
+        if (this.activityAgain.delete(threadId)) {
+          this.activitySeen.delete(threadId);
+          this.onThreadEvents(threadId, Number.MAX_SAFE_INTEGER);
+        }
       }
     })();
     this.activityReads.set(threadId, run);
@@ -1033,7 +1041,7 @@ export class Engine {
     for (let page = 0; page < 5; page++) {
       const w = this.store.threadRow(rowId);
       if (!w?.thread_id) return;
-      const limit = 200;
+      const limit = THREAD_EVENTS_PAGE;
       const { seq, items } = await this.ctx.bb.threadActivity(w.thread_id, w.activity_seq, limit);
       if (seq <= w.activity_seq) return;
       let latest: { activity: Activity; at: number } | null = null;

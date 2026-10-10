@@ -433,10 +433,19 @@ export function feedItems(
   const gatingAt = new Map<number, number>();
   const nOf = (d: Record<string, unknown>): number | null => (typeof d.n === "number" ? d.n : typeof d.candidate === "number" ? (ctx.candidateN.get(d.candidate) ?? null) : null);
   const idea = (id: unknown): string => (typeof id === "number" ? `idea #${id}${ctx.ideas.get(id) ? ` (${clip(ctx.ideas.get(id)!.title, 60)})` : ""}` : "an idea");
+  let pendingBest: LiveFeedItem | null = null;
+  const flushBest = () => {
+    if (pendingBest) out.push(pendingBest);
+    pendingBest = null;
+  };
   for (const e of events) {
     const d = e.data;
     const n = nOf(d);
-    const push = (text: string, tone: FeedTone = "info", candidate: number | null = n) => out.push({ id: e.id, at: e.at, candidate, text, tone });
+    if (pendingBest && !(e.kind === "candidate.verdict" && n === pendingBest.candidate) && e.kind !== "candidate.stage" && e.kind !== "bench.cache_invalidated") flushBest();
+    const push = (text: string, tone: FeedTone = "info", candidate: number | null = n) => {
+      out.push({ id: e.id, at: e.at, candidate, text, tone });
+      if (e.kind === "candidate.verdict") flushBest();
+    };
     switch (e.kind) {
       case "candidate.submitted":
         push(`c/${n} submitted${typeof d.files === "number" ? ` (${plural(d.files, "file")})` : ""}`);
@@ -460,7 +469,7 @@ export function feedItems(
         push(`c/${n} rebased onto the new best`);
         break;
       case "candidate.requeued":
-        push(`c/${n} back to tests: ${clip(String(d.reason ?? "best moved"), 80)}`, "warn");
+        push(`c/${n} sent back: ${clip(String(d.reason ?? "best moved"), 80)}`, "warn");
         break;
       case "measure.started":
         push(`c/${n} on the bench${typeof d.host === "string" ? ` (${ctx.hostName(d.host)})` : ""}`);
@@ -471,9 +480,12 @@ export function feedItems(
       case "measure.deferred":
         push(`c/${n} waits: the bench host failed its health check`, "warn");
         break;
-      case "measure.finished":
-        push(`c/${n} measured${typeof d.pairs === "number" ? `: ${plural(d.pairs, "pair")}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}`);
+      case "measure.finished": {
+        const m = typeof d.measure_pairs === "number" ? d.measure_pairs : typeof d.pairs === "number" ? d.pairs : null;
+        const c = typeof d.confirm_pairs === "number" && d.confirm_pairs > 0 ? d.confirm_pairs : 0;
+        push(`c/${n} measured${m !== null ? `: ${plural(m, "pair")}${c ? `, then ${plural(c, "confirmation pair")}` : ""}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}`);
         break;
+      }
       case "candidate.verdict": {
         const eff = typeof d.effect === "number" ? improvementText(d.effect, ctx.metric, { digits: 1, factor: false }) : null;
         const reason = Array.isArray(d.reasons) && typeof d.reasons[0] === "string" ? clip(d.reasons[0], 90) : "";
@@ -502,7 +514,8 @@ export function feedItems(
         break;
       }
       case "best.promoted":
-        push(`Best moved: c/${n} promoted, workers notified`, "best");
+        // Promotion is recorded just before the verdict; tell it after the "won" line.
+        pendingBest = { id: e.id, at: e.at, candidate: n, text: `Best moved: c/${n} promoted, workers notified`, tone: "best" };
         break;
       case "worker.spawned":
         push(`A worker picked ${idea(d.idea)}`, "info", null);
@@ -521,6 +534,7 @@ export function feedItems(
         break;
     }
   }
+  flushBest();
   return out;
 }
 

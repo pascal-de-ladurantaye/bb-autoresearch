@@ -88,6 +88,13 @@ describe("live model: derivation", () => {
     expect(classifyItem({ kind: "commandExecution", command: "bash -lc 'cd src && sed -n 1,40p toy.py'" })).toBe("reading");
     expect(classifyItem({ kind: "commandExecution", command: "/bin/zsh -lc \"python -m pytest -q\"" })).toBe("testing");
     expect(classifyItem({ kind: "commandExecution", command: "cd /wt && python bench/measure.py" })).toBe("testing");
+    // Edits through the shell, and compound commands judged by their strongest part.
+    expect(classifyItem({ kind: "commandExecution", command: "sed -i 's/a/b/' src/toy.py" })).toBe("editing");
+    expect(classifyItem({ kind: "commandExecution", command: "cat bench/test_toy.py | head -30; python3 - <<'E'\nimport re\np='src/toy.py'; s=open(p).read()\nopen(p,'w').write(s)\nE" })).toBe("editing");
+    expect(classifyItem({ kind: "commandExecution", command: "cat > src/toy.py <<'EOF'\nx = 1\nEOF" })).toBe("editing");
+    expect(classifyItem({ kind: "commandExecution", command: "cat src/toy.py; python3 bench/test_toy.py 2>&1 | tail -3" })).toBe("testing");
+    expect(classifyItem({ kind: "commandExecution", command: "find . -type f -print | head; cat src/*.py" })).toBe("reading");
+    expect(classifyItem({ kind: "commandExecution", command: "python3 bench/measure.py > /dev/null 2>&1" })).toBe("testing");
     expect(classifyItem({ kind: "toolCall", tool: "edit" })).toBe("editing");
     expect(classifyItem({ kind: "toolCall", tool: "read" })).toBe("reading");
     expect(classifyItem({ kind: "toolCall", tool: "bash" })).toBe("testing");
@@ -370,6 +377,26 @@ describe("live recorder and view (fake host)", () => {
     expect(port.published.some((p) => p.channel === "study-changed")).toBe(true);
   });
 
+  it("reads tool items when BB announces new thread events, once per new sequence, at most 100 per page", async () => {
+    await running(["Idea A"]);
+    for (let i = 0; i < 130; i++) port.addActivity("thr_w1", i < 129 ? "fileRead" : "fileChange", { at: clock.t + i });
+    engine.onThreadEvents("thr_w1", 500);
+    engine.onThreadEvents("thr_w1", 500); // coalesced: already reading
+    await new Promise((r) => setTimeout(r, 20));
+    engine.live.flushPending();
+    const w = store.threadById("thr_w1")!;
+    expect(w).toMatchObject({ activity: "editing", activity_seq: 130, phase: "editing" });
+    const calls = port.activityCalls;
+    engine.onThreadEvents("thr_w1", 500); // nothing new since that sequence
+    await new Promise((r) => setTimeout(r, 20));
+    expect(port.activityCalls).toBe(calls);
+    // Strategist and unknown threads are ignored.
+    engine.onThreadEvents("thr_study", 900);
+    engine.onThreadEvents("thr_nope", 900);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(port.activityCalls).toBe(calls);
+  });
+
   it("rate-limits flips between reading, editing and testing", async () => {
     engine.live.dispose();
     engine = new Engine({ ...engine.ctx, config: { ...engine.ctx.config, liveDwellMs: 3000 } });
@@ -413,6 +440,9 @@ describe("live recorder and view (fake host)", () => {
     const texts = v.feed.map((f) => f.text);
     expect(texts).toEqual(expect.arrayContaining(["c/1 tests started", "c/1 won: 10.0% lower size", "Best moved: c/1 promoted, workers notified"]));
     expect(texts.some((t) => /^c\/1 tests passed in [\d.]+ s, queued for the bench$/u.test(t))).toBe(true);
+    // Promotion is recorded before the verdict, but the feed tells the win first.
+    expect(texts.indexOf("c/1 won: 10.0% lower size")).toBeLessThan(texts.indexOf("Best moved: c/1 promoted, workers notified"));
+    expect(texts.some((t) => /^c\/1 measured: \d+ pairs, then \d+ confirmation pairs? in /u.test(t))).toBe(true);
     expect(texts.some((t) => /^c\/2 (lost|inconclusive): /u.test(t))).toBe(true);
     expect(v.feed.find((f) => f.text.startsWith("c/1 won"))).toMatchObject({ candidate: 1, tone: "win" });
     expect(texts.some((t) => t.startsWith("A worker picked idea #1 (Idea A)"))).toBe(true);

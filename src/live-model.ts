@@ -82,6 +82,9 @@ export interface ActivityItem {
 
 const READ_ONLY_COMMAND = /^(?:cat|less|more|head|tail|ls|ll|tree|pwd|rg|grep|egrep|ag|find|fd|wc|file|stat|du|which|type|echo|printf|nl|sed\s+-n|awk|git\s+(?:log|show|diff|status|blame|grep|ls-files|rev-parse|branch))\b/u;
 
+/** Shell commands that write files: in-place edits, patches, redirects into a file, scripts that write. */
+const WRITES_FILES = /\b(?:apply_patch|patch\s+-p|sed\s+-i|perl\s+-p?i|tee\s)|(?:^|[^>&0-9])>{1,2}\s*(?!\/dev\/null|&)[\w./-]+|\.write(?:_text)?\(|open\([^)]*['"][wa]\+?['"]/u;
+
 function unwrapShell(command: string): string {
   let c = command.trim();
   const wrapped = /^(?:\/bin\/|\/usr\/bin\/)?(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1$/u.exec(c);
@@ -105,7 +108,11 @@ export function classifyItem(item: ActivityItem): Activity | null {
     case "commandExecution": {
       const c = unwrapShell(item.command ?? "");
       if (!c) return null;
-      return READ_ONLY_COMMAND.test(c) ? "reading" : "testing";
+      // Agents often edit through the shell (sed -i, heredocs, scripts that write files).
+      if (WRITES_FILES.test(c)) return "editing";
+      // A compound command is as strong as its strongest part: `cat x; python3 test.py` runs code.
+      const parts = c.split(/\s*(?:&&|\|\||;|\||\n)\s*/u).map((x) => unwrapShell(x)).filter(Boolean);
+      return parts.length && parts.every((x) => READ_ONLY_COMMAND.test(x)) ? "reading" : "testing";
     }
     case "toolCall": {
       const t = (item.tool ?? "").toLowerCase();

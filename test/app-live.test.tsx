@@ -144,12 +144,12 @@ describe("frontend: Live tab and Live panel", () => {
     expect(within(lanes).getByRole("button", { name: /Worker on idea #3, Memoize fib: being measured for 42 seconds, submission 1 of 2, c\/2 measuring/u })).toBeTruthy();
     expect(within(lanes).getByRole("button", { name: /Worker on idea #4, Use a set: editing for/u })).toBeTruthy();
     const pipeline = p.getByRole("region", { name: "Candidates in the pipeline" });
-    expect(within(pipeline).getByRole("listitem", { name: "Bench: 1" }).textContent).toMatch(/c\/2.*Memoize fib.*measuring · pair 3 of up to 6/u);
+    expect(within(pipeline).getByRole("listitem", { name: "Bench: 1" }).textContent).toMatch(/c\/2.*Memoize fib.*measuring · pair 3 of ≤6/u);
     expect(within(pipeline).getByRole("listitem", { name: "Queue: 1" }).textContent).toMatch(/c\/3.*1st in line/u);
     expect(within(pipeline).getByRole("listitem", { name: "Promoted: 1" }).textContent).toMatch(/c\/1.*win.*23\.4% fewer ops/u);
     expect(within(pipeline).getByRole("listitem", { name: "Verdict: 1" }).textContent).toMatch(/c\/4.*lose.*0\.4% more ops \(worse\)/u);
     const bench = p.getByRole("region", { name: "Bench" });
-    expect(bench.textContent).toMatch(/local.*healthy.*c\/2.*measuring.*pair 3 of up to 6/u);
+    expect(bench.textContent).toMatch(/local.*healthy.*c\/2.*measuring.*pair 3 of ≤6/u);
     expect(bench.textContent).toMatch(/busy 73% of the last 10 min/u);
     expect(bench.textContent).toMatch(/Queue:\s*c\/3/u);
     expect(p.getByRole("region", { name: "Up next" }).textContent).toMatch(/#7 Vectorize the inner loop.*algo.*and 2 more/u);
@@ -176,7 +176,7 @@ describe("frontend: Live tab and Live panel", () => {
       ],
     });
     const pipeline = p.getByRole("region", { name: "Candidates in the pipeline" });
-    await waitFor(() => expect(within(pipeline).getByRole("listitem", { name: "Bench: 2" }).textContent).toMatch(/c\/2.*pair 5 of up to 6.*c\/3/u));
+    await waitFor(() => expect(within(pipeline).getByRole("listitem", { name: "Bench: 2" }).textContent).toMatch(/c\/2.*pair 5 of ≤6.*c\/3/u));
     expect(within(pipeline).getByRole("listitem", { name: "Queue: 0" })).toBeTruthy();
     expect(p.getByRole("button", { name: /Worker on idea #4, Use a set: testing locally for/u })).toBeTruthy();
     expect(p.getByRole("region", { name: "Up next" }).textContent).not.toMatch(/Vectorize/u);
@@ -266,7 +266,7 @@ describe("frontend: Live tab and Live panel", () => {
     expect(within(workerBadge.container).queryByRole("button", { name: /live view/u })).toBeNull();
   });
 
-  it("motion: a card that moves column glides there; nothing animates under prefers-reduced-motion", async () => {
+  it("motion: a card that moves column glides there; nothing animates under prefers-reduced-motion or without rendered frames", async () => {
     const calls: Keyframe[][] = [];
     const proto = HTMLElement.prototype as unknown as { animate?: unknown; getBoundingClientRect: () => DOMRect };
     const originalAnimate = proto.animate;
@@ -281,6 +281,10 @@ describe("frontend: Live tab and Live panel", () => {
       const x = col?.parentElement ? [...col.parentElement.children].indexOf(col) * 100 : 0;
       return { left: x, top: 0, right: x + 90, bottom: 40, width: 90, height: 40, x, y: 0, toJSON() {} } as DOMRect;
     };
+    // The page renders frames (the view skips animation when it doesn't, e.g. a hidden tab).
+    const w = window as unknown as { requestAnimationFrame?: (cb: (t: number) => void) => number };
+    const originalRaf = w.requestAnimationFrame;
+    w.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 0) as unknown as number;
     const setReduced = (reduce: boolean) => {
       (window as unknown as { matchMedia: unknown }).matchMedia = (q: string) => ({ matches: reduce && q.includes("reduce"), media: q, addEventListener() {}, removeEventListener() {} });
     };
@@ -291,6 +295,7 @@ describe("frontend: Live tab and Live panel", () => {
         const p = await page("toy-size/live", { "study.live": async () => liveFixture() });
         await p.findByText("Live");
         expect(p.container.querySelector("[data-reduced-motion]") !== null).toBe(reduce);
+        await new Promise((r) => setTimeout(r, 20));
         // c/3 leaves the queue for the bench.
         await p.behavior.emitRealtime(LIVE_CHANNEL, { s: "s1", d: [{ k: "stage", id: 300, t: 1_800_000_000_000, c: 3, to: "measuring" }] });
         await waitFor(() => expect(within(p.getByRole("region", { name: "Candidates in the pipeline" })).getByRole("listitem", { name: "Bench: 2" })).toBeTruthy());
@@ -299,11 +304,39 @@ describe("frontend: Live tab and Live panel", () => {
         else expect(moves.length).toBeGreaterThan(0);
         p.lifecycle.unmount();
       }
+      // A page that renders no frames (a hidden tab) doesn't start animations that would freeze mid-flight.
+      calls.length = 0;
+      setReduced(false);
+      w.requestAnimationFrame = () => 0;
+      const hidden = await page("toy-size/live", { "study.live": async () => liveFixture() });
+      await hidden.findByText("Live");
+      await hidden.behavior.emitRealtime(LIVE_CHANNEL, { s: "s1", d: [{ k: "stage", id: 300, t: 1_800_000_000_000, c: 3, to: "measuring" }] });
+      await waitFor(() => expect(within(hidden.getByRole("region", { name: "Candidates in the pipeline" })).getByRole("listitem", { name: "Bench: 2" })).toBeTruthy());
+      expect(calls).toHaveLength(0);
     } finally {
       proto.animate = originalAnimate;
       proto.getBoundingClientRect = originalRect;
+      w.requestAnimationFrame = originalRaf;
       delete (window as unknown as { matchMedia?: unknown }).matchMedia;
     }
+  });
+
+  it("the Live tab switches to the compact layout when its area is narrow (e.g. beside an open side panel)", async () => {
+    const proto = HTMLElement.prototype as unknown as { getBoundingClientRect: () => DOMRect };
+    const original = proto.getBoundingClientRect;
+    proto.getBoundingClientRect = () => ({ left: 0, top: 0, right: 500, bottom: 100, width: 500, height: 100, x: 0, y: 0, toJSON() {} }) as DOMRect;
+    try {
+      const p = await page("toy-size/live", { "study.live": async () => liveFixture() });
+      await p.findByText("Live");
+      await waitFor(() => expect(p.container.querySelector("[data-layout]")?.getAttribute("data-layout")).toBe("compact"));
+      // Still offers to open beside the study thread (it is the Live tab).
+      expect(p.getByRole("button", { name: "Open beside the study thread" })).toBeTruthy();
+      p.lifecycle.unmount();
+    } finally {
+      proto.getBoundingClientRect = original;
+    }
+    const wide = await page("toy-size/live", { "study.live": async () => liveFixture() });
+    await waitFor(() => expect(wide.container.querySelector("[data-layout]")?.getAttribute("data-layout")).toBe("wide"));
   });
 
   it("groups the feed by candidate, newest group last", () => {

@@ -32,7 +32,29 @@ export interface LiveStudyProps {
 /** Recent verdict cards shown per column. */
 const SHOWN = { verdict: 5, promoted: 4 } as const;
 
-export function LiveStudy({ slug, layout, onOpenCandidate, onOpenOverview, onOpenBeside, initialWorker = null }: LiveStudyProps) {
+/** Below this width the wide layout's columns don't fit (a narrow window, or the page beside an open side panel). */
+const COMPACT_BELOW_PX = 760;
+
+/** The width of an element, following resizes (null until measured). */
+function useWidth(): [(el: HTMLDivElement | null) => void, number | null] {
+  const [width, setWidth] = useState<number | null>(null);
+  const observer = useRef<ResizeObserver | null>(null);
+  const ref = (el: HTMLDivElement | null) => {
+    observer.current?.disconnect();
+    observer.current = null;
+    if (!el) return;
+    setWidth(el.getBoundingClientRect().width || null);
+    if (typeof ResizeObserver === "function") {
+      observer.current = new ResizeObserver((entries) => setWidth(entries[0]?.contentRect.width ?? null));
+      observer.current.observe(el);
+    }
+  };
+  return [useMemo(() => ref, []), width]; // eslint-disable-line react-hooks/exhaustive-deps
+}
+
+export function LiveStudy({ slug, layout: requested, onOpenCandidate, onOpenOverview, onOpenBeside, initialWorker = null }: LiveStudyProps) {
+  const [measure, width] = useWidth();
+  const layout: LiveLayout = requested === "wide" && width !== null && width > 0 && width < COMPACT_BELOW_PX ? "compact" : requested;
   const live = useLiveStudy(slug);
   const now = useNow(live.offset);
   const [selected, setSelected] = useState<number | null>(initialWorker);
@@ -46,8 +68,11 @@ export function LiveStudy({ slug, layout, onOpenCandidate, onOpenOverview, onOpe
   }, [selected, v?.workers]);
 
   if (!v) {
-    if (live.error) return <ErrorLine error={live.error.includes("no study named") ? `No study named ${slug}.` : `Couldn't load the live view: ${live.error}`} retry={live.refetch} />;
-    return <Skeleton lines={layout === "wide" ? 8 : 5} label="Loading the live view…" />;
+    return (
+      <div ref={measure}>
+        {live.error ? <ErrorLine error={live.error.includes("no study named") ? `No study named ${slug}.` : `Couldn't load the live view: ${live.error}`} retry={live.refetch} /> : <Skeleton lines={layout === "wide" ? 8 : 5} label="Loading the live view…" />}
+      </div>
+    );
   }
   const inFlight = v.cards.some((c) => c.stage !== "decided");
   const quiet = v.state !== "running" && !v.workers.length && !inFlight;
@@ -64,8 +89,9 @@ export function LiveStudy({ slug, layout, onOpenCandidate, onOpenOverview, onOpe
     />
   );
   return (
+    <div ref={measure} data-layout={layout}>
     <FlipRoot className={cn("space-y-4", compact && "space-y-3")}>
-      <LiveHeader v={v} compact={compact} onOpenBeside={onOpenBeside} />
+      <LiveHeader v={v} compact={compact} onOpenBeside={requested === "wide" ? onOpenBeside : undefined} />
       {live.error ? <ErrorLine error={`Live updates failed (showing the last data): ${live.error}`} retry={live.refetch} /> : null}
       {quiet ? (
         <CalmState v={v} onOpenOverview={onOpenOverview} onOpenCandidate={onOpenCandidate} now={now} compact={compact} />
@@ -91,6 +117,7 @@ export function LiveStudy({ slug, layout, onOpenCandidate, onOpenOverview, onOpe
         </div>
       )}
     </FlipRoot>
+    </div>
   );
 }
 
@@ -341,7 +368,8 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
           : c.stage === "promoting"
             ? "promoting onto best"
             : `${STAGE_LABEL[c.stage]} · ${elapsed}`;
-  const label = `c/${c.n}${c.ideaTitle ? `, ${c.ideaTitle}` : ""}: ${vd ? vd.label : STAGE_LABEL[c.stage]}${detail ? `, ${detail}` : ""}. Open the candidate.`;
+  const spokenDetail = (c.stage === "measuring" || c.stage === "confirming") && c.pairs ? `${c.stage}, ${pairsText(c.pairs, { spoken: true })}` : detail;
+  const label = `c/${c.n}${c.ideaTitle ? `, ${c.ideaTitle}` : ""}: ${vd ? vd.label : STAGE_LABEL[c.stage]}${spokenDetail ? `, ${spokenDetail}` : ""}. Open the candidate.`;
   if (compact) {
     return (
       <button
@@ -354,7 +382,7 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
       >
         {vd ? <Icon name={vd.icon} className={cn("size-3", vd.tone)} aria-hidden /> : null}
         <span className="font-mono">c/{c.n}</span>
-        <span className="truncate text-muted-foreground">{c.stage === "measuring" || c.stage === "confirming" ? (c.pairs ? pairsText(c.pairs, true) : "") : c.stage === "decided" ? (vd?.label ?? "") : c.stage === "queued" && qpos ? ordinal(qpos) : ""}</span>
+        <span className="truncate text-muted-foreground">{c.stage === "measuring" || c.stage === "confirming" ? (c.pairs ? pairsText(c.pairs, { short: true }) : "") : c.stage === "decided" ? (vd?.label ?? "") : c.stage === "queued" && qpos ? ordinal(qpos) : ""}</span>
         {(c.stage === "measuring" || c.stage === "confirming") && c.pairs ? <PairBar pairs={c.pairs} className="w-10" /> : null}
       </button>
     );
@@ -392,9 +420,11 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
   );
 }
 
-function pairsText(p: Pairs, short = false): string {
-  const of = p.of > 1 ? (short ? `/${p.of}` : ` of up to ${p.of}`) : "";
-  return short ? `${p.done}${of}` : `${p.run === "confirm" ? "confirmation " : ""}pair ${p.done}${of}`;
+/** "pair 3 of ≤12" (the sequential test may stop early); `spoken` for labels; `short` for chips ("3/12"). */
+function pairsText(p: Pairs, opts: { short?: boolean; spoken?: boolean; run?: boolean } = {}): string {
+  if (opts.short) return `${p.done}${p.of > 1 ? `/${p.of}` : ""}`;
+  const of = p.of > 1 ? (opts.spoken ? ` of up to ${p.of}` : ` of ≤${p.of}`) : "";
+  return `${opts.run && p.run === "confirm" ? "confirmation " : ""}pair ${p.done}${of}`;
 }
 
 function PairBar({ pairs, className }: { pairs: Pairs; className?: string }) {
@@ -457,7 +487,7 @@ function BenchHost({ h, now, compact, onOpenCandidate }: { h: LiveBenchHost; now
               c/{cur.n}
             </button>
             <span className="text-muted-foreground">{cur.stage === "confirming" ? "confirming" : cur.stage === "promoting" ? "promoting" : "measuring"}</span>
-            {cur.pairs ? <span className="tabular-nums text-muted-foreground">{pairsText(cur.pairs)}</span> : null}
+            {cur.pairs ? <span className="tabular-nums text-muted-foreground">{pairsText(cur.pairs, { run: true })}</span> : null}
             <span className="ml-auto tabular-nums text-muted-foreground">{clock(now - cur.startedAt)}</span>
           </div>
           {cur.pairs ? <PairBar pairs={cur.pairs} /> : null}
