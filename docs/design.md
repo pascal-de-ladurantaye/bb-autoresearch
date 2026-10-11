@@ -1767,6 +1767,7 @@ Append-only migrations: `bench_hosts.side_runs`, `bench_hosts.run_seconds`, `stu
 - **Auto side runs cap at 30.** A benchmark faster than `min_side_seconds` / 30 should repeat itself internally.
 - **The confirmation skip** uses only the primary metric's CI; guardrails are then judged on the first measurement's pairs.
 - **Replay** shows the headline across segments but not the segment's raw values.
+- **Harvest attribution.** Reverting from best still isolates blockers one at a time (else all later ones); only the forward probe shrinks to a minimal set. Fold reasons say a file was "added or changed" (telling them apart needs a new host op). No real-git test triggers a forward or backward fold inside an already ordered stack; the pure model tests cover that loop.
 
 
 ## Credits
