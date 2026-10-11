@@ -143,6 +143,7 @@ export class FakeHost implements HostRunner {
       this.metric = shareWith.metric;
       this.holdoutMetric = shareWith.holdoutMetric;
       this.rss = shareWith.rss;
+      this.runMs = shareWith.runMs;
     }
   }
   private isBenchRepo(repo: string): boolean {
