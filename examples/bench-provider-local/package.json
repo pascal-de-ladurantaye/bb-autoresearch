@@ -1,0 +1,26 @@
+{
+  "name": "bb-plugin-bench-provider-local",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Example bench provider for bb-autoresearch: lends local temp directories as bench machines. For tests and smoke tests only.",
+  "license": "MIT",
+  "author": "Pascal de Ladurantaye <pascal.de.ladurantaye@gmail.com>",
+  "keywords": [
+    "bb-plugin"
+  ],
+  "engines": {
+    "bb": ">=0.45",
+    "bbPluginSdk": ">=0.6.14"
+  },
+  "bb": {
+    "name": "Local bench provider (example)",
+    "description": "Lends local temp directories as bench machines through the bench provider contract. For tests and smoke tests only: nothing is isolated.",
+    "branding": {
+      "icon": "Server"
+    },
+    "server": "./server.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  }
+}
