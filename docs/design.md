@@ -5,7 +5,7 @@ subtitle: A BB plugin for long-running, measured code-optimization studies. Shor
 brand: AR
 brandLabel: bb-autoresearch
 brandSublabel: BB plugin design
-pills: v0.2.2 | M0-M3 built | Live view and replay | Single-machine mode | Toy-validated | Exit criteria partly validated
+pills: v0.2.3 | M0-M3 built | Live view and replay | Single-machine mode | Toy-validated | Exit criteria partly validated
 cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned | Output=PRs with measured gains
 ---
 
@@ -30,7 +30,7 @@ The last pass before release closed two guardrail gaps and three usability issue
 
 After the release, a **Live** view was added (part 1 of 2): while a study runs, the study page opens on a Live tab, and the same view can sit beside the study thread in its split pane. Every change it shows is recorded as an event, so a later replay can rebuild it at any time (see "Implementation notes: live view (part 1)"). Part 2 added a CI band per measurement that narrows pair by pair to the sequential test's decision (computed from the samples with the decision's own seeded bootstrap, so it shows exactly the CI the verdict saw), a "last action" line per worker, a visible "best moved" moment, and a replay of any study with a timeline scrubber (see "Implementation notes: live view (part 2)").
 
-Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes"); v0.2.2 adds single-machine mode (gates take turns with measurements on a machine that is both edit and bench host, and an optional quiet bench that holds new worker turns while it measures) and commits in the studied repository as the repository's own git identity (see "Implementation notes: single-machine mode").
+Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes"); v0.2.2 adds single-machine mode (gates take turns with measurements on a machine that is both edit and bench host, and an optional quiet bench that holds new worker turns while it measures) and commits in the studied repository as the repository's own git identity (see "Implementation notes: single-machine mode"); v0.2.3 fixes the UI issues found while capturing the marketplace screenshots, tells the strategist where best's code is, and stops archiving from spawning replacement workers (see "Implementation notes: v0.2.3").
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
@@ -350,7 +350,7 @@ Only one round runs at a time. Each round prompt starts with a self-contained di
 ### Strategist (study thread)
 
 - **Model.** A strong reasoning model. It runs rarely and its decisions shape everything else.
-- **Inputs.** The round digest, the dossier, and the findings, which it can search with tools.
+- **Inputs.** The round digest, the dossier, and the findings, which it can search with tools. Its own environment can be any checkout of the project, so every round says where best is and how to read it through git without switching branches (see "Implementation notes: v0.2.3").
 - **Responsibilities.**
   - keep the idea queue full and diverse
   - retire dead directions
@@ -440,7 +440,7 @@ A **Studies** nav panel lists every study with its state, what needs the human, 
 - **Live.** The default tab while the study runs: workers picking up ideas and moving through their phases with their last action, candidate cards moving through tests and the bench to a verdict, each measurement's CI band narrowing to the decision, the bench hosts, the ideas up next in pick order, a feed of what just happened, and one worker's transcript at a time. Read only. The same view opens beside the study thread (see Threads), and any study can be replayed in it from its recorded events.
 - **Overview.** Needs you, best vs. base in words with raw values and CI, what's running now, a trajectory chart (every candidate as a mark, best as a step line), secondary metrics and guardrails against their limits, budget, controls (pause, resume, concurrency, harvest, archive), and notices that each name the action they ask for.
 - **Ideas.** A board: queued, running, won, lost, abandoned. You can add, reorder, pin, or veto.
-- **Candidates.** A filterable table. Each row opens its diff, samples, verdict, and worker thread.
+- **Candidates.** A filterable table. Each row opens its diff, its measurement's CI band (how the verdict formed), samples, verdict, and worker thread.
 - **Findings.** A searchable list.
 - **Oracle.** The spec, its version history, calibration reports, and approval of specs and calibrations.
 - **Bench.** Machines, queue, health, and drift checks.
@@ -1584,6 +1584,61 @@ Append-only migrations: `candidates.gate_seconds`, and an index on `bench_interv
 - **Quiet bench holds turn starts only.** A worker whose turn is already running (and runs its own tests) keeps competing with the measurement; the health check before each measurement is still the guard for that.
 - **Replay shows today's setting.** The replay bundle carries the current single-machine setting, not the one in force at each moment (gate events are only recorded when it was on, so the bench strip is still right).
 - **A held spawn is attributed by origin.** BB's hook context doesn't carry plugin metadata, so a thread is recognized as a spawning worker by `originPluginId` alone.
+
+## Implementation notes: v0.2.3
+
+Fixes from capturing the marketplace screenshots, plus two found right after: the strategist didn't know where best's code was, and archiving a running study could spawn replacement workers. Same platform pins (BB 0.45.x, SDK 0.6.14). UI, wording and view models, except the two engine fixes at the end; no statistics change.
+
+### Live view
+
+- **Status line by phase.** It said "N workers editing" whatever the workers did. `runningStatusText` (present.ts) now takes the workers' recorded phases and says what they do: "Running: 2 workers: 1 editing, 1 being measured; measuring c/9, 1 queued for the bench." (one phase: "2 workers editing"; none: "no live workers"). The server status line, the Live view and replay all pass phases; a worker row without a recorded phase counts by its state (starting, finishing) or as "working".
+- **Worker count against W.** "3 workers (up to 2)" read like a bug: live workers include finishing ones, and W can drop below the live count (nobody is stopped for it). The header now reads "2 workers + 1 finishing · target 2", or "3 workers · target now 2 (no new worker until fewer)" (`workerCountText`). The Overview's hint says "target 2 now (W), max 3" and, when more are live, that no new worker starts until fewer than W are.
+- **One queue position.** The lane counted the measurement on the bench as ahead ("c/2 queued, 2nd for the bench") while the Queue card counted the queue ("1st in line"). `benchQueueOrder` and `queuePosition` (live-model.ts) are now the one place the order and the position are decided; the lanes, cards, bench strip, Overview worker list and worker badges read them (1 = next for the bench, "1st in line"), and the lane prefers the view's queue over the server's number so a refetch can't make them disagree.
+- **CI band labels.** The region names (win, continue, lose) moved into a right margin outside the plot, so they never cover the band or the decision line; the y-axis labels (0, the threshold, the domain's ends) and the region names are placed by `layoutLabels` (src/chart.ts): by priority, at least 11 px apart, a label that can't fit near its spot is dropped (0 always stays). Tests check the computed positions for four scales, including a +1.0% threshold a pixel above 0. The "pairs" axis title sits in the margin too, and the decision label no longer jumps down at the right edge.
+- **Before the first pair.** The band's box was empty at "pair 0": it now says "Running best and the candidate for the first pair (in random order) of up to 20; the band starts once that pair is done" (and the same for the confirmation), and progress text says "first pair of ≤20 running" instead of "pair 0 of ≤20".
+- **Expensive band in pixels.** It used a stretched viewBox, so its text was scaled; it now draws at the box's width like the noisy band (`useBoxWidth`), with column labels that shorten when columns get narrow.
+- **Guardrail rows.** "no change than best vs the 10.0% limit" became "no change from best (CI 0.3% better to 0.4% worse), within the 10.0% limit · in total 2.1% worse than the segment base, within the 15.0% total limit" (`limitCheckWords`, guardrails.ts). `guardrailStatus`'s text reads "than best"/"than the segment base" (and "no change from …") instead of "vs best".
+
+### Notices and the Overview
+
+- **The human's own controls aren't notices for them.** The strategist's first round said "13 notices for you" when most were `control.idea_added` from the human's own CLI calls. The digest's summary counts only notices that need the human; controls are listed apart in the agent-only detail as an audit trail ("mention one only if it looks like something the human wouldn't have done"). Pre-start notices steered into the human's turn separate them the same way. All are still marked delivered.
+- **State-aware actions.** A notice is stored once, but its step may be done: `noticeAction` now takes the study's state (and the latest harvest). `budget.exhausted` offers "Start harvest" only while the study is paused; while harvesting it is "Open Harvest" or "Review harvest", when running again "See budget", when archived nothing (or "Open Harvest"). `calibration.ready` after the start reads "See calibration"; `spec.proposed` without a pending spec "See the spec".
+- **Trajectory chart.** It drew in a stretched 640-wide viewBox (text scaled with the width) with ticks at fifths of the data range (−7.9%, +19.1%) and no x axis. It now draws at its box's width with a fixed 10 px font, nice y ticks (1, 2, 2.5 or 5 × 10ⁿ, the domain widened to them; `niceTicks`) and labelled candidate numbers on x, spaced for the width (`trajectoryAxes`).
+- **Guardrail trend.** The small trend line stretched any range to the full height, so a 0.02% wobble looked like a drop. `trendDomain` gives it at least 5% of the values' size, so a near-constant guardrail draws flat.
+
+### Candidate detail
+
+- **How the verdict formed.** The candidate detail shows the measurement's CI band with the Live view's component (`Measurement`, without its header): the stored `band_json` once measured (recomputed from samples for older candidates, marked as such), the live band while it is on the bench. `LiveRecorder.bandFor` picks which.
+- **Which statistic.** The headline says what it is ("median of the per-pair changes, the verdict's estimate"; "single run of each side"; for expensive, "mean of the confirmation runs (or the screening run) against the median of best's runs"). The metrics table is titled "median of each side" and, when its primary change differs from the headline (6.20% vs 5.72%), a line under it says why.
+- **Samples.** No inner scroll box: the first 12 rows, then "Show all 30 pairs". Rows come from `sampleTableRows` (src/sample-rows.ts) per noise class: noisy pairs numbered from 1, a deterministic measurement as one "single run" row (never "pair 0"), an expensive one as baseline runs, the screening run and confirmation runs.
+
+### Harvest
+
+- **No cut words or open code spans.** PR bodies clipped titles, summaries and dependency reasons mid-word and inside code spans ("Byte-i…", "a cheap `lin…"). `clipWords` (present.ts) cuts at the last word boundary and before an opening backtick whose code span the limit would cut; PR titles, bodies and the report's tables use it. Bodies are stored when drafted, so harvests drafted before v0.2.3 keep their old text.
+- **Signs.** "best with this change reverted is +22.00% worse than best" is now "… is 22.00% worse than best" (or "better", or "measures the same") (`revertedWords`).
+- **"It".** "Builds on #5: reverting it from best fails while this one stays" named neither; it now reads "Builds on #5: reverting #5 from best fails while this changeset stays."
+
+### Replay: health checks
+
+Replay showed every bench host as "not checked yet": only unhealthy streaks were events. Every health check now appends a `bench.health` event (host, ok, context; append-only), replay applies it, and the bench strip says "health checks off" when the spec disables them, "health not recorded" in replays of studies from before v0.2.3 (no `bench.health` event at all), and "not checked yet" only when none has run yet. `benchHealthText` (live-model.ts) is the one place it is worded; the replay bundle's spec carries `healthChecks`.
+
+### The strategist reads best through git
+
+- **The gap.** The study thread's environment is whatever was picked when the study was created: often a managed worktree branched from the project's default branch, or the project checkout on any branch. Nothing told the strategist where best was, so as promotions landed it kept reading base and its dossier and ideas drifted from best. Workers were fine (they branch from `studies/<slug>/best`).
+- **The Code block.** Every strategist round and the harvest grouping round now carry a short "Code" section (`codeLines`, prompts.ts; `Engine.codeInfo`): the study base with its commit, `studies/<slug>/best` with its commit and the promotions so far, the sentence "Your own checkout may be on another commit; read code at best this way. Don't check out or commit in your own checkout.", and the commands that read best without switching branches from any checkout of the repository (refs are shared by its worktrees): `git show studies/<slug>/best:<path>`, `git grep -n <pattern> studies/<slug>/best`, `git diff --stat <base sha>..studies/<slug>/best`, `git log --oneline <base sha>..studies/<slug>/best`.
+- **Another repository.** Detecting whether the strategist's environment is a worktree of the study's repository would need the thread's environment path and a git call on its host per round, so instead the block always also gives the `git -C <study repo path> …` form, with a line saying when to use it (a different `git rev-parse --git-common-dir`, or no repository).
+- **Skills.** The `autoresearch` skill's strategist section says the same; `study-create` says the study thread may run in any environment of the project, because it only reads code and reads best through git.
+
+### Archiving a running study spawned replacement workers
+
+- **Seen live.** `control.archive` at t, the two live workers marked abandoned 0.2 ms later, then `worker.spawned` twice at t + 0.3-0.7 s (new ideas, new threads), and `study.state running → archived` only at t + 43 s, after the bench checkouts were removed. Each ended worker kicks the control loop, and the loop still saw a Running study with free slots and queued ideas. The two new workers kept running until stopped by hand.
+- **Fix.** `archiveStudy` changes the state first, in one transaction with finishing the strategist row, before cancelling the harvest, stopping workers or removing checkouts. The control loop re-reads the study after its awaits before deciding to spawn (it used the row read at the start of the pass). `spawnWorker` re-checks the state after its own awaits and before asking BB for a thread (the row is marked failed and its idea re-queued), and again when the spawn resolves: if the study left Running meanwhile (paused, harvesting, archived), the new thread is stopped and archived at once (`worker.spawn_discarded`; the idea goes back to the queue unless the study is archived), and if the row was ended while the spawn was in flight (the archive ends spawning rows too) its late thread is stopped and archived the same way. Reconciliation finishes stopping live workers of an archived study (an archive interrupted mid-cleanup).
+- **Pause and harvest** already changed the state synchronously before anything else; they shared only the late-spawn race, which the same check covers. A pause still lets running workers finish.
+- **Tests.** Archiving with free slots and five queued ideas records no `worker.spawned` after it starts, and its `study.state` event comes before the first `worker.abandoned`; a spawn held until after the archive (and one held until after a pause) ends with its thread stopped and archived and no second `worker.spawned`. All three fail on v0.2.2.
+
+### Data model
+
+No migrations. New events: `bench.health` (every health check), `worker.spawn_discarded`. The replay bundle's `spec` gains `healthChecks`; `LiveBenchHost` gains `healthRecord`; `LiveView.counts` gains `finishing`; the candidate detail gains `band`, `noise`, `effectStatistic` and `hostName`.
 
 ## Credits
 
