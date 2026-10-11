@@ -69,7 +69,7 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
           <ul className="divide-y divide-border rounded-lg border border-border bg-card text-sm">
             {d.history.map((x) => (
               <li key={x.id} className="flex items-center gap-2 px-3 py-1.5">
-                <span className="font-mono text-xs">h{x.id}</span>
+                <span className="font-mono text-xs">h{x.seq}</span>
                 <StatePill state={x.state} />
                 {x.publishState && x.publishState !== "dry-run" ? <span className="text-xs">publish: {x.publishState}</span> : null}
                 <span className="text-xs text-muted-foreground">
@@ -120,7 +120,7 @@ function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart,
   return (
     <>
       <Section
-        title={`Harvest h${h.id}`}
+        title={`Harvest h${h.seq}`}
         actions={
           onRestart ? (
             <Button size="sm" variant="outline" onClick={onRestart}>
@@ -201,7 +201,7 @@ function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart,
           <ul className="space-y-1 text-sm" aria-label="Stacks">
             {h.stacks.map((s) => (
               <li key={s.stack} className="rounded-md border border-border bg-card px-3 py-1.5">
-                <span className="font-medium">Stack {s.stack}:</span> <span className="font-mono">{s.members.map((k) => `#${k}`).join(" → ")}</span>
+                <span className="font-medium">Stack {s.stack}:</span> <span className="font-mono">{s.order}</span>
                 <span className="ml-2 text-xs text-muted-foreground">
                   PRs stacked in this order{s.contribution ? ` · together ${s.contribution.text}` : s.status === "not_needed" ? " · members measured one by one" : ` · joint measurement ${s.status}`}
                   {s.detail && s.status !== "not_needed" ? ` · ${s.detail}` : ""}
@@ -251,7 +251,7 @@ function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart,
           </div>
         </div>
       </Section>
-      {publishing ? <PublishDialog slug={slug} harvestId={h.id} rpc={rpc} onClose={() => setPublishing(false)} onDone={onChanged} /> : null}
+      {publishing ? <PublishDialog slug={slug} harvestId={h.id} seq={h.seq} rpc={rpc} onClose={() => setPublishing(false)} onDone={onChanged} /> : null}
     </>
   );
 }
@@ -294,7 +294,7 @@ function PublishResults({ prs }: { prs: NonNullable<Harvest["published"]> }) {
   );
 }
 
-function PublishDialog({ slug, harvestId, rpc, onClose, onDone }: { slug: string; harvestId: number; rpc: Rpc; onClose: () => void; onDone: () => void }) {
+function PublishDialog({ slug, harvestId, seq, rpc, onClose, onDone }: { slug: string; harvestId: number; seq: number; rpc: Rpc; onClose: () => void; onDone: () => void }) {
   const plan = useLive((r) => r.call("study.harvest.plan", { slug, harvestId }), [slug, harvestId], 60_000);
   const p = plan.data;
   const pushing = p?.prs.filter((x) => x.push) ?? [];
@@ -302,7 +302,7 @@ function PublishDialog({ slug, harvestId, rpc, onClose, onDone }: { slug: string
     <ConfirmDialog
       open
       onOpenChange={(x) => !x && onClose()}
-      title={`Publish harvest h${harvestId} as draft PRs`}
+      title={`Publish harvest h${seq} as draft PRs`}
       description="This pushes branches to GitHub and opens draft PRs. It is a human control, recorded in the audit log, the same as the CLI command."
       confirmLabel={p ? `Push ${pushing.length} branch${pushing.length === 1 ? "" : "es"} and open draft PRs` : "Publish"}
       disabled={!p || !p.ok || !pushing.length}
@@ -379,6 +379,8 @@ function ChangesetItem({ c, h, slug, rpc, onOpenCandidate, onChanged }: { c: Cha
         <span className="font-mono text-xs">#{c.k}</span>
         <span className="min-w-0 flex-1 font-medium">{c.title}</span>
         {c.stack !== null ? <span className="rounded-full bg-muted px-2 py-0.5 text-xs">stack {c.stack}</span> : null}
+        {c.foldedInto !== null ? <span className="rounded-full bg-muted px-2 py-0.5 text-xs">ships inside #{c.foldedInto}'s PR</span> : null}
+        {c.ships.length ? <span className="rounded-full bg-muted px-2 py-0.5 text-xs">also ships {c.ships.map((k) => `#${k}`).join(", ")}</span> : null}
         {c.droppable ? (
           <span className="inline-flex items-center gap-1 rounded-full bg-warning/15 px-2 py-0.5 text-xs text-warning-text">
             droppable <Help term="droppable" />
@@ -447,12 +449,34 @@ function ChangesetItem({ c, h, slug, rpc, onOpenCandidate, onChanged }: { c: Cha
       {c.pr.body ? (
         <details className="text-xs">
           <summary className="cursor-pointer text-muted-foreground">PR preview{c.pr.title ? `: ${c.pr.title}` : ""}</summary>
-          <div className="mt-1 max-h-96 overflow-auto rounded-md border border-border p-3">
-            <Markdown content={c.pr.body} />
-          </div>
+          <PrPreview body={c.pr.body} k={c.k} />
         </details>
       ) : null}
     </li>
+  );
+}
+
+/** Bodies longer than this start collapsed (a fade and "Show more"); shorter ones show whole. */
+const PREVIEW_LINES = 24;
+const PREVIEW_CHARS = 1600;
+
+/** A PR body: whole when short; otherwise collapsed with a fade and a Show more / Show less toggle (never a hidden inner scroll). */
+export function PrPreview({ body, k }: { body: string; k: number }) {
+  const long = body.length > PREVIEW_CHARS || body.split("\n").length > PREVIEW_LINES;
+  const [open, setOpen] = useState(false);
+  const id = `pr-preview-${k}`;
+  return (
+    <div className="mt-1">
+      <div id={id} data-testid="pr-preview" className={cn("relative rounded-md border border-border p-3", long && !open && "max-h-96 overflow-hidden")}>
+        <Markdown content={body} />
+        {long && !open ? <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 h-16 rounded-b-md bg-gradient-to-t from-card to-transparent" /> : null}
+      </div>
+      {long ? (
+        <Button size="sm" variant="ghost" className="mt-1 h-7 px-2 text-xs" aria-expanded={open} aria-controls={id} onClick={() => setOpen((x) => !x)}>
+          {open ? "Show less" : "Show more"}
+        </Button>
+      ) : null}
+    </div>
   );
 }
 

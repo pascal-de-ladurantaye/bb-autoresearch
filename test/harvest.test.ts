@@ -21,8 +21,8 @@ function sh(cwd: string, ...args: string[]): string {
 
 // Metric: the sum of the first number in each src/*.txt (lower is better), so effects add exactly.
 const MEASURE = `total=0; for f in src/*.txt; do v=$(head -1 "$f" | tr -dc 0-9); total=$((total + \${v:-0})); done; echo "METRIC size=$total"`;
-// Gate: a file that says "uses-helper" needs src/helper.txt.
-const GATE = `if grep -q uses-helper src/*.txt && [ ! -f src/helper.txt ]; then echo "helper missing" >&2; exit 1; fi`;
+// Gate: a file that says "uses-helper" needs src/helper.txt (or src/helper2.txt).
+const GATE = `if grep -q uses-helper src/*.txt && [ ! -f src/helper.txt ] && [ ! -f src/helper2.txt ]; then echo "helper missing" >&2; exit 1; fi`;
 
 function spec(extra = ""): string {
   return `
@@ -208,7 +208,9 @@ describe("harvest (real git)", () => {
     expect(a.pr_body).toContain("Alone on `main`, the study base: gates pass;");
     expect(a.pr_body).toContain("Finding #1");
     expect(a.pr_body).toContain(`studies/${SLUG}/harvest`);
-    expect(c4.pr_body).toContain("Depends on: #3 Shrink c");
+    // One line per dependency, the reason without repeating "depends on #3".
+    expect(c4.pr_body).toContain("- Depends on #3 Shrink c: reverting #3 from best conflicts in src/c.txt");
+    expect(c4.pr_body).not.toContain("depends on #3:");
     // Exported files.
     expect(h.export_dir).toBe(join(root, "data", "exports", `${SLUG}-harvest-h${id}`));
     const report = readFileSync(join(h.export_dir!, "report.md"), "utf8");
@@ -264,6 +266,104 @@ describe("harvest (real git)", () => {
     expect(cs.every((c) => c.ablation_status === "measured" && c.stack === null)).toBe(true);
     expect(cs.map((c) => Math.round(c.contribution! * 255))).toEqual([70, 25, 50]);
     expect(accountingFor(engine.ctx, h).interaction).toBe(false);
+  });
+
+  /**
+   * Every drafted branch sits on its PR base (the previous layer's branch, or
+   * the study base), merges cleanly onto it, and passes the gate in a checkout
+   * of its tip; every changeset ships in a drafted PR (its own or its host's).
+   */
+  function expectEveryPrApplies(harvestId: number): void {
+    const cs = store.changesets(harvestId);
+    const main = sh(repo, "rev-parse", "main");
+    for (const c of cs) {
+      const host = (c.folded_into ?? null) === null ? c : cs.find((x) => x.id === c.folded_into)!;
+      expect(host.folded_into ?? null, `#${c.k} ships inside a PR that is itself folded`).toBeNull();
+      expect(host.branch, `#${c.k} ships in no drafted PR (${c.standalone_status}: ${c.standalone_detail})`).not.toBeNull();
+    }
+    for (const c of cs.filter((x) => x.branch)) {
+      const base = c.pr_base && c.pr_base !== "base" ? cs.find((x) => `#${x.k}` === c.pr_base)! : null;
+      const baseSha = base ? sh(repo, "rev-parse", `refs/heads/${base.branch!}`) : main;
+      expect(sh(repo, "rev-parse", `${c.branch!}^`), `#${c.k}'s parent is its PR base`).toBe(baseSha);
+      // A clean three-way merge onto its PR base (exit 0 = no conflict).
+      execFileSync("git", ["merge-tree", "--write-tree", baseSha, c.branch!], { cwd: repo });
+      const wt = join(root, `check-${c.k}`);
+      sh(repo, "worktree", "add", "-q", "--detach", wt, c.branch!);
+      try {
+        execFileSync("sh", ["bench/gate.sh"], { cwd: wt, stdio: "pipe" });
+      } finally {
+        sh(repo, "worktree", "remove", "--force", wt);
+      }
+    }
+  }
+
+  it("orders a stack by dependency (a layer that needs a later layer's file goes after it) and folds interleaved groups, so every PR applies on its base", async () => {
+    promote("Shrink c", { "src/c.txt": "80\n" }, 0.05);
+    promote("Shrink a", { "src/a.txt": "60\n" }, 0.1);
+    promote("Add helper", { "src/helper.txt": "0 helper\n" }, 0);
+    promote("Shrink c more", { "src/c.txt": "75\n" }, 0.01);
+    // Changes the file c/3 adds, and uses it.
+    promote("Tune helper", { "src/helper.txt": "0 helper v2\n", "src/d.txt": "50 uses-helper\n" }, 0.15);
+    promote("Shrink c most", { "src/c.txt": "70\n" }, 0.01);
+    const r = engine.startHarvest(SLUG, "human");
+    await waitFor(() => store.harvest(r.harvest.id)!.round_sent_at !== null);
+    await engine.proposeHarvest("thr_study", [
+      // Interleaved with "c more" on src/c.txt: c/1 → c/4 → c/6.
+      { title: "Shrink c twice", candidates: [1, 6], rationale: "c, first and last" },
+      // Ordered before "Add helper" by its earliest commit, but c/5 needs the file c/3 adds.
+      { title: "Shrink a and tune helper", candidates: [2, 5], rationale: "a and the helper" },
+      { title: "Add helper", candidates: [3], rationale: "the helper" },
+      { title: "Shrink c more", candidates: [4], rationale: "c, middle" },
+    ]);
+    await engine.waitForHarvest(SLUG, 60_000);
+    const h = store.harvest(r.harvest.id)!;
+    expect(h.error).toBeNull();
+    expect(h.state).toBe("ready");
+    const cs = store.changesets(h.id);
+    const by = (t: string) => cs.find((c) => c.title === t)!;
+    expectEveryPrApplies(h.id);
+    // "Add helper" (#3) comes first in its stack, though its k is larger.
+    const helper = by("Add helper");
+    const tune = by("Shrink a and tune helper");
+    expect(tune.stack).toBe(helper.stack);
+    expect(helper.pr_base).toBe("base");
+    expect(tune.pr_base).toBe(`#${helper.k}`);
+    // The interleaved pair ships as one PR: #4 inside #1's.
+    const twice = by("Shrink c twice");
+    const more = by("Shrink c more");
+    expect(more.folded_into).toBe(twice.id);
+    expect(more.branch).toBeNull();
+    expect(more.fold_reason).toMatch(/src\/c\.txt/u);
+    expect(sh(repo, "show", `${twice.branch!}:src/c.txt`)).toBe("70");
+    expect(twice.pr_body).toContain("Also includes #4 Shrink c more");
+    // The accounting keeps every ablation.
+    expect(accountingFor(engine.ctx, h).interaction).toBe(false);
+    // Words: the CLI and the report show the folds and the PR order.
+    const text = harvestText(engine, SLUG);
+    expect(text).toContain("#4 ships inside #1's PR");
+    expect(text).toMatch(new RegExp(`stack \\d+: #${helper.k} → #${tune.k}`, "iu"));
+  });
+
+  it("an independent changeset that fails its gates alone on the base is stacked on what it needs (probed with gates)", async () => {
+    promote("Shrink a", { "src/a.txt": "60\n" }, 0.1);
+    promote("Add helper", { "src/helper.txt": "0 helper\n" }, 0);
+    promote("Use helper for d", { "src/d.txt": "50 uses-helper\n" }, 0.19);
+    // A second helper: best without either one still passes the gates, so ablation finds no dependency.
+    promote("Add helper2", { "src/helper2.txt": "0 helper\n" }, 0);
+    const r = engine.startHarvest(SLUG, "human", { onePerPromotion: true, measureStandalone: false });
+    await engine.waitForHarvest(SLUG, 60_000);
+    const h = store.harvest(r.harvest.id)!;
+    expect(h.error).toBeNull();
+    const cs = store.changesets(h.id);
+    const by = (t: string) => cs.find((c) => c.title === t)!;
+    expect(cs.every((c) => c.ablation_status === "measured")).toBe(true);
+    // Alone on main, "Use helper for d" fails the gate; either helper will do, and the earlier one is kept.
+    expect(JSON.parse(by("Use helper for d").depends_on_json)).toEqual([by("Add helper").id]);
+    expect(by("Use helper for d").dependency_reason).toContain("#3 fails the gates on `main` without #2");
+    expectEveryPrApplies(h.id);
+    expect(harvestText(engine, SLUG)).toMatch(/stack \d+: #2 → #3/u);
+    expect(by("Add helper2").stack).toBeNull();
+    expect(by("Shrink a").stack).toBeNull();
   });
 
   it("--one-per-promotion skips the strategist round", async () => {

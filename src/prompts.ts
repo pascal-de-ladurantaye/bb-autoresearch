@@ -390,7 +390,7 @@ function fmtNum(v: number | undefined): string {
 export interface HarvestRoundInput {
   study: StudyRow;
   spec: StudySpec;
-  harvest: { id: number };
+  harvest: { id: number; seq: number };
   promotions: Array<{ sha: string; n: number | null; title: string; paths: string[] }>;
   candidates: Map<number, CandidateRow | undefined>;
   dossier: { version: number; text: string } | null;
@@ -400,9 +400,9 @@ export interface HarvestRoundInput {
 
 /** The harvest grouping round: one turn asking the strategist for study_propose_harvest. */
 export function harvestRoundPrompt(d: HarvestRoundInput): AgentMessage {
-  const summary = `[autoresearch] Harvest h${d.harvest.id}: please group the ${d.promotions.length} promotion${d.promotions.length === 1 ? "" : "s"} on best into changesets (one PR each) with study_propose_harvest.`;
+  const summary = `[autoresearch] Harvest h${d.harvest.seq}: please group the ${d.promotions.length} promotion${d.promotions.length === 1 ? "" : "s"} on best into changesets (one PR each) with study_propose_harvest.`;
   const lines = [
-    `Harvest h${d.harvest.id} · study \`${d.study.slug}\` · group the promotions into changesets`,
+    `Harvest h${d.harvest.seq} · study \`${d.study.slug}\` · group the promotions into changesets`,
     "",
     `Best is final for this harvest: ${d.promotions.length} promotion(s) on \`studies/${d.study.slug}/best\`, oldest first. Each changeset becomes one PR; the plugin then measures each one's contribution by reverting it from best (ablation), checks it alone on the base, and drafts the PRs. You don't run anything.`,
     "",

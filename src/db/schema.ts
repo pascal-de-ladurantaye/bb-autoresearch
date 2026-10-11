@@ -436,4 +436,12 @@ export const MIGRATIONS: string[] = [
   /** Seconds the candidate's gates ran (with single-machine mode they held the bench lock). */
   `ALTER TABLE candidates ADD COLUMN gate_seconds REAL NOT NULL DEFAULT 0`,
   `CREATE INDEX bench_intervals_open ON bench_intervals (host_id, ended_at)`,
+  // ---- v0.2.4: harvest ----
+  /** The harvest's number within its study (h1, h2, …), shown everywhere instead of the global id; backfilled in id order per study. */
+  `ALTER TABLE harvests ADD COLUMN seq INTEGER`,
+  `UPDATE harvests SET seq = (SELECT r.n FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY study_id ORDER BY id) AS n FROM harvests) r WHERE r.id = harvests.id) WHERE seq IS NULL`,
+  /** Stacks that apply: the changeset whose PR ships this one (null when it has its own), why, and its position in its stack's PR order. */
+  `ALTER TABLE changesets ADD COLUMN folded_into INTEGER`,
+  `ALTER TABLE changesets ADD COLUMN fold_reason TEXT`,
+  `ALTER TABLE changesets ADD COLUMN layer INTEGER`,
 ];
