@@ -121,6 +121,7 @@ describe("v0.2.4 sequential rules vs v0.2.3, simulated", () => {
         ),
       ];
       console.log(table.join("\n"));
+      if (process.env.SIM_OUT) (await import("node:fs")).writeFileSync(process.env.SIM_OUT, `${table.join("\n")}\n`);
       const at = (k: number) => rows.find((r) => r.k === k)!;
       // False wins (no true effect): no worse than v0.2.3 (allow one trial of chance).
       expect(at(0).now.win).toBeLessThanOrEqual(at(0).old.win + 1);

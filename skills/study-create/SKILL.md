@@ -28,7 +28,7 @@ Find or write, with the user, three commands. They run from the repository root 
 Pick the noise class:
 
 - `deterministic`: the number is identical run to run (bundle size, instruction or allocation counts, output size). One run per side; a candidate wins when it is better beyond `tolerance`.
-- `noisy`: wall-clock time, latency, throughput. Paired, interleaved runs with a bootstrap CI of the median and a sequential test. Calibration measures the noise first.
+- `noisy`: wall-clock time, latency, throughput. Paired, interleaved runs with a bootstrap CI of the median and a sequential test. Calibration measures the noise first, and (`side_runs = "auto"`, the default) picks how many runs of `measure` make one side of a pair so a side lasts at least `min_side_seconds`: a benchmark that already loops internally for several seconds stays at one run. When best gets much faster later, the plugin recalibrates by itself (shorter runs are noisier relative to themselves; that isn't drift).
 - `expensive`: one run takes many minutes. One screening run per candidate against the calibrated per-run noise; a promising run is confirmed with `confirm_runs` (default 3) fresh runs.
 
 Pick the bench hosts (`oracle.bench_hosts`): `["local"]` (default) measures in plugin checkouts on this machine. Any other entry is a BB machine name or host id (see `bb host list`); that machine keeps its own clone and receives commits as git bundles. A dedicated, quiet machine of the production architecture is best. When the bench host is this machine (the laptop case), **single-machine mode** (`oracle.single_machine`, default `"auto"`) turns on: gates take the same bench lock as measurements, one at a time, so tests never run while a candidate is timed. Size the gate for that: its time now counts as bench time per candidate. `quiet_bench = true` also holds new worker turns while a measurement runs. Ask whether there is a **holdout** workload that lives only on the bench host (a different input set): it is run on every win before promotion, and agents only learn pass/fail.
@@ -90,6 +90,7 @@ retry_seconds = 60               # a deferred host waits this long
 every = 10                       # evaluations per bench host (0 = off)
 pairs = 6
 max_ratio = 2                    # pause when noise > 2x calibrated
+recalibrate_below = 0.6          # best's runs under 60% of their calibrated time: recalibrate (no pause)
 
 [oracle.protocol]                # all optional
 n_min = 6                        # noisy: pairs before an early stop
@@ -98,6 +99,12 @@ min_effect = "1%"                # floor for the win threshold
 max_mde = "20%"                  # calibration fails above this
 tolerance = "0%"                 # deterministic: required improvement
 confirm = true                   # noisy: re-measure wins before promotion
+skip_confirm_factor = 3          # noisy: no confirmation when the CI's low end is >= 3x the win threshold (0 = always)
+futility = true                  # noisy: stop as inconclusive once the CI's high end is below the win threshold
+early_lose_from = 3              # noisy: a clear loss stops from 3 pairs (0 = off)
+early_lose_confidence = 0.99     # ... when a t interval at this confidence is entirely below 0
+side_runs = "auto"               # noisy: measure runs per side (best per metric); "auto": >= min_side_seconds a side
+min_side_seconds = 5
 confirm_runs = 3                 # expensive: k confirmation runs
 calibration_runs = 5             # expensive: baseline runs at calibration
 
