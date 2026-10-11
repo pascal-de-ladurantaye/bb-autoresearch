@@ -5,9 +5,12 @@ agent workers propose changes in parallel; the plugin owns the loop, the
 measurements, and every keep or discard decision, then turns the wins into
 reviewable PRs whose contributions are measured by ablation.
 
+![The Live tab mid-study: one lane per worker, candidate cards moving from tests to the bench and Promoted, and the measurement's confidence interval narrowing pair by pair against the win threshold](docs/screenshots/live.jpg)
+
 Design and status: [docs/design.md](docs/design.md). The "Status" section says
 which milestone exit criteria were validated (short version: everything is
-built; it has only run on toy repositories), and the "Implementation notes"
+built; it has run on toy repositories and once, blind, against another
+autoresearch loop on a real-world CLI performance task), and the "Implementation notes"
 sections record how the code works and every deviation from the design.
 
 ## Install
@@ -98,6 +101,8 @@ wait.
    be kept or dropped first. Or *Keep exploring* (resume), or *Archive*. CLI:
    `bb study harvest <slug> --publish`, `bb study resume <slug>`,
    `bb study archive <slug>`.
+
+   ![A harvest review: each changeset with its measured share of the gain and CI, independent changesets based on main, and dependent ones grouped into stacks with the dependency explained in words](docs/screenshots/harvest.jpg)
 
 ### One machine for everything
 
