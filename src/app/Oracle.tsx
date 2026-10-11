@@ -60,6 +60,11 @@ export function OracleTab({ slug, o: overview, rpc, onChanged }: { slug: string;
                       {g.k}
                       {g.active ? <span className="ml-1 text-xs text-success">active</span> : null}
                       {g.awaitingApproval ? <span className="ml-1 text-xs text-foreground">awaiting your approval</span> : null}
+                      {g.auto ? (
+                        <div className="text-xs text-muted-foreground" title={g.autoReason ?? undefined}>
+                          recalibrated automatically (same oracle){g.autoReason ? `: ${g.autoReason}` : ""}
+                        </div>
+                      ) : null}
                     </td>
                     <td className="px-3 py-2">
                       <Mono>{g.oracleHash}</Mono>
@@ -72,7 +77,7 @@ export function OracleTab({ slug, o: overview, rpc, onChanged }: { slug: string;
                     <td className="px-3 py-2 text-right tabular-nums">{frac(g.mde)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{duration(g.evalSeconds)}</td>
                     <td className="px-3 py-2 text-xs text-muted-foreground">
-                      {g.hosts.length ? g.hosts.map((h) => `${h.name}: noise ${frac(h.noiseFloor)}, MDE ${frac(h.mde)}, ${duration(h.evalSeconds)}`).join("; ") : "—"}
+                      {g.hosts.length ? g.hosts.map((h) => `${h.name}: noise ${frac(h.noiseFloor)}, MDE ${frac(h.mde)}, ${duration(h.evalSeconds)}${h.sideRuns && h.sideRuns > 1 ? `, ${h.sideRuns} runs a side` : ""}${h.runSeconds !== null ? `, one run ${duration(h.runSeconds)}` : ""}`).join("; ") : "—"}
                     </td>
                   </tr>
                 ))}

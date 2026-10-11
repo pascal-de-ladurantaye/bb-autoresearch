@@ -406,6 +406,9 @@ export function benchHostsView(engine: Engine, s: StudyRow) {
       bestBuildSha: h.best_build_sha,
       noiseFloor: h.noise_floor,
       mde: h.mde,
+      /** noisy: runs of the measure command per side, and one run's seconds at calibration. */
+      sideRuns: h.side_runs,
+      runSeconds: h.run_seconds,
       repoPath: h.mode === "clone" ? h.repo_path : null,
       lastTransfer: t ? `${t.bytes} B (${t.purpose}, ${t.chunks} chunk${t.chunks === 1 ? "" : "s"})` : null,
       bundles: sent.length,
@@ -842,7 +845,10 @@ export function oracleView(engine: Engine, s: StudyRow) {
       evalSeconds: g.eval_seconds,
       gateSeconds: g.gate_seconds,
       report: g.report ? clip(g.report, 1500) : null,
-      hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, evalSeconds: h.evalSeconds })),
+      hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number; sideRuns?: number | null; runSeconds?: number | null }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, evalSeconds: h.evalSeconds, sideRuns: h.sideRuns ?? null, runSeconds: finiteOrNull(h.runSeconds) })),
+      /** Started by an automatic recalibration (same oracle), and why. */
+      auto: safeJson<{ auto?: boolean }>(g.details_json)?.auto === true,
+      autoReason: safeJson<{ reason?: string }>(g.details_json)?.reason ?? null,
       guardrails: guardrailCalibrationRows(safeJson<{ guardrails?: GuardrailCalibration[] }>(g.details_json)?.guardrails ?? []),
       ref: `refs/studies/${s.slug}/segment/${g.k}`,
       createdAt: g.created_at,
@@ -1569,6 +1575,8 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
     const reason = clip(s.pause_reason ?? "", 300);
     if (pause.kind === "budget") {
       items.push({ id: "budget_exhausted", kind: "budget_exhausted", tone: "action", title: "Budget used up: harvest the wins", short: "harvest ready to start", detail: `${reason}. Harvest turns the promotions into reviewable PRs (a dry run: nothing is pushed).`, tab: "harvest", action: { kind: "harvest" }, command: `bb study harvest ${slug}`, at: pause.at });
+    } else if (pause.kind === "drift" && /^automatic recalibration failed/u.test(reason)) {
+      items.push({ id: "drift", kind: "drift", tone: "alert", title: "Paused: recalibrating on best's shorter runs failed", short: "recalibration failed", detail: `${reason}.`, tab: "oracle", action: { kind: "resume" }, command: `bb study resume ${slug}`, at: pause.at });
     } else if (pause.kind === "drift") {
       items.push({ id: "drift", kind: "drift", tone: "alert", title: "Paused: the bench got noisier (drift check)", short: "drift alarm", detail: `${reason}. Check what else runs on the bench host, then resume; or ask the study thread for an oracle with more pairs.`, tab: "bench", action: { kind: "resume" }, command: `bb study resume ${slug}`, at: pause.at });
     } else if (pause.kind === "oracle") {
@@ -1640,8 +1648,11 @@ export function statusLine(engine: Engine, s: StudyRow): string {
       return s.calibration_status === "failed" ? "Draft: the last calibration failed. A revised spec needs your approval." : `Draft: spec v${s.spec_version} waits for your approval.`;
     case "calibrating":
       return s.calibration_status === "running" ? "Calibrating: gates on the base commit, then A/A measurements to learn the noise." : s.calibration_status === "ready" ? "Calibration finished: review it and start the study." : "Calibrating.";
-    case "running":
-      return runningStatusText(phases, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length, testing);
+    case "running": {
+      const line = runningStatusText(phases, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length, testing);
+      // An automatic recalibration holds the bench (or waits for it): best's runs got much shorter.
+      return s.recalibrate_due !== null ? `${line.replace(/\.$/u, "")}; recalibrating on best at the next free bench slot (its runs got much shorter).` : line;
+    }
     case "paused": {
       const p = pauseInfo(engine, s);
       return `Paused${p.system ? " by the system" : " by you"}: ${clip(s.pause_reason ?? "no reason recorded", 200)}.${live ? ` ${live} worker${live === 1 ? "" : "s"} finishing.` : ""}`;

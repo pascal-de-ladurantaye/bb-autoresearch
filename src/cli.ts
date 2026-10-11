@@ -545,6 +545,7 @@ function benchLines(engine: Engine, s: StudyRow): string[] {
       `  ${h.name} [${h.mode === "clone" ? "own clone via git bundles" : "local checkouts"}] ${h.status}` +
       ` · health ${h.healthOk === null ? "not checked" : h.healthOk ? "ok" : `FAILING (${h.problems.join("; ")})`}${h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toISOString().slice(11, 19)}` : ""}` +
       ` · ${h.measuring !== null ? `measuring c/${h.measuring}` : h.gating !== null ? `testing c/${h.gating} (gates hold the bench)` : "idle"} · drift ${h.driftStatus ?? "not run"} (${h.evalsSinceDrift}/${h.driftEvery} evals)` +
+      `${h.sideRuns && h.sideRuns > 1 ? ` · ${h.sideRuns} runs a side` : ""}${h.runSeconds ? ` · one run ≈ ${h.runSeconds < 10 ? h.runSeconds.toFixed(2) : h.runSeconds.toFixed(1)} s at calibration` : ""}` +
       ` · cached best build ${h.bestBuildSha ? h.bestBuildSha.slice(0, 10) : "none"}${h.lastTransfer ? ` · last bundle ${h.lastTransfer}` : ""}${h.healthSummary ? `\n      ${h.healthSummary}` : ""}`,
   );
 }
@@ -586,8 +587,8 @@ function benchText(engine: Engine, slug: string): string {
     ...section(
       "Segments",
       table(
-        ["K", "ORACLE", "SPEC", "BASELINE", "MDE", "NOISE FLOOR"],
-        store.segments(s.id).map((g) => [String(g.k), g.oracle_hash, `v${g.spec_version ?? "?"}`, g.baseline_sha.slice(0, 10), magnitudePct(g.mde), magnitudePct(g.noise_floor)]),
+        ["K", "ORACLE", "SPEC", "BASELINE", "MDE", "NOISE FLOOR", "STARTED BY"],
+        store.segments(s.id).map((g) => [String(g.k), g.oracle_hash, `v${g.spec_version ?? "?"}`, g.baseline_sha.slice(0, 10), magnitudePct(g.mde), magnitudePct(g.noise_floor), safeJson<{ auto?: boolean }>(g.details_json)?.auto ? "automatic recalibration (same oracle)" : "calibration"]),
       ),
     ),
   ];
