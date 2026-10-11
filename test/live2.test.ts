@@ -58,6 +58,7 @@ warmup = 0
 n_min = ${opts.nMin ?? 4}
 n_max = ${opts.nMax ?? 12}
 calibration_pairs = 6
+skip_confirm_factor = 0
 bootstrap = 300
 min_effect = 0.01
 confirm = ${opts.confirm ?? true}
@@ -103,20 +104,23 @@ describe("live CI band", () => {
       const band = buildBand(samples, { kind: "noisy", candidate: 50 + i, n: i + 1, metric: { name: "size", direction: "lower" }, protocol: sp.oracle.protocol, guardrails: [], mde: 0.01, noiseFloor: null }) as NoisyBand;
       const run = band.runs[0]!;
       expect(run.points).toHaveLength(out.n);
-      // The last point is the verdict's CI, to the bit.
-      expect(run.points.at(-1)).toMatchObject({ n: out.n, lo: out.ciLo, hi: out.ciHi, m: out.effect });
+      // The last point is the verdict's CI, to the bit (an early lose: its stricter CI).
+      const lastPt = run.points.at(-1)!;
+      if (out.stop === "early") expect({ n: lastPt.n, ...lastPt.early }).toEqual({ n: out.n, lo: out.ciLo, hi: out.ciHi });
+      else expect(lastPt).toMatchObject({ n: out.n, lo: out.ciLo, hi: out.ciHi, m: out.effect });
       // Every judged point equals the decision recomputed at that pair, and only the last one decides.
       const imps: number[] = [];
       for (const p of run.points) {
         const pair = samples.filter((s) => s.pair === p.n - 1 && s.metric === "size");
         imps.push(improvement(pair.find((s) => s.side === "best")!.value, pair.find((s) => s.side === "candidate")!.value, "lower"));
-        if (p.n < sp.oracle.protocol.n_min) {
-          expect(pointDecision(band, p)).toBe("continue");
-          continue;
-        }
-        const d = sequentialDecision({ improvements: imps, nMin: 4, nMax: 20, mde: 0.01, confidence: 0.95, iterations: 300, rng: ciRngFor(50 + i, "measure")(p.n) });
-        expect([p.lo, p.hi]).toEqual([d.ci.lo, d.ci.hi]);
+        const pr = sp.oracle.protocol;
+        const d = sequentialDecision({ improvements: imps, nMin: 4, nMax: 20, mde: 0.01, confidence: 0.95, iterations: 300, rng: ciRngFor(50 + i, "measure")(p.n), futility: pr.futility, earlyLoseFrom: pr.early_lose_from, earlyLoseConfidence: pr.early_lose_confidence });
+        if (p.n < pr.n_min) {
+          // Before n_min only the early-lose check (stricter confidence) can stop it: the band carries the decision's own CI.
+          if (d.early) expect(p.early).toEqual({ lo: d.early.lo, hi: d.early.hi });
+        } else expect([p.lo, p.hi]).toEqual([d.ci.lo, d.ci.hi]);
         expect(pointDecision(band, p)).toBe(p.n === out.n ? out.decision : "continue");
+        expect(pointDecision(band, p)).toBe(d.decision);
       }
       const stop = runDecision(band, run)!;
       expect(stop).toMatchObject({ n: out.n, decision: out.decision });

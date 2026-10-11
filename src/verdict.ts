@@ -2,6 +2,7 @@
 // step against best and in total against the segment base; see guardrails.ts).
 import { judgeGuardrails, type GuardrailEstimate, type GuardrailJudgement, type Position } from "./guardrails.ts";
 import type { MeasureOutcome } from "./noise.ts";
+import { magnitudePct, measuredCiText, signedPct } from "./present.ts";
 import type { StudySpec } from "./spec.ts";
 
 export const VERDICTS = ["win", "lose", "inconclusive", "gate_failed", "conflict", "rejected"] as const;
@@ -17,9 +18,11 @@ export interface VerdictResult {
 export interface VerdictOptions {
   /** Best's position per guardrail against the segment base (the promotion chain so far). */
   prior?: Record<string, Position>;
+  /** The win threshold the measurement used (named in futility reasons). */
+  mde?: number;
 }
 
-const pct = (f: number) => `${(f * 100).toFixed(2)}%`;
+const pct = (f: number) => `${Math.abs(f * 100).toFixed(1)}%`;
 
 /** The outcome's guardrail estimates; hand-built outcomes without them fall back to their point regressions (no CI). */
 export function outcomeEstimates(outcome: MeasureOutcome): Record<string, GuardrailEstimate> {
@@ -37,15 +40,35 @@ export function decideVerdict(outcome: MeasureOutcome, spec: StudySpec, opts: Ve
   const guardrails = judgeGuardrails(spec, outcomeEstimates(outcome), opts.prior ?? {});
   const broken = Object.values(guardrails).filter((g) => g.state === "broken" || g.state === "missing").map((g) => g.text);
   const flagged = Object.values(guardrails).filter((g) => g.state === "inconclusive").map((g) => g.text);
-  const ci = outcome.ciLo !== null && outcome.ciHi !== null ? ` (CI ${pct(outcome.ciLo)}..${pct(outcome.ciHi)}, n=${outcome.n})` : ` (n=${outcome.n})`;
+  const noise = spec.oracle.noise;
+  const p = spec.oracle.protocol;
+  const early = outcome.stop === "early";
+  const ciWords = measuredCiText(outcome.ciLo, outcome.ciHi, outcome.n, noise, early ? { confidence: p.early_lose_confidence } : {});
+  const ci = ciWords ? ` (${ciWords})` : "";
+  const threshold = opts.mde !== undefined ? `the ${magnitudePct(opts.mde, 1)} win threshold` : "the win threshold";
   switch (outcome.decision) {
     case "win":
       if (broken.length) return { verdict: "lose", reasons: [`primary metric improved ${pct(outcome.effect)}${ci}`, ...broken, ...flagged], guardrails };
       return { verdict: "win", reasons: [`primary metric improved ${pct(outcome.effect)}${ci}`, ...flagged], guardrails };
     case "lose":
-      return { verdict: "lose", reasons: [`primary metric regressed ${pct(-outcome.effect)}${ci}`, ...broken, ...flagged], guardrails };
+      return {
+        verdict: "lose",
+        reasons: [
+          `primary metric regressed ${pct(-outcome.effect)}${ci}${early ? `: stopped early, the whole CI is below 0 before pair ${p.n_min}` : ""}`,
+          ...broken,
+          ...flagged,
+        ],
+        guardrails,
+      };
     case "inconclusive":
-      return { verdict: "inconclusive", reasons: [`effect ${pct(outcome.effect)}${ci} did not clear the minimum detectable effect`, ...broken, ...flagged], guardrails };
+      if (outcome.stop === "futility") {
+        return {
+          verdict: "inconclusive",
+          reasons: [`effect ${signedPct(outcome.effect)}${ci} can no longer clear ${threshold}: stopped early (futility: the CI's high end is below it)`, ...broken, ...flagged],
+          guardrails,
+        };
+      }
+      return { verdict: "inconclusive", reasons: [`effect ${signedPct(outcome.effect)}${ci} did not clear ${threshold}`, ...broken, ...flagged], guardrails };
   }
 }
 

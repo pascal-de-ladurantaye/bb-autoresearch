@@ -178,6 +178,8 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
   const pts = run.points;
   const last = pts.at(-1) ?? null;
   const stop = runDecision(band, run);
+  // The last CI drawn: an early lose shows the stricter CI it was decided on.
+  const whisker = last && stop?.reason === "early" && last.early ? last.early : last && last.lo !== null && last.hi !== null ? { lo: last.lo, hi: last.hi } : null;
   const ci = pts.filter((p) => p.lo !== null && p.hi !== null);
   const tone = stop ? DECISION_WORD[stop.decision].tone : "text-foreground";
   // Segments of the band between consecutive points, keyed by pair: a new one grows in from the left.
@@ -265,7 +267,7 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
             {pts.map((p) => (
               <circle key={p.n} cx={x(p.n)} cy={y(p.m)} r={1.6} fill="currentColor" opacity={p.n < band.nMin ? 0.5 : 0.9} />
             ))}
-            {last && last.lo !== null && last.hi !== null ? <line x1={x(last.n)} x2={x(last.n)} y1={y(last.hi)} y2={y(last.lo)} stroke="currentColor" strokeWidth={2} strokeLinecap="round" /> : null}
+            {whisker ? <line data-whisker={stop?.reason === "early" ? "early" : undefined} x1={x(last!.n)} x2={x(last!.n)} y1={y(whisker.hi)} y2={y(whisker.lo)} stroke="currentColor" strokeWidth={2} strokeLinecap="round" /> : null}
             {last ? <circle data-head cx={x(last.n)} cy={y(last.m)} r={3.2} fill="currentColor" style={{ transformBox: "fill-box", transformOrigin: "center" }} /> : null}
           </g>
           {stop ? (
@@ -273,6 +275,7 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
               <line x1={x(stop.n)} x2={x(stop.n)} y1={M.t} y2={H - M.b} stroke="currentColor" strokeWidth={1.5} strokeDasharray="2 2" />
               <text x={x(stop.n) > W - M.r - 50 ? x(stop.n) - 3 : x(stop.n) + 3} y={M.t + 8} fill="currentColor" style={{ fontSize: FONT, fontWeight: 600 }} textAnchor={x(stop.n) > W - M.r - 50 ? "end" : "start"}>
                 {stop.n} of {band.nMax}
+                {STOP_TAG[stop.reason] ? ` · ${STOP_TAG[stop.reason]}` : ""}
               </text>
             </g>
           ) : null}
@@ -284,23 +287,39 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
   );
 }
 
+/** A short tag on the decision marker when the stop wasn't the plain rule. */
+const STOP_TAG: Record<string, string> = { futility: "can't win", early: "early" };
+
+/** The decision's CI at a point: the stricter early-lose CI for an early stop. */
+function stopCi(band: NoisyBand, p: BandPoint, reason: string | null): string {
+  if (reason === "early" && p.early) return `CI ${pct(p.early.lo)} to ${pct(p.early.hi)} at ${Math.round((band.earlyLoseConfidence ?? 0.99) * 1000) / 10}%`;
+  return p.lo !== null && p.hi !== null ? `CI ${pct(p.lo)} to ${pct(p.hi)}` : "no CI yet";
+}
+
 /** The run's state in one sentence (also the chart's accessible name). */
 export function runWords(band: NoisyBand, run: BandRun): string {
   const last = run.points.at(-1);
   if (!last) return "No pairs yet.";
   const stop = runDecision(band, run);
-  const ci = last.lo !== null && last.hi !== null ? `CI ${pct(last.lo)} to ${pct(last.hi)}` : "no CI yet";
+  const ci = stopCi(band, last, stop?.reason ?? null);
   if (stop) {
     const what =
-      stop.decision === "win"
+      stop.reason === "win"
         ? `the CI cleared the ${pct(band.mde)} threshold`
-        : stop.decision === "lose"
+        : stop.reason === "lose"
           ? "the whole CI is on the worse side"
-          : `the CI still straddles the range at the ${band.nMax}-pair cap`;
+          : stop.reason === "early"
+            ? `the whole CI is on the worse side even at the stricter confidence, so it stopped before pair ${band.nMin}`
+            : stop.reason === "futility"
+              ? `the CI's high end is below the ${pct(band.mde)} threshold, so more pairs can't make it a win (stopped early)`
+              : `the CI still straddles the range at the ${band.nMax}-pair cap`;
     return `Decided after ${stop.n} of ${band.nMax} pairs: ${DECISION_WORD[stop.decision].label}. Estimate ${pct(last.m)}, ${ci}: ${what}.`;
   }
-  if (last.n < band.nMin) return `Pair ${last.n} of up to ${band.nMax}: no decision before pair ${band.nMin}. Estimate ${pct(last.m)}${last.lo !== null ? `, ${ci} (for orientation)` : ""}.`;
-  return `Pair ${last.n} of up to ${band.nMax}: estimate ${pct(last.m)}, ${ci}. A win needs the CI's low end above ${pct(band.mde)}, a loss its high end below 0.`;
+  if (last.n < band.nMin) {
+    const early = band.earlyLoseFrom ? `; only a CI entirely below 0 at ${Math.round((band.earlyLoseConfidence ?? 0.99) * 1000) / 10}% stops it before then` : "";
+    return `Pair ${last.n} of up to ${band.nMax}: no win before pair ${band.nMin}${early}. Estimate ${pct(last.m)}${last.lo !== null ? `, CI ${pct(last.lo)} to ${pct(last.hi ?? last.lo)} (for orientation)` : ""}.`;
+  }
+  return `Pair ${last.n} of up to ${band.nMax}: estimate ${pct(last.m)}, ${ci}. A win needs the CI's low end above ${pct(band.mde)}, a loss its high end below 0${band.futility ? `; a high end below ${pct(band.mde)} stops it as inconclusive` : ""}.`;
 }
 
 function RunWords({ band, run }: { band: NoisyBand; run: BandRun }) {
@@ -313,7 +332,8 @@ function RunWords({ band, run }: { band: NoisyBand; run: BandRun }) {
         {stop ? (
           <>
             Decided after {stop.n} of {band.nMax} pairs: <span className={DECISION_WORD[stop.decision].tone}>{DECISION_WORD[stop.decision].label}</span>
-            {last && last.lo !== null && last.hi !== null ? <span className="font-normal text-muted-foreground"> · CI {pct(last.lo)} to {pct(last.hi)}</span> : null}
+            {stop.reason === "futility" ? <span className="font-normal"> (futility: it can no longer win)</span> : stop.reason === "early" ? <span className="font-normal"> (early: clearly worse)</span> : null}
+            {last ? <span className="font-normal text-muted-foreground"> · {stopCi(band, last, stop.reason)}</span> : null}
           </>
         ) : (
           runWords(band, run)

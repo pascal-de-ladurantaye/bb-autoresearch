@@ -30,7 +30,7 @@ export interface CalibrationReport {
   oracleHash: string;
   details: Record<string, number | string | boolean>;
   /** Per bench host results (noise floor, MDE, eval cost). */
-  hosts: Array<{ hostId: string; name: string; mode: string; noiseFloor: number; mde: number; evalSeconds: number; report: string; guardrails?: GuardrailCalibration[] }>;
+  hosts: Array<{ hostId: string; name: string; mode: string; noiseFloor: number; mde: number; evalSeconds: number; report: string; guardrails?: GuardrailCalibration[]; sideRuns?: number | null; runSeconds?: number | null }>;
   /** Per guardrail: A/A noise and CI half-width (worst host). */
   guardrails: GuardrailCalibration[];
   /** Things the human should know that don't fail calibration (a guardrail too noisy to be judged). */
@@ -159,7 +159,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     evalSeconds,
     report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine + singleLine + identityLine,
     details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length, singleMachine: single.on, quietBench: spec.oracle.quiet_bench, commitIdentity: `${identity.name} <${identity.email}>`, commitIdentitySource: identity.source },
-    hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [] })),
+    hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [], sideRuns: r.outcome.sideRuns ?? null, runSeconds: r.outcome.runSeconds ?? null })),
     guardrails,
     warnings: [...guardrailWarnings(guardrails), ...scopeWarnings, ...protectedWarnings, ...(identity.source === "fallback" ? [identityText(identity)] : [])],
   });
@@ -210,7 +210,8 @@ async function calibrateHost(ctx: Ctx, pipeline: Pipeline, study: StudyRow, h: B
       }
     }
     site.markBestBuilt(baseSha, a);
-    const bench = site.bench(spec, { best: a, candidate: b }, { label: "calibration" });
+    // Side runs are chosen by the strategy (noisy "auto"); it gets single runs to time and repeats them itself.
+    const bench = site.bench(spec, { best: a, candidate: b }, { label: "calibration", sideRuns: 1 });
     const outcome = await strategy.calibrate({
       bench,
       spec,
@@ -228,6 +229,8 @@ async function calibrateHost(ctx: Ctx, pipeline: Pipeline, study: StudyRow, h: B
       evals_since_drift: 0,
       drift_status: null,
       baseline_json: outcome.baselineRuns ? JSON.stringify({ sha: baseSha, runs: outcome.baselineRuns.slice(0, 20) }) : null,
+      side_runs: outcome.sideRuns ?? null,
+      run_seconds: outcome.runSeconds ?? null,
     });
     return outcome;
   });
@@ -281,4 +284,125 @@ export async function recordCalibration(ctx: Ctx, study: StudyRow, report: Calib
     store.event(study.id, "calibration.ready", "plugin", { segment: k, mde: report.mde, noise_floor: report.noiseFloor, eval_seconds: report.evalSeconds, oracle: report.oracleHash, hosts: report.hosts.length, warnings: (report.warnings ?? []).length });
     if (k > Math.max(1, study.segment)) store.event(study.id, "segment.started", "plugin", { segment: k, baseline: report.baselineSha, oracle: report.oracleHash, spec_version: study.spec_version });
   });
+}
+
+export interface AutoRecalibration {
+  ok: boolean;
+  problems: string[];
+  /** The new segment (when ok). */
+  segment: number | null;
+  /** Per host: side runs, per-run seconds, noise floor and MDE before and after. */
+  hosts: Array<{ hostId: string; name: string; before: HostCalibration; after: HostCalibration | null }>;
+  report: CalibrationReport | null;
+}
+
+interface HostCalibration {
+  sideRuns: number;
+  runSeconds: number | null;
+  noiseFloor: number | null;
+  mde: number | null;
+}
+
+/**
+ * Automatic recalibration (v0.2.4): best's runs got much shorter than at
+ * calibration, so their relative noise grew for that reason alone. A/A on
+ * best on every bench host (side runs chosen again when "auto"), then a new
+ * segment with the SAME oracle: no gates (best passed them), no approval, no
+ * state change. An A/A median that excludes zero is a warning here, not a
+ * failure (both checkouts are best). If the new MDE exceeds `max_mde` the
+ * hosts keep their old calibration and the caller pauses the study.
+ */
+export async function runAutoRecalibration(ctx: Ctx, pipeline: Pipeline, studyId: string, why: string): Promise<AutoRecalibration> {
+  const { store } = ctx;
+  const study = store.study(studyId)!;
+  const spec = store.spec(study);
+  const baseSha = study.best_sha!;
+  const prev = store.segment(study.id, study.segment);
+  const timeoutMs = spec.oracle.timeout_minutes * 60_000;
+  const hosts = pipeline.benchHosts(study);
+  const snapshot = (h: BenchHostRow): HostCalibration => ({ sideRuns: Math.max(1, h.side_runs ?? 1), runSeconds: h.run_seconds, noiseFloor: h.noise_floor, mde: h.mde });
+  const before = new Map(hosts.map((h) => [h.host_id, { row: h, cal: snapshot(h) }] as const));
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  store.event(study.id, "recalibration.started", "plugin", { segment: study.segment, best: baseSha, reason: why });
+  store.deleteCalibrationSamples(study.id);
+  const results = await Promise.all(
+    hosts.map(async (h) => {
+      try {
+        return { h, outcome: await calibrateHost(ctx, pipeline, study, h, baseSha, timeoutMs), problem: null as string | null };
+      } catch (e) {
+        if (e instanceof BenchError) return { h, outcome: null, problem: `${h.name}: ${e.message}: ${clip(e.output.trim(), 600)}` };
+        if (e instanceof BenchTransferError || e instanceof HealthError) return { h, outcome: null, problem: `${h.name}: ${e.message}` };
+        throw e;
+      }
+    }),
+  );
+  for (const r of results) {
+    if (r.problem) problems.push(r.problem);
+    for (const p of r.outcome?.problems ?? []) {
+      const text = results.length > 1 ? `${r.h.name}: ${p}` : p;
+      // Both checkouts are best: a biased A/A median is chance (or a checkout effect), worth a note, not a pause.
+      if (/excludes zero/u.test(p)) warnings.push(text);
+      else problems.push(text);
+    }
+  }
+  const restore = () => {
+    for (const { row, cal } of before.values()) {
+      store.updateBenchHost(study.id, row.host_id, { noise_floor: cal.noiseFloor, mde: cal.mde, side_runs: row.side_runs, run_seconds: cal.runSeconds, eval_seconds: row.eval_seconds, baseline_json: row.baseline_json });
+    }
+  };
+  const hostLines = (after: (id: string) => HostCalibration | null) => hosts.map((h) => ({ hostId: h.host_id, name: h.name, before: before.get(h.host_id)!.cal, after: after(h.host_id) }));
+  if (problems.length) {
+    restore();
+    store.tx(() => {
+      store.updateStudy(study.id, { recalibrate_due: null });
+      store.event(study.id, "recalibration.failed", "plugin", { segment: study.segment, problems: problems.slice(0, 5) });
+    });
+    return { ok: false, problems, segment: null, hosts: hostLines(() => null), report: null };
+  }
+  const ok = results.filter((r): r is { h: BenchHostRow; outcome: CalibrationOutcome; problem: null } => r.outcome !== null);
+  const first = ok[0]!.outcome;
+  const guardrails = worstGuardrailCalibration(ok.map((r) => r.outcome.guardrails ?? []));
+  const report: CalibrationReport = {
+    ok: true,
+    problems: [],
+    report: `Automatic recalibration on best (${why}). ${(ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report}`,
+    baselineSha: baseSha,
+    gateSeconds: prev?.gate_seconds ?? 0,
+    noiseFloor: Math.max(...ok.map((r) => r.outcome.noiseFloor)),
+    mde: Math.max(...ok.map((r) => r.outcome.mde)),
+    evalSeconds: Math.max(...ok.map((r) => r.outcome.evalSeconds)),
+    oracleHash: prev?.oracle_hash ?? oracleHash(spec),
+    details: { ...first.details, auto: true },
+    hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [], sideRuns: r.outcome.sideRuns ?? null, runSeconds: r.outcome.runSeconds ?? null })),
+    guardrails,
+    warnings: [...guardrailWarnings(guardrails), ...warnings],
+    finishedAt: ctx.now(),
+  };
+  const k = study.segment + 1;
+  const runner = ctx.bb.hostRunner(study.host_id!);
+  const segRef = segmentRef(study.slug, k);
+  const seg = await runner.resolveRef(study.repo_path!, segRef);
+  if (seg !== baseSha) await runner.updateRef(study.repo_path!, segRef, baseSha, seg);
+  const fresh = store.study(study.id)!;
+  store.tx(() => {
+    store.upsertSegment({
+      study_id: study.id,
+      k,
+      baseline_sha: baseSha,
+      oracle_hash: report.oracleHash,
+      noise_floor: report.noiseFloor,
+      mde: report.mde,
+      eval_seconds: report.evalSeconds,
+      gate_seconds: report.gateSeconds,
+      report: report.report,
+      spec_version: fresh.spec_version,
+      details_json: JSON.stringify({ hosts: report.hosts, guardrails: report.guardrails, warnings: report.warnings, auto: true, reason: why }),
+    });
+    store.updateStudy(study.id, { segment: k, calibration_status: "ready", calibration_json: JSON.stringify(report), calibration_approved_at: ctx.now(), recalibrate_due: null });
+    store.event(study.id, "calibration.ready", "plugin", { segment: k, mde: report.mde, noise_floor: report.noiseFloor, eval_seconds: report.evalSeconds, oracle: report.oracleHash, hosts: report.hosts.length, warnings: report.warnings.length, auto: true });
+    store.event(study.id, "segment.started", "plugin", { segment: k, baseline: baseSha, oracle: report.oracleHash, spec_version: fresh.spec_version, auto: true, reason: why });
+  });
+  const after = new Map(ok.map((r) => [r.h.host_id, { sideRuns: Math.max(1, r.outcome.sideRuns ?? 1), runSeconds: r.outcome.runSeconds ?? null, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde }] as const));
+  return { ok: true, problems: [], segment: k, hosts: hostLines((id) => after.get(id) ?? null), report };
 }

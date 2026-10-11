@@ -3,7 +3,7 @@
 // Only this module and the pipeline change study state.
 import { randomUUID } from "node:crypto";
 import { resolveBenchHosts } from "./bench.ts";
-import { recordCalibration, runCalibration, type CalibrationReport } from "./calibration.ts";
+import { recordCalibration, runAutoRecalibration, runCalibration, type AutoRecalibration, type CalibrationReport } from "./calibration.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
 import { applyProposal, type Promotion } from "./harvest-math.ts";
@@ -77,6 +77,7 @@ export class Engine {
       notify: (study, kind, text) => this.notify(study.id, kind, text),
       onSample: (studyId, candidateId) => this.live.onSample(studyId, candidateId),
       onMeasured: (candidateId) => this.live.storeBand(candidateId),
+      recalibrate: async (study) => void (await this.autoRecalibrate(study.id)),
     });
     this.harvester = new Harvester(ctx, this.pipeline, {
       notify: (study, kind, text, opts) => this.notify(study.id, kind, text, opts),
@@ -457,6 +458,8 @@ export class Engine {
     }
     if (study.state !== "paused") throw new EngineError(`${slug} is ${study.state}, not paused`);
     this.pipeline.resetAttempts(study.id);
+    // A host held after a drift pause measures again: the human resumed (or recalibrated).
+    for (const h of this.store.benchHosts(study.id)) if (h.drift_status === "drift") this.store.updateBenchHost(study.id, h.host_id, { drift_status: null });
     this.store.setStudyState(study.id, "running", actor);
     this.kick();
     return `${slug} resumed.`;
@@ -1724,7 +1727,7 @@ export class Engine {
     // One notice kind per milestone the human cares about.
     const kind = /^oracle broken|could not send best|holdout check failed on best/u.test(reason)
       ? "oracle.broken"
-      : /^noise drift/u.test(reason)
+      : /^noise drift|^automatic recalibration failed/u.test(reason)
         ? "drift"
         : /^budget exhausted/u.test(reason)
           ? "budget.exhausted"
@@ -1736,6 +1739,29 @@ export class Engine {
           ? `Next: check the bench host on the Bench tab, then resume on the Overview (\`bb study resume ${study.slug}\`).`
           : `Next: resume on the Overview when it's fixed (\`bb study resume ${study.slug}\`).`;
     await this.notify(studyId, kind, `\`${study.slug}\` paused itself: ${reason}. ${next}`);
+  }
+
+  /**
+   * The pipeline's automatic recalibration (best's runs got much shorter than
+   * at calibration): A/A on best on every bench host and a new segment with
+   * the same oracle. A failure (the oracle is too noisy at these run times)
+   * pauses the study with the numbers.
+   */
+  async autoRecalibrate(studyId: string): Promise<AutoRecalibration | null> {
+    const study = this.store.study(studyId);
+    if (!study || study.state !== "running" || study.recalibrate_due === null || !study.best_sha) return null;
+    const why = safeJson<{ reason?: string }>(study.recalibrate_due)?.reason ?? "best's runs got much shorter than at calibration";
+    this.publish(studyId);
+    const r = await runAutoRecalibration(this.ctx, this.pipeline, studyId, why);
+    this.publish(studyId);
+    this.kick();
+    const fresh = this.store.study(studyId)!;
+    if (!r.ok) {
+      await this.systemPause(studyId, `automatic recalibration failed (${why}): ${r.problems.map((p) => clip(p, 300)).join("; ")}. Raise oracle.protocol side_runs or max_mde with a spec change, or resume to keep the old calibration`);
+      return r;
+    }
+    await this.notify(studyId, "segment.recalibrated", recalibrationNotice(fresh, r, why));
+    return r;
   }
 
   /** The primary metric's name, unit and direction (for text in the shared improvement convention). */
@@ -1914,4 +1940,15 @@ function calibrationNotice(study: StudyRow, report: CalibrationReport): string {
   }
   const warnings = (report.warnings ?? []).map((w) => `- Warning: ${clip(w, 500)}`).join("\n");
   return `Calibration of \`${study.slug}\` is ready. Next: review it and start the study on the Oracle tab (\`bb study start ${study.slug}\`).\n${report.report}${warnings ? `\n${warnings}` : ""}`;
+}
+
+/** The notice after an automatic recalibration: why, and what changed per host (side runs, run time, noise floor, MDE). */
+export function recalibrationNotice(study: StudyRow, r: AutoRecalibration, why: string): string {
+  const pct = (f: number | null) => (f === null ? "?" : `${(f * 100).toFixed(2)}%`);
+  const secs = (v: number | null) => (v === null ? "?" : v < 10 ? `${v.toFixed(2)} s` : `${v.toFixed(1)} s`);
+  const lines = r.hosts.map(
+    (h) =>
+      `- ${h.name}: side runs ${h.before.sideRuns} → ${h.after?.sideRuns ?? "?"}, one run ${secs(h.before.runSeconds)} → ${secs(h.after?.runSeconds ?? null)}, noise floor ${pct(h.before.noiseFloor)} → ${pct(h.after?.noiseFloor ?? null)} per pair, win threshold ${pct(h.before.mde)} → ${pct(h.after?.mde ?? null)}`,
+  );
+  return [`\`${study.slug}\` recalibrated itself on best (${why}): segment ${r.segment} started, same oracle. Shorter runs are noisier relative to themselves; that isn't drift, so the study kept running. Nothing to do.`, ...lines].join("\n");
 }

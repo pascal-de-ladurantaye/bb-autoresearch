@@ -14,7 +14,7 @@
 // notes: live view (part 2)".
 import { estimatePaired, judgeGuardrail, type GuardrailJudgement, type LimitCheck, type Position } from "./guardrails.ts";
 import type { Direction } from "./present.ts";
-import { bootstrapMedianCI, improvement, median, seededRng, tQuantile, type Rng } from "./stats.ts";
+import { bootstrapMedianCI, earlyLoseApplies, earlyLoseCI, improvement, median, seededRng, tQuantile, type Rng, type StopReason } from "./stats.ts";
 
 /** Resamples for CIs the decision doesn't use (before n_min, running guardrail estimates). */
 export const PREVIEW_ITERATIONS = 400;
@@ -42,6 +42,8 @@ export interface BandPoint {
   m: number;
   lo: number | null;
   hi: number | null;
+  /** Before n_min (from `earlyLoseFrom`): the early-lose check's CI at the stricter confidence, as the decision computed it. */
+  early?: { lo: number; hi: number };
 }
 
 export interface BandRun {
@@ -92,6 +94,11 @@ export interface NoisyBand extends BandBase {
   /** False for measurements decided before the seeded bootstrap existed (recomputed; can differ slightly from the verdict's CI). */
   exact: boolean;
   runs: BandRun[];
+  /** v0.2.4 rules (absent in bands stored before them: off). After n_min, stop as inconclusive once the CI's high end is below the threshold. */
+  futility?: boolean;
+  /** Early lose before n_min: from this many pairs, a CI entirely below 0 at `earlyLoseConfidence`. */
+  earlyLoseFrom?: number;
+  earlyLoseConfidence?: number;
 }
 
 export interface DeterministicBand extends BandBase {
@@ -135,7 +142,19 @@ export interface BandInput {
   candidate: number;
   n: number;
   metric: { name: string; direction: Direction };
-  protocol: { n_min: number; n_max: number; confidence: number; bootstrap: number; tolerance: number; min_effect: number; confirm_runs: number; calibration_runs: number };
+  protocol: {
+    n_min: number;
+    n_max: number;
+    confidence: number;
+    bootstrap: number;
+    tolerance: number;
+    min_effect: number;
+    confirm_runs: number;
+    calibration_runs: number;
+    futility?: boolean;
+    early_lose_from?: number;
+    early_lose_confidence?: number;
+  };
   guardrails: BandGuardrail[];
   mde: number;
   /** expensive: calibrated per-run σ (null: mde / 2, as the strategy does). */
@@ -189,13 +208,16 @@ function noisyRun(candidate: number, run: "measure" | "confirm", pairs: readonly
       points.push(cached);
       continue;
     }
+    // The decision's early-lose check before n_min (a t interval of the mean: deterministic, so exactly the decision's).
+    const early = earlyLoseApplies(n, p.n_min, p.early_lose_from) ? earlyLoseCI(imps, p.early_lose_confidence ?? 0.99) : null;
+    const withEarly = (pt: BandPoint): BandPoint => (early ? { ...pt, early: { lo: early.lo, hi: early.hi } } : pt);
     if (n === 1) {
-      points.push({ n, at: pair.at, m: imps[0]!, lo: null, hi: null });
+      points.push(withEarly({ n, at: pair.at, m: imps[0]!, lo: null, hi: null }));
       continue;
     }
     const judged = n >= p.n_min;
     const ci = bootstrapMedianCI(imps, p.confidence, judged ? p.bootstrap : Math.min(p.bootstrap, PREVIEW_ITERATIONS), judged ? rngFor(n) : rngFor(n, "preview"));
-    points.push({ n, at: pair.at, m: ci.median, lo: ci.lo, hi: ci.hi });
+    points.push(withEarly({ n, at: pair.at, m: ci.median, lo: ci.lo, hi: ci.hi }));
   }
   return { run, points, gr };
 }
@@ -217,7 +239,20 @@ export function buildBand(samples: readonly SampleLike[], input: BandInput, prev
       const r = noisyRun(input.candidate, run, pairs, input, old?.runs.find((x) => x.run === run));
       if (r.points.length) runs.push(r);
     }
-    return { ...base, kind: "noisy", nMin: p.n_min, nMax: p.n_max, mde: input.mde, confidence: p.confidence, bootstrap: p.bootstrap, exact: input.exact ?? true, runs };
+    return {
+      ...base,
+      kind: "noisy",
+      nMin: p.n_min,
+      nMax: p.n_max,
+      mde: input.mde,
+      confidence: p.confidence,
+      bootstrap: p.bootstrap,
+      exact: input.exact ?? true,
+      runs,
+      futility: p.futility ?? false,
+      earlyLoseFrom: p.early_lose_from ?? 0,
+      earlyLoseConfidence: p.early_lose_confidence ?? 0.99,
+    };
   }
   const pairs = groupPairs(samples, "measure");
   if (input.kind === "deterministic") {
@@ -275,20 +310,32 @@ export function buildBand(samples: readonly SampleLike[], input: BandInput, prev
 
 // ------------------------------------------------------------ reading
 
-/** The sequential decision at one point of a noisy run (the same rule as stats.sequentialDecision). */
-export function pointDecision(band: Pick<NoisyBand, "nMin" | "nMax" | "mde">, p: BandPoint): BandDecision {
-  if (p.n < band.nMin || p.lo === null || p.hi === null) return "continue";
+type DecisionRule = Pick<NoisyBand, "nMin" | "nMax" | "mde"> & Partial<Pick<NoisyBand, "futility" | "earlyLoseFrom">>;
+
+/** Why the sequential test stops at one point of a noisy run, or null to continue (the same rule as stats.sequentialDecision). */
+export function pointStop(band: DecisionRule, p: BandPoint): StopReason | null {
+  if (p.n < band.nMin) return p.early && band.earlyLoseFrom && p.early.hi < 0 ? "early" : null;
+  if (p.lo === null || p.hi === null) return null;
   if (p.hi < 0) return "lose";
   if (p.lo > band.mde) return "win";
-  if (p.n >= band.nMax) return "inconclusive";
-  return "continue";
+  if (band.futility && p.hi < band.mde) return "futility";
+  if (p.n >= band.nMax) return "cap";
+  return null;
 }
 
-/** Where a noisy run stopped: the first point with a decision, if any. */
-export function runDecision(band: Pick<NoisyBand, "nMin" | "nMax" | "mde">, run: BandRun): { n: number; at: number; decision: Exclude<BandDecision, "continue"> } | null {
+const STOP_DECISION: Record<StopReason, Exclude<BandDecision, "continue">> = { win: "win", lose: "lose", early: "lose", futility: "inconclusive", cap: "inconclusive" };
+
+/** The sequential decision at one point of a noisy run (the same rule as stats.sequentialDecision). */
+export function pointDecision(band: DecisionRule, p: BandPoint): BandDecision {
+  const stop = pointStop(band, p);
+  return stop ? STOP_DECISION[stop] : "continue";
+}
+
+/** Where a noisy run stopped: the first point with a decision, if any, and why. */
+export function runDecision(band: DecisionRule, run: BandRun): { n: number; at: number; decision: Exclude<BandDecision, "continue">; reason: StopReason } | null {
   for (const p of run.points) {
-    const d = pointDecision(band, p);
-    if (d !== "continue") return { n: p.n, at: p.at, decision: d };
+    const reason = pointStop(band, p);
+    if (reason) return { n: p.n, at: p.at, decision: STOP_DECISION[reason], reason };
   }
   return null;
 }

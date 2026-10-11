@@ -674,7 +674,7 @@ function trimForReplay(kind: string, d: Record<string, unknown>): Record<string,
     const cause = verdictCause(typeof d.verdict === "string" ? d.verdict : null, d.reasons);
     return { candidate: d.candidate, n: d.n, verdict: d.verdict, effect: d.effect, reasons, ...(cause ? { cause } : {}) };
   }
-  const keep = ["candidate", "n", "from", "to", "verdict", "worker", "thread", "idea", "candidate", "host", "of", "run", "pairs", "measure_pairs", "confirm_pairs", "seconds", "effect", "files", "label", "w", "worker_row", "priority", "pinned", "theme", "source", "segment", "ok", "decision"];
+  const keep = ["candidate", "n", "from", "to", "verdict", "worker", "thread", "idea", "candidate", "host", "of", "run", "pairs", "measure_pairs", "confirm_pairs", "stop", "confirm_skipped", "seconds", "effect", "files", "label", "w", "worker_row", "priority", "pinned", "theme", "source", "segment", "ok", "decision"];
   const out: Record<string, unknown> = {};
   for (const k of keep) if (d[k] !== undefined) out[k] = d[k];
   for (const k of ["reason", "title"]) if (typeof d[k] === "string") out[k] = clip(d[k] as string, 120);

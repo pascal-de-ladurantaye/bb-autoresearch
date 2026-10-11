@@ -21,6 +21,7 @@ import {
   sequentialDecision,
   tQuantile,
   type Rng,
+  type StopReason,
 } from "./stats.ts";
 
 export type Side = "best" | "candidate";
@@ -29,6 +30,54 @@ export interface RunResult {
   metrics: Record<string, number>;
   diag: string[];
   durationMs: number;
+  /** Runs of the measure command this result combines (side runs; absent: 1). `durationMs` is their sum. */
+  reps?: number;
+}
+
+/** Seconds of one run of the measure command in a (possibly repeated) side. */
+export function perRunSeconds(r: Pick<RunResult, "durationMs" | "reps">): number {
+  return r.durationMs / 1000 / Math.max(1, r.reps ?? 1);
+}
+
+/** The most side runs "auto" picks (a benchmark faster than min_side_seconds / this should loop itself). */
+export const AUTO_SIDE_RUNS_MAX = 30;
+
+/** Side runs for "auto": enough runs of `runSeconds` each for a side to last `minSideSeconds`. */
+export function autoSideRuns(runSeconds: number, minSideSeconds: number): number {
+  if (!(runSeconds > 0) || !(minSideSeconds > 0)) return 1;
+  return Math.max(1, Math.min(AUTO_SIDE_RUNS_MAX, Math.ceil(minSideSeconds / runSeconds - 1e-9)));
+}
+
+/**
+ * Several runs of one side combined into one result: each metric keeps its
+ * best value in its own direction (the primary metric's and each
+ * guardrail's; the minimum for metrics without one), the usual "best of N"
+ * for timings. DIAG lines come from the last run; the duration is the sum.
+ */
+export function combineRuns(runs: readonly RunResult[], spec: Pick<StudySpec, "metric" | "guardrail">): RunResult {
+  if (runs.length === 1) return runs[0]!;
+  const dir = new Map<string, "lower" | "higher">([[spec.metric.name, spec.metric.direction], ...spec.guardrail.map((g) => [g.name, g.direction] as const)]);
+  const metrics: Record<string, number> = {};
+  for (const r of runs) {
+    for (const [k, v] of Object.entries(r.metrics)) {
+      const cur = metrics[k];
+      if (cur === undefined) metrics[k] = v;
+      else metrics[k] = dir.get(k) === "higher" ? Math.max(cur, v) : Math.min(cur, v);
+    }
+  }
+  return { metrics, diag: runs.at(-1)!.diag, durationMs: runs.reduce((a, r) => a + r.durationMs, 0), reps: runs.reduce((a, r) => a + (r.reps ?? 1), 0) };
+}
+
+/** A bench whose every side is `n` runs of the measure command, combined (`combineRuns`). n = 1 returns `bench`. */
+export function repeatBench(bench: Bench, spec: Pick<StudySpec, "metric" | "guardrail">, n: number): Bench {
+  if (n <= 1) return bench;
+  return {
+    run: async (side) => {
+      const runs: RunResult[] = [];
+      for (let i = 0; i < n; i++) runs.push(await bench.run(side));
+      return combineRuns(runs, spec);
+    },
+  };
 }
 
 export class BenchError extends Error {
@@ -72,7 +121,7 @@ export interface MeasureContext {
    * noisy: the generator for the sequential test's bootstrap at pair n (band.ts `ciRngFor`),
    * so the live CI band can recompute the decision's exact CI from the samples. Default: `rng`.
    */
-  ciRng?: (n: number) => Rng;
+  ciRng?: (n: number, salt?: string) => Rng;
 }
 
 export type Decision = "win" | "lose" | "inconclusive";
@@ -98,6 +147,10 @@ export interface MeasureOutcome {
   baselineRuns?: RunResult[];
   /** expensive: the candidate's confirmation runs (the new baseline if it is promoted). */
   confirmRuns?: RunResult[];
+  /** noisy: why the sequential test stopped (absent: hand-built outcomes, other classes). */
+  stop?: StopReason;
+  /** Median seconds of one run of the measure command per side (the auto-recalibration trigger). */
+  runSeconds?: { best: number | null; candidate: number | null };
 }
 
 export interface CalibrationContext {
@@ -123,6 +176,10 @@ export interface CalibrationOutcome {
   baselineRuns?: RunResult[];
   /** Per guardrail: A/A noise and the CI half-width a typical evaluation gets. */
   guardrails?: GuardrailCalibration[];
+  /** noisy: runs of the measure command per side (side_runs, chosen when "auto"). */
+  sideRuns?: number;
+  /** Median seconds of one run of the measure command at calibration. */
+  runSeconds?: number;
 }
 
 export interface NoiseStrategy {
@@ -180,6 +237,18 @@ export const noisyStrategy: NoiseStrategy = {
       await ctx.bench.run("best");
       await ctx.bench.run("candidate");
     }
+    // Side runs: "auto" times one warm run of each side and picks enough runs for a side to last min_side_seconds.
+    let sideRuns = typeof p.side_runs === "number" ? p.side_runs : 1;
+    let timedSeconds: number | null = null;
+    if (p.side_runs === "auto") {
+      checkAborted(ctx.signal);
+      const a = await ctx.bench.run("best");
+      const b = await ctx.bench.run("candidate");
+      timedSeconds = median([perRunSeconds(a), perRunSeconds(b)]);
+      sideRuns = autoSideRuns(timedSeconds, p.min_side_seconds);
+    }
+    const bench = repeatBench(ctx.bench, ctx.spec, sideRuns);
+    const runTimes: number[] = [];
     const improvements: number[] = [];
     const aaPairs: Array<{ best: Record<string, number>; candidate: Record<string, number> }> = [];
     let pairMs = 0;
@@ -189,9 +258,10 @@ export const noisyStrategy: NoiseStrategy = {
       const order: Side[] = ctx.rng() < 0.5 ? ["best", "candidate"] : ["candidate", "best"];
       const runs: Partial<Record<Side, RunResult>> = {};
       for (const side of order) {
-        const r = await ctx.bench.run(side);
+        const r = await bench.run(side);
         runs[side] = r;
         pairMs += r.durationMs;
+        runTimes.push(perRunSeconds(r));
         ctx.record({ pair: i, side, metrics: r.metrics });
       }
       bestRun = runs.best!;
@@ -214,10 +284,17 @@ export const noisyStrategy: NoiseStrategy = {
     const problems: string[] = [];
     if (stats.mde > p.max_mde) problems.push(`minimum detectable effect ${fmt(stats.mde)} exceeds max_mde ${fmt(p.max_mde)}: the oracle is too noisy`);
     if (stats.biased) problems.push(`A/A median ${fmt(stats.aaCi.median)} (CI ${fmt(stats.aaCi.lo)}..${fmt(stats.aaCi.hi)}) excludes zero: the two bench checkouts are not equivalent`);
+    const runSeconds = runTimes.length ? median(runTimes) : (timedSeconds ?? 0);
+    const sideLine =
+      sideRuns > 1
+        ? ` Each side of a pair is ${sideRuns} runs of the measure command (best of ${sideRuns} per metric; one run takes about ${duration(runSeconds)}${p.side_runs === "auto" ? `, so ${sideRuns} make a side of at least ${duration(p.min_side_seconds)}` : ""}).`
+        : p.side_runs === "auto"
+          ? ` One run per side (a run takes about ${duration(runSeconds)}, at least the ${duration(p.min_side_seconds)} a side needs).`
+          : "";
     const report =
       `Detects changes of ${fmt(stats.detectable)} or more with ${p.n_max} pairs (win threshold on the CI lower bound: ${fmt(stats.mde)}). ` +
       `Noise floor ${fmt(stats.noiseFloor)} per pair. About ${duration(evalSeconds)} per evaluation, ` +
-      `so about ${Math.round(3600 / Math.max(0.1, evalSeconds))} evaluations per hour per bench host.`;
+      `so about ${Math.round(3600 / Math.max(0.1, evalSeconds))} evaluations per hour per bench host.${sideLine}`;
     return {
       ok: problems.length === 0,
       problems,
@@ -233,9 +310,13 @@ export const noisyStrategy: NoiseStrategy = {
         halfWidthAtNMax: stats.halfWidthAtNMax,
         detectable: stats.detectable,
         secondsPerPair,
+        sideRuns,
+        runSeconds,
       },
       bestRun,
       guardrails,
+      sideRuns,
+      runSeconds,
     };
   },
   async measure(ctx) {
@@ -267,10 +348,14 @@ export const noisyStrategy: NoiseStrategy = {
         confidence: p.confidence,
         iterations: p.bootstrap,
         rng: ctx.ciRng ? ctx.ciRng(improvements.length) : ctx.rng,
+        futility: p.futility,
+        earlyLoseFrom: p.early_lose_from,
+        earlyLoseConfidence: p.early_lose_confidence,
       });
       if (last.decision !== "continue") break;
     }
     const decision = last && last.decision !== "continue" ? last.decision : "inconclusive";
+    const secs = (side: "best" | "candidate") => (pairs.length ? median(pairs.map((x) => perRunSeconds(x[side]))) : null);
     const perPair = pairedRegressions(ctx.spec, pairs.map((x) => ({ best: x.best.metrics, candidate: x.candidate.metrics })));
     const guardrailEstimates = Object.fromEntries(ctx.spec.guardrail.map((g) => [g.name, estimatePaired(perPair[g.name] ?? [], p.confidence, p.bootstrap, ctx.rng)]));
     return {
@@ -286,6 +371,8 @@ export const noisyStrategy: NoiseStrategy = {
       bestDiag: pairs.at(-1)?.best.diag ?? [],
       candidateDiag: pairs.at(-1)?.candidate.diag ?? [],
       bestRun: pairs.at(-1)?.best ?? null,
+      ...(last?.stop ? { stop: last.stop } : {}),
+      runSeconds: { best: secs("best"), candidate: secs("candidate") },
     };
   },
 };

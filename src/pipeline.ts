@@ -33,6 +33,7 @@ import { checkScope } from "./scope.ts";
 import { identityText, resolveCommitIdentity, type CommitIdentity } from "./identity.ts";
 import { singleMachineMode, type SingleMachineMode } from "./single-machine.ts";
 import { bestBranch, candidateRef, formatPct, type StudySpec } from "./spec.ts";
+import { magnitudePct, signedPct } from "./present.ts";
 import { applyConfirmation, decideVerdict, outcomeEstimates, type VerdictResult } from "./verdict.ts";
 
 export type SubmitResult = { ok: true; candidate: CandidateRow; text: string } | { ok: false; text: string };
@@ -60,6 +61,23 @@ export interface PipelineHooks {
   onSample?(studyId: string, candidateId: number): void;
   /** Live view: a measurement ended and its metrics are stored (the band is kept with the candidate). */
   onMeasured?(candidateId: number): void;
+  /**
+   * An automatic recalibration is due and the study's bench is free: A/A on best on every
+   * bench host, a new segment with the same oracle (engine.ts → calibration.ts).
+   */
+  recalibrate?(study: StudyRow): Promise<void>;
+}
+
+/**
+ * Whether best's runs got short enough, against the host's calibration, that
+ * relative noise has grown for that reason alone: below `recalibrate_below`
+ * of the calibrated per-run time. Returns the ratio when it triggers.
+ */
+export function recalibrationTrigger(spec: StudySpec, host: Pick<BenchHostRow, "run_seconds">, runSeconds: number | null | undefined): number | null {
+  const below = spec.oracle.drift.recalibrate_below ?? 0;
+  if (spec.oracle.noise !== "noisy" || !(below > 0) || !host.run_seconds || !(host.run_seconds > 0) || runSeconds === null || runSeconds === undefined || !(runSeconds > 0)) return null;
+  const ratio = runSeconds / host.run_seconds;
+  return ratio < below ? ratio : null;
 }
 
 /** The win threshold a measurement of `study` on `host` uses (segment MDE, at least the host's own). */
@@ -71,6 +89,18 @@ export function measurementMde(store: Store, study: StudyRow, spec: StudySpec, h
 /** The calibrated per-run noise a measurement on `host` uses (expensive: σ of one run). */
 export function measurementNoise(store: Store, study: StudyRow, host: Pick<BenchHostRow, "noise_floor">): number | null {
   return host.noise_floor ?? store.segment(study.id, study.segment)?.noise_floor ?? null;
+}
+
+/**
+ * Whether a noisy win skips its confirmation: its CI's lower bound is at
+ * least `skip_confirm_factor` times the win threshold (0 turns this off). A
+ * false win that far beyond the threshold would need the whole CI to be
+ * wrong by several half-widths. Returns the reason recorded in the verdict.
+ */
+export function confirmationSkip(spec: StudySpec, mde: number, ciLo: number | null): string | null {
+  const f = spec.oracle.protocol.skip_confirm_factor ?? 0;
+  if (!(f > 0) || ciLo === null || !Number.isFinite(ciLo) || !(mde > 0) || ciLo < f * mde) return null;
+  return `confirmation skipped: the CI's lower bound ${signedPct(ciLo)} is ${(ciLo / mde).toFixed(1)}× the ${magnitudePct(mde, 1)} win threshold (skip_confirm_factor ${f})`;
 }
 
 /** Live view: at most one measure.progress event per candidate this often (plus the first and the last). */
@@ -97,9 +127,27 @@ export function benchLockKey(study: StudyRow, spec: StudySpec, hostId: string): 
  * promotion chain base → best, compounded (see guardrails.ts).
  */
 export function bestGuardrailPositions(store: Store, study: StudyRow, spec: StudySpec): Record<string, Position> {
-  const seg = store.segment(study.id, study.segment);
-  const chain = promotionChain(store.candidates(study.id, { stages: ["decided"] }), seg?.baseline_sha ?? study.base_sha, study.best_sha);
+  const chain = promotionChain(store.candidates(study.id, { stages: ["decided"] }), guardrailChainBase(store, study), study.best_sha);
   return positionsFromChain(spec, chain, (m) => safeJson(m));
+}
+
+/**
+ * Where guardrails' total limit is counted from: the baseline of the first
+ * segment in the current run of segments with the same oracle. An automatic
+ * recalibration starts a segment without changing the oracle, so it must
+ * not reset the cumulative limit; an oracle change does.
+ */
+export function guardrailChainBase(store: Store, study: StudyRow): string | null {
+  const segs = store.segments(study.id);
+  const current = segs.find((g) => g.k === study.segment);
+  if (!current) return study.base_sha;
+  let base = current;
+  for (let k = current.k - 1; k >= 1; k--) {
+    const g = segs.find((x) => x.k === k);
+    if (!g || g.oracle_hash !== current.oracle_hash) break;
+    base = g;
+  }
+  return base.baseline_sha;
 }
 
 /** The active segment's calibrated guardrail noise (worst bench host), by guardrail name. */
@@ -179,6 +227,8 @@ export class Pipeline {
   private jobs = new Map<string, Promise<void>>();
   /** Lock keys with a measurement job launched. */
   private measuring = new Set<string>();
+  /** The study of each launched measurement, by lock key (an automatic recalibration waits until its study has none). */
+  private measuringStudy = new Map<string, string>();
   /** Lock keys with a serialized gate job launched (single-machine mode). */
   private gating = new Set<string>();
   /** Gate checkout slots in use, per study. */
@@ -447,11 +497,17 @@ export class Pipeline {
           }
         });
       }
-      for (const c of store.candidates(study.id, { stages: ["queued"] })) {
-        if (this.eligible(`c:${c.id}`, c)) bench.push({ kind: "measure", study, spec, c, lockKey: null, limit });
+      // An automatic recalibration is due: no new measurement or drift check starts; once the study's
+      // measurements on the bench have finished, it runs (each host under its own bench lock).
+      const recal = study.state === "running" && study.recalibrate_due !== null;
+      if (!recal) {
+        for (const c of store.candidates(study.id, { stages: ["queued"] })) {
+          if (this.eligible(`c:${c.id}`, c)) bench.push({ kind: "measure", study, spec, c, lockKey: null, limit });
+        }
       }
       // Drift checks are due on idle hosts even with nothing queued.
-      if (study.state === "running") for (const h of this.benchHosts(study)) this.maybeStartDrift(study, spec, h);
+      if (study.state === "running" && !recal) for (const h of this.benchHosts(study)) this.maybeStartDrift(study, spec, h);
+      if (recal) this.maybeStartRecalibration(study);
     }
     // Bench: one holder per lock key, oldest first across studies (a candidate
     // waits since it was queued, or, for a first gate, since it was submitted).
@@ -480,13 +536,17 @@ export class Pipeline {
         const lockKey = benchLockKey(study, spec, h.host_id);
         if (this.keyBusy(lockKey)) continue;
         if (h.status === "offline" || (h.deferred_until ?? 0) > now) continue;
+        // A host whose drift check paused the study measures nothing until resume or recalibration.
+        if (h.drift_status === "drift") continue;
         if (study.state === "running" && this.maybeStartDrift(study, spec, h)) continue;
         this.measuring.add(lockKey);
+        this.measuringStudy.set(lockKey, study.id);
         this.start(`c:${c.id}`, async () => {
           try {
             await this.guard(study, c, () => this.measure(c.id, h.host_id));
           } finally {
             this.measuring.delete(lockKey);
+            this.measuringStudy.delete(lockKey);
             if (this.progressByKey.get(lockKey)?.studyId === study.id) this.progressByKey.delete(lockKey);
           }
         });
@@ -501,6 +561,39 @@ export class Pipeline {
         this.start(key, () => this.report(c.id));
       }
     }
+  }
+
+  /** Start the study's automatic recalibration once none of its measurements or drift checks is on the bench. */
+  private maybeStartRecalibration(study: StudyRow): void {
+    const key = `recal:${study.id}`;
+    if (!this.hooks.recalibrate || this.jobs.has(key) || (this.backoff.get(key) ?? 0) > this.ctx.now()) return;
+    if ([...this.measuringStudy.values()].includes(study.id)) return;
+    if ([...this.jobs.keys()].some((k) => k.startsWith(`d:${study.id}:`))) return;
+    this.start(key, async () => {
+      try {
+        await this.hooks.recalibrate!(study);
+      } catch (e) {
+        if (this.ctx.disposed || e instanceof StoreClosedError) return;
+        // Host errors: try again later rather than on every pass.
+        this.backoff.set(key, this.ctx.now() + Math.max(this.ctx.config.retryDelayMs, 1000) * 5);
+        this.ctx.bb.log("warn", `automatic recalibration of ${study.slug}: ${errText(e)}`);
+      }
+    });
+  }
+
+  /**
+   * Schedule an automatic recalibration (best's runs got much shorter than at
+   * calibration): it runs at the next free bench slot, before any other
+   * measurement of the study.
+   */
+  markRecalibrationDue(study: StudyRow, reason: string, data: Record<string, unknown> = {}): void {
+    const fresh = this.ctx.store.study(study.id);
+    if (!fresh || fresh.recalibrate_due !== null || fresh.state === "archived") return;
+    this.ctx.store.tx(() => {
+      this.ctx.store.updateStudy(study.id, { recalibrate_due: JSON.stringify({ reason, at: this.ctx.now(), ...data }) });
+      this.ctx.store.event(study.id, "recalibration.due", "plugin", { reason, ...data });
+    });
+    this.changed(study.id);
   }
 
   private takeGateSlot(studyId: string, limit: number): number | null {
@@ -683,6 +776,8 @@ export class Pipeline {
       } catch (e) {
         // Plugin reload: the store is closed and the new instance restarts this measurement.
         if (this.ctx.disposed) return;
+        // Another instance (after a restart) took this measurement over: write nothing.
+        if (e instanceof StaleMeasurementError) return;
         const seconds = (this.ctx.now() - started) / 1000;
         store.addBenchSeconds(study.id, seconds);
         const fresh = store.candidate(c.id)!;
@@ -759,6 +854,7 @@ export class Pipeline {
       return;
     }
     const dirs = { best: best.dir, candidate: candDir };
+    const sideRunsUsed = strategy.kind === "noisy" ? site.sideRuns() : 1;
     const bench = site.bench(spec, dirs, { signal, label: `c/${c.n}`, onProgress: (line) => progress(line) });
     let runNo = 0;
     // Pair progress for the live view: completed pairs (noisy) or candidate runs, recorded as
@@ -773,7 +869,13 @@ export class Pipeline {
       pairs.recorded = pairs.done;
       store.event(study.id, "measure.progress", "plugin", { candidate: c.id, n: c.n, run: pairs.run, pairs: pairs.done, of: pairs.run === "confirm" ? units.confirm : units.measure, host: host.host_id });
     };
+    // A measurement that reconciliation restarted elsewhere (measure_restarts moved on) must not write.
+    const stillMine = () => {
+      const now = store.candidate(c.id);
+      if (!now || now.measure_restarts !== c.measure_restarts || !["measuring", "confirming"].includes(now.stage)) throw new StaleMeasurementError();
+    };
     const record = (run: string) => (s: { pair: number; side: Side; metrics: Record<string, number> }) => {
+      stillMine();
       runNo += 1;
       progress(`${run} pair ${s.pair + 1} ${s.side} (run ${runNo})`);
       for (const [metric, value] of Object.entries(s.metrics)) {
@@ -820,10 +922,27 @@ export class Pipeline {
       signal,
     });
     recordProgress(true);
-    let result = decideVerdict(outcome, spec, { prior });
+    stillMine();
+    let result = decideVerdict(outcome, spec, { prior, mde });
     let estimates: Record<string, GuardrailEstimate> = outcomeEstimates(outcome);
-    if (result.verdict === "win" && spec.oracle.protocol.confirm && strategy.kind === "noisy") {
+    let confirmSkipped = false;
+    const p0 = spec.oracle.protocol;
+    const skip = confirmationSkip(spec, mde, outcome.ciLo);
+    if (result.verdict === "win" && p0.confirm && strategy.kind === "noisy" && skip) {
+      // The measurement alone is far beyond the threshold: a fresh confirmation would only cost pairs.
+      confirmSkipped = true;
+      result = { ...result, reasons: [result.reasons[0] ?? "win", skip, ...result.reasons.slice(1)] };
+      store.event(study.id, "confirm.skipped", "plugin", { candidate: c.id, n: c.n, lo: outcome.ciLo, mde, factor: p0.skip_confirm_factor });
+    } else if (result.verdict === "win" && p0.confirm && strategy.kind === "noisy") {
       store.updateCandidate(c.id, { stage: "confirming" });
+      // The confirmation starts: its first pair is running (the live view shows a placeholder for its band).
+      pairs.byRun[pairs.run] = pairs.done;
+      pairs.run = "confirm";
+      pairs.done = 0;
+      pairs.recorded = 0;
+      pairs.sides.clear();
+      pairs.counted.clear();
+      store.event(study.id, "measure.progress", "plugin", { candidate: c.id, n: c.n, run: "confirm", pairs: 0, of: units.confirm, host: host.host_id });
       this.changed(study.id);
       const confirmation = await strategy.measure({ bench, spec, mde, rng: this.ctx.rng, ciRng: ciRngFor(c.id, "confirm"), record: record("confirm"), bestCache: null, guardrailNoise, signal });
       recordProgress(true);
@@ -836,7 +955,7 @@ export class Pipeline {
         if (e) pooled[g.name] = e;
       }
       estimates = pooled;
-      result = applyConfirmation(result, decideVerdict({ ...confirmation, guardrails: Object.fromEntries(Object.entries(pooled).map(([k, e]) => [k, e.regression])), guardrailEstimates: pooled }, spec, { prior }));
+      result = applyConfirmation(result, decideVerdict({ ...confirmation, guardrails: Object.fromEntries(Object.entries(pooled).map(([k, e]) => [k, e.regression])), guardrailEstimates: pooled }, spec, { prior, mde }));
     }
     if (result.verdict === "win" && spec.oracle.holdout) {
       store.updateCandidate(c.id, { stage: "confirming" });
@@ -853,9 +972,10 @@ export class Pipeline {
       }
       result = h.pass ? { verdict: "win", reasons: [...result.reasons, h.reason] } : { verdict: "lose", reasons: [...result.reasons, HOLDOUT_FAIL] };
     }
+    stillMine();
     const seconds = (this.ctx.now() - started) / 1000;
     store.addBenchSeconds(study.id, seconds);
-    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run, measure_pairs: pairs.run === "measure" ? pairs.done : (pairs.byRun.measure ?? 0), confirm_pairs: pairs.run === "confirm" ? pairs.done : 0, effect: Number.isFinite(outcome.effect) ? outcome.effect : null });
+    store.event(study.id, "measure.finished", "plugin", { candidate: c.id, n: c.n, against, seconds, decision: result.verdict, host: host.host_id, pairs: pairs.done, run: pairs.run, measure_pairs: pairs.run === "measure" ? pairs.done : (pairs.byRun.measure ?? 0), confirm_pairs: pairs.run === "confirm" ? pairs.done : 0, effect: Number.isFinite(outcome.effect) ? outcome.effect : null, ...(outcome.stop ? { stop: outcome.stop } : {}), ...(confirmSkipped ? { confirm_skipped: true } : {}) });
     const hostRow = store.benchHost(study.id, host.host_id)!;
     store.updateBenchHost(study.id, host.host_id, { evals_since_drift: hostRow.evals_since_drift + 1 });
     // Cache a run of best: reused as the baseline by single-run classes, and its DIAG lines go into briefs.
@@ -878,11 +998,18 @@ export class Pipeline {
         ...(result.guardrails ? { guardrailJudgement: result.guardrails } : {}),
         n: outcome.n,
         mde,
+        ...(outcome.stop ? { stop: outcome.stop } : {}),
+        ...(confirmSkipped ? { confirmSkipped: true } : {}),
+        ...(outcome.runSeconds ? { runSeconds: outcome.runSeconds } : {}),
+        ...(sideRunsUsed > 1 ? { sideRuns: sideRunsUsed } : {}),
       }),
       diag_json: JSON.stringify(outcome.candidateDiag.slice(0, 40)),
       bench_seconds: c.bench_seconds + seconds,
     });
     this.hooks.onMeasured?.(c.id);
+    // Best's runs much shorter than at calibration: relative noise grew for that reason alone, so recalibrate.
+    const bestRatio = recalibrationTrigger(spec, store.benchHost(study.id, host.host_id) ?? host, outcome.runSeconds?.best);
+    if (bestRatio !== null) this.markRecalibrationDue(study, `best's runs take ${Math.round(bestRatio * 100)}% of the time they took at calibration on ${host.name}`, { ratio: bestRatio, host: host.host_id, source: "measurement" });
     if (result.verdict === "win") {
       // A win only counts against the best it was measured on. If best moved
       // during the measurement (another bench host promoted), measure again.
@@ -1045,7 +1172,17 @@ export class Pipeline {
         store.updateBenchHost(study.id, hostId, { evals_since_drift: 0, drift_status: result.ok ? "ok" : "drift", drift_at: this.ctx.now() });
         store.event(study.id, "drift.checked", "plugin", { host: hostId, ok: result.ok, noise: result.noise, calibrated: result.calibrated, ratio: Math.round(result.ratio * 100) / 100, pairs: result.pairs });
         this.changed(study.id);
+        const shorter = recalibrationTrigger(spec, host, result.runSeconds);
+        if (!result.ok && shorter !== null) {
+          // Not drift: best's runs got much shorter, and shorter runs are noisier relative to themselves.
+          store.updateBenchHost(study.id, hostId, { drift_status: null });
+          store.event(study.id, "drift.explained", "plugin", { host: hostId, ratio: shorter, noise: result.noise, calibrated: result.calibrated });
+          this.markRecalibrationDue(study, `a drift check on ${host.name} measured noise ${formatPct(result.noise)} per pair (${result.ratio.toFixed(1)}× the calibrated level) while best's runs take ${Math.round(shorter * 100)}% of the time they took at calibration`, { ratio: shorter, host: hostId, source: "drift" });
+          return result;
+        }
         if (!result.ok) {
+          // Measurements of this study on this host wait (an in-flight one restarts later) until resume or recalibration.
+          this.cancelMeasurements((e) => e.studyId === study.id && e.hostId === hostId, `noise drift on ${host.name}: the study paused`);
           await this.hooks.systemPause(
             study,
             `noise drift on bench host ${host.name}: an A/A check on best measured noise ${formatPct(result.noise)} per pair, ${result.ratio.toFixed(1)}× the calibrated ${formatPct(result.calibrated)} (limit ${spec.oracle.drift.max_ratio}×). Check the machine, then resume or recalibrate`,
@@ -1133,6 +1270,11 @@ export class Pipeline {
     this.pendingBaselines.delete(c.id);
     if (pending) store.updateBenchHost(study.id, pending.hostId, { baseline_json: JSON.stringify({ sha: promoted, runs: pending.runs }) });
     this.decide(store.candidate(c.id)!, { verdict: "win", reasons: JSON.parse(c.reasons_json ?? "[]") as string[] });
+    // The new best's runs (the winner's candidate side) much shorter than at calibration: recalibrate before the next measurement.
+    const measured = safeJson<{ runSeconds?: { candidate?: number | null } }>(c.metrics_json)?.runSeconds?.candidate;
+    const hostRow = c.bench_host_id ? store.benchHost(study.id, c.bench_host_id) : undefined;
+    const ratio = hostRow ? recalibrationTrigger(store.spec(study), hostRow, measured) : null;
+    if (ratio !== null) this.markRecalibrationDue(study, `c/${c.n} made best's runs ${Math.round(ratio * 100)}% as long as at calibration on ${hostRow!.name}`, { ratio, host: hostRow!.host_id, source: "promotion", candidate: c.n });
     this.hooks.bestMoved(store.study(study.id)!, store.candidate(c.id)!, promoted);
   }
 
@@ -1238,4 +1380,12 @@ export function gitId(id: CommitIdentity): { name: string; email: string } {
 
 export function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** A measurement whose candidate was restarted by another instance (reconciliation after a restart). */
+export class StaleMeasurementError extends Error {
+  constructor() {
+    super("measurement restarted elsewhere");
+    this.name = "StaleMeasurementError";
+  }
 }

@@ -71,10 +71,14 @@ describe("noisy strategy", () => {
     const pairsOrder = bench.order.slice(2).reduce<string[]>((acc, side, i, a) => (i % 2 === 0 ? [...acc, `${side}-${a[i + 1]}`] : acc), []);
     expect(new Set(pairsOrder).size).toBe(2);
   });
-  it("stops early on a clear loss", async () => {
+  it("stops early on a clear loss: from 3 pairs (CI below 0 at 99%), or at n_min without the early rule", async () => {
     const o = await noisyStrategy.measure({ bench: fakeBench({ effect: -0.1, noise: 0.01, seed: 2 }), spec: s, mde: 0.02, rng: seededRng(2), record: () => {} });
     expect(o.decision).toBe("lose");
-    expect(o.n).toBe(5);
+    expect(o.n).toBe(3);
+    expect(o.stop).toBe("early");
+    const off = spec("[oracle.protocol]\nn_min = 5\nn_max = 20\nwarmup = 1\nbootstrap = 500\nearly_lose_from = 0");
+    const o2 = await noisyStrategy.measure({ bench: fakeBench({ effect: -0.1, noise: 0.01, seed: 2 }), spec: off, mde: 0.02, rng: seededRng(2), record: () => {} });
+    expect(o2).toMatchObject({ decision: "lose", n: 5, stop: "lose" });
   });
   it("runs to n_max and is inconclusive on no effect", async () => {
     const o = await noisyStrategy.measure({ bench: fakeBench({ effect: 0, noise: 0.05, seed: 3 }), spec: s, mde: 0.02, rng: seededRng(3), record: () => {} });

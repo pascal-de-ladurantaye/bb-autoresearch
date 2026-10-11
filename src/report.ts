@@ -7,7 +7,7 @@ import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/stor
 import { harvestAccounting, type Accounting, type Estimate } from "./harvest-math.ts";
 import type { GuardrailCost, StackRecord } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
-import { bestGuardrailPositions, segmentGuardrailCalibration } from "./pipeline.ts";
+import { bestGuardrailPositions, guardrailChainBase, segmentGuardrailCalibration } from "./pipeline.ts";
 import { amountText, ciRangeText, ciText, clipWords, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
@@ -261,8 +261,7 @@ export function harvestSection(ctx: Ctx, study: StudyRow, spec: StudySpec, h: Ha
 export function guardrailSection(ctx: Ctx, study: StudyRow, spec: StudySpec): string[] {
   const { store } = ctx;
   const positions = bestGuardrailPositions(store, study, spec);
-  const seg = store.segment(study.id, study.segment);
-  const chain = promotionChain(store.candidates(study.id, { stages: ["decided"] }), seg?.baseline_sha ?? study.base_sha, study.best_sha);
+  const chain = promotionChain(store.candidates(study.id, { stages: ["decided"] }), guardrailChainBase(store, study), study.best_sha);
   const calibration = new Map(segmentGuardrailCalibration(store, study).map((g) => [g.name, g] as const));
   const decided = store.decided(study.id, 5000);
   const lines = [

@@ -45,6 +45,8 @@ export interface StudyRow {
   budget_notices_json: string;
   /** When the human last looked at the study's notices (the "new" count). */
   notices_seen_at: number | null;
+  /** An automatic recalibration waits for the next free bench slot (JSON `{ reason, at, ratio }`), or null. */
+  recalibrate_due: string | null;
 }
 
 export interface SpecVersionRow {
@@ -250,6 +252,10 @@ export interface BenchHostRow {
   mde: number | null;
   eval_seconds: number | null;
   baseline_json: string | null;
+  /** noisy: runs of the measure command per side on this host (null: 1, calibrated before v0.2.4). */
+  side_runs: number | null;
+  /** Median seconds of one run of the measure command at calibration. */
+  run_seconds: number | null;
 }
 
 export interface HealthCheckRow {

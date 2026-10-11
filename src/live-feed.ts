@@ -88,7 +88,9 @@ export function feedItems(
         const c = typeof d.confirm_pairs === "number" && d.confirm_pairs > 0 ? d.confirm_pairs : 0;
         // Deterministic measurements are one run each side; expensive ones count candidate runs; noisy ones pairs.
         const what = ctx.noise === "deterministic" ? "one run each" : m === null ? null : ctx.noise === "expensive" ? plural(m, "run") : `${plural(m, "pair")}${c ? `, then ${plural(c, "confirmation pair")}` : ""}`;
-        push(`c/${n} measured${what ? `: ${what}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}`);
+        // Why the sequential test stopped when it wasn't the plain rule, and a skipped confirmation.
+        const why = d.confirm_skipped === true ? " (confirmation skipped: far beyond the win threshold)" : d.stop === "futility" ? " (stopped: it could no longer win)" : d.stop === "early" ? " (stopped early: clearly worse)" : "";
+        push(`c/${n} measured${what ? `: ${what}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}${why}`);
         break;
       }
       case "candidate.verdict": {

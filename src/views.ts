@@ -1492,7 +1492,7 @@ export function pauseInfo(engine: Engine, s: StudyRow): { system: boolean; kind:
   const row = engine.ctx.store.db.prepare(`SELECT at, data_json FROM events WHERE study_id = ? AND kind = 'study.state' ORDER BY id DESC LIMIT 1`).get(s.id) as { at: number; data_json: string } | undefined;
   const data = safeJson<{ system?: boolean; to?: string }>(row?.data_json ?? null) ?? {};
   const reason = s.pause_reason ?? "";
-  const kind = /^budget exhausted/u.test(reason) ? "budget" : /^noise drift/u.test(reason) ? "drift" : /^oracle broken|could not send best|holdout check failed on best/u.test(reason) ? "oracle" : "other";
+  const kind = /^budget exhausted/u.test(reason) ? "budget" : /^noise drift|^automatic recalibration failed/u.test(reason) ? "drift" : /^oracle broken|could not send best|holdout check failed on best/u.test(reason) ? "oracle" : "other";
   return { system: Boolean(data.system), kind, at: row?.at ?? null };
 }
 

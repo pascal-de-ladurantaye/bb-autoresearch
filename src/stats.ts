@@ -82,6 +82,14 @@ export function bootstrapMedianCI(values: readonly number[], confidence: number,
 
 export type SequentialDecision = "continue" | "win" | "lose" | "inconclusive";
 
+/**
+ * Why a sequential test stopped: a clear `win` or `lose` after n_min, an
+ * `early` lose before n_min (a CI entirely below 0 at the stricter
+ * confidence), `futility` (after n_min the CI's upper bound is below the win
+ * threshold: it can no longer win), or the `cap` at n_max.
+ */
+export type StopReason = "win" | "lose" | "early" | "futility" | "cap";
+
 export interface SequentialInput {
   improvements: readonly number[];
   nMin: number;
@@ -91,21 +99,107 @@ export interface SequentialInput {
   confidence: number;
   iterations: number;
   rng: Rng;
+  /** Stop as inconclusive after n_min once the CI's upper bound is below the MDE (v0.2.4; default off here, on in the spec). */
+  futility?: boolean;
+  /** From this many pairs before n_min, a CI entirely below 0 at `earlyLoseConfidence` is a lose (0 or absent: off). */
+  earlyLoseFrom?: number;
+  earlyLoseConfidence?: number;
+}
+
+export interface SequentialResult {
+  decision: SequentialDecision;
+  ci: Interval;
+  /** Set when the test stopped. */
+  stop?: StopReason;
+  /** Before n_min: the early-lose check's CI (at the stricter confidence), when it ran. */
+  early?: Interval;
+}
+
+/** Student-t CDF for an integer number of degrees of freedom (the exact finite series). */
+export function tCdf(t: number, df: number): number {
+  const v = Math.max(1, Math.round(df));
+  const theta = Math.atan(t / Math.sqrt(v));
+  const c2 = Math.cos(theta) ** 2;
+  const sin = Math.sin(theta);
+  if (v % 2 === 1) {
+    let sum = 0;
+    let term = Math.cos(theta);
+    for (let k = 3; k <= v; k += 2) {
+      sum += term;
+      term *= (c2 * (k - 1)) / k;
+    }
+    return 0.5 + (theta + sin * (v > 1 ? sum : 0)) / Math.PI;
+  }
+  let sum = 0;
+  let term = 1;
+  for (let k = 2; k <= v; k += 2) {
+    sum += term;
+    term *= (c2 * (k - 1)) / k;
+  }
+  return 0.5 + (sin * sum) / 2;
+}
+
+/** One-sided Student-t quantile, exact for integer degrees of freedom (bisection on `tCdf`). */
+export function tQuantileExact(p: number, df: number): number {
+  if (p <= 0) return -Infinity;
+  if (p >= 1) return Infinity;
+  if (p < 0.5) return -tQuantileExact(1 - p, df);
+  let lo = 0;
+  let hi = 1;
+  while (tCdf(hi, df) < p) hi *= 2;
+  for (let i = 0; i < 100; i++) {
+    const mid = (lo + hi) / 2;
+    if (tCdf(mid, df) < p) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
 }
 
 /**
- * After n_min pairs: lose when the CI is entirely on the regression side,
- * win when the lower bound clears the MDE, inconclusive at n_max.
+ * The early-lose check's interval: a two-sided Student-t CI of the MEAN of
+ * the per-pair improvements. The bootstrap percentile CI of the median the
+ * sequential test uses after n_min is badly miscalibrated at 3-5 pairs (a
+ * "99%" bootstrap CI of 3 pairs is just [min, max], which covers the true
+ * median 75% of the time), so the early check uses the t interval, valid at
+ * small n for roughly normal pair noise and conservative with outliers
+ * (they inflate the SD). Deterministic: no resampling.
  */
-export function sequentialDecision(input: SequentialInput): { decision: SequentialDecision; ci: Interval } {
+export function earlyLoseCI(values: readonly number[], confidence: number): Interval {
+  const n = values.length;
+  if (n < 2) return { median: values[0] ?? Number.NaN, lo: Number.NaN, hi: Number.NaN, n };
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const half = tQuantileExact(1 - (1 - confidence) / 2, n - 1) * (sampleSd(values) / Math.sqrt(n));
+  return { median: median(values), lo: mean - half, hi: mean + half, n };
+}
+
+/** Whether the early-lose check runs at `n` pairs. */
+export function earlyLoseApplies(n: number, nMin: number, earlyLoseFrom: number | undefined): boolean {
+  return Boolean(earlyLoseFrom && earlyLoseFrom > 0 && n >= earlyLoseFrom && n < nMin && n >= 2);
+}
+
+/**
+ * After n_min: lose when the CI is entirely on the regression side, win when
+ * the lower bound clears the MDE, inconclusive once the upper bound can no
+ * longer clear it (futility) or at n_max. Before n_min, an early lose needs
+ * the CI entirely below 0 at a stricter confidence (`earlyLoseCI`: a t
+ * interval of the mean, valid at a few pairs).
+ */
+export function sequentialDecision(input: SequentialInput): SequentialResult {
   const n = input.improvements.length;
   if (n < input.nMin) {
-    return { decision: "continue", ci: { median: median(input.improvements), lo: Number.NaN, hi: Number.NaN, n } };
+    const open = { median: median(input.improvements), lo: Number.NaN, hi: Number.NaN, n };
+    if (earlyLoseApplies(n, input.nMin, input.earlyLoseFrom)) {
+      const early = earlyLoseCI(input.improvements, input.earlyLoseConfidence ?? 0.99);
+      if (early.hi < 0) return { decision: "lose", ci: early, stop: "early", early };
+      return { decision: "continue", ci: open, early };
+    }
+    return { decision: "continue", ci: open };
   }
   const ci = bootstrapMedianCI(input.improvements, input.confidence, input.iterations, input.rng);
-  if (ci.hi < 0) return { decision: "lose", ci };
-  if (ci.lo > input.mde) return { decision: "win", ci };
-  if (n >= input.nMax) return { decision: "inconclusive", ci };
+  if (ci.hi < 0) return { decision: "lose", ci, stop: "lose" };
+  if (ci.lo > input.mde) return { decision: "win", ci, stop: "win" };
+  if (input.futility && ci.hi < input.mde) return { decision: "inconclusive", ci, stop: "futility" };
+  if (n >= input.nMax) return { decision: "inconclusive", ci, stop: "cap" };
   return { decision: "continue", ci };
 }
 

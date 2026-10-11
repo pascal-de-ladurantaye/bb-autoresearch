@@ -102,6 +102,38 @@ export function ciRangeText(lo: number | null | undefined, hi: number | null | u
 
 export type NoiseClass = "noisy" | "deterministic" | "expensive";
 
+/** How many samples a measurement used, per noise class: "6 pairs", "single run", "4 runs". */
+export function samplesText(n: number | null | undefined, noise: NoiseClass = "noisy"): string {
+  if (!finite(n)) return "";
+  if (noise === "deterministic") return "single run";
+  if (noise === "expensive") return `${n} run${n === 1 ? "" : "s"}`;
+  return `${n} pair${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * A measurement's CI with its size, in the page's format: "CI +13.6% to +22.0%, 6 pairs",
+ * "single run", "CI −9.1% to −2.0% at 99%, 3 pairs". Better is positive.
+ */
+export function measuredCiText(lo: number | null | undefined, hi: number | null | undefined, n: number | null | undefined, noise: NoiseClass = "noisy", opts: { confidence?: number } = {}): string {
+  const size = samplesText(n, noise);
+  if (noise === "deterministic" || isPointCi(lo, hi)) return size || "single run";
+  const ci = ciText(lo, hi);
+  if (!ci) return size;
+  const at = opts.confidence !== undefined ? ` at ${Math.round(opts.confidence * 1000) / 10}%` : "";
+  return `${ci}${at}${size ? `, ${size}` : ""}`;
+}
+
+/**
+ * A verdict reason in the page's format. Reasons recorded before v0.2.4 carry the raw
+ * "(CI 13.58%..21.99%, n=6)"; they read "(CI +13.6% to +22.0%, 6 pairs)" like everything else.
+ */
+export function reasonText(reason: string, noise: NoiseClass = "noisy"): string {
+  return reason
+    .replace(/\(CI (-?\d+(?:\.\d+)?)%\.\.(-?\d+(?:\.\d+)?)%, n=(\d+)\)/gu, (_m, lo: string, hi: string, n: string) => `(${measuredCiText(Number(lo) / 100, Number(hi) / 100, Number(n), noise)})`)
+    .replace(/\(n=(\d+)\)/gu, (_m, n: string) => `(${samplesText(Number(n), noise)})`)
+    .replace(/(^|: |initial )(primary metric (?:improved|regressed)|effect) (-?\d+\.\d{2})%/gu, (_m, pre: string, head: string, v: string) => `${pre}${head} ${head === "effect" ? signedPct(Number(v) / 100) : `${Math.abs(Number(v)).toFixed(1)}%`}`);
+}
+
 /**
  * The calibrated noise in one sentence, per noise class: noisy oracles have a
  * noise floor per pair, expensive ones the σ of one run, deterministic ones

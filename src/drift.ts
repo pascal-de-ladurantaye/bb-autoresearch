@@ -2,7 +2,7 @@
 // evaluations per bench host. If the noise has grown past `max_ratio` (2×)
 // the calibrated level, the study pauses and the human is notified: a
 // disturbed bench machine would otherwise hand out random verdicts.
-import type { Bench, RunResult, Side } from "./noise.ts";
+import { perRunSeconds, type Bench, type RunResult, type Side } from "./noise.ts";
 import type { StudySpec } from "./spec.ts";
 import { improvement, median, robustSd, sampleSd, type Rng } from "./stats.ts";
 
@@ -14,6 +14,8 @@ export interface DriftResult {
   ratio: number;
   median: number;
   ok: boolean;
+  /** Median seconds of one run of the measure command on best during the check (the auto-recalibration trigger). */
+  runSeconds?: number | null;
 }
 
 /** Below this the calibrated floor is treated as this (avoids dividing by ~0). */
@@ -30,15 +32,19 @@ export async function driftNoisy(bench: Bench, spec: StudySpec, rng: Rng, calibr
   const { pairs, max_ratio } = spec.oracle.drift;
   const metric = spec.metric;
   const diffs: number[] = [];
+  const secs: number[] = [];
   for (let i = 0; i < pairs; i++) {
     if (signal?.aborted) throw new Error("drift check aborted");
     const order: Side[] = rng() < 0.5 ? ["best", "candidate"] : ["candidate", "best"];
     const runs: Partial<Record<Side, RunResult>> = {};
-    for (const side of order) runs[side] = await bench.run(side);
+    for (const side of order) {
+      runs[side] = await bench.run(side);
+      secs.push(perRunSeconds(runs[side]!));
+    }
     diffs.push(improvement(runs.best!.metrics[metric.name]!, runs.candidate!.metrics[metric.name]!, metric.direction));
   }
   const noise = robustSd(diffs) || sampleSd(diffs);
-  return assessDrift(noise, median(diffs), calibrated, max_ratio, pairs);
+  return { ...assessDrift(noise, median(diffs), calibrated, max_ratio, pairs), runSeconds: secs.length ? median(secs) : null };
 }
 
 /** expensive: `pairs` runs of best compared with the bench host's baseline median. */

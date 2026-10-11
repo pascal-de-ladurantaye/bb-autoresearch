@@ -14,7 +14,7 @@ import type { BenchHostRow, ResolvedBenchHost, StudyRow } from "./db/store.ts";
 import type { ExecResult } from "./host/contract.ts";
 import type { HostRunner, RunOptions } from "./host/runner.ts";
 import { parseMeasureOutput } from "./metrics.ts";
-import { BenchError, type Bench, type RunResult, type Side } from "./noise.ts";
+import { BenchError, repeatBench, type Bench, type RunResult, type Side } from "./noise.ts";
 import { clip } from "./prompts.ts";
 import type { HostInfo } from "./ports.ts";
 import type { StudySpec } from "./spec.ts";
@@ -178,9 +178,21 @@ export class BenchSite {
     return { ok: r.exitCode === 0, output: tail(r), cached: false };
   }
 
-  /** A Bench over two checkouts on this host. Each run is one host job. */
-  bench(spec: StudySpec, dirs: Record<Side, string>, opts: { signal?: AbortSignal; label: string; onProgress?: (line: string) => void }): Bench {
-    return makeBench(this.runner, spec, dirs, opts);
+  /**
+   * A Bench over two checkouts on this host. Each run is one host job; for a
+   * noisy oracle each side is the host's calibrated side runs (`sideRuns`
+   * overrides it: calibration passes 1 and chooses), combined best-of-N.
+   */
+  bench(spec: StudySpec, dirs: Record<Side, string>, opts: { signal?: AbortSignal; label: string; onProgress?: (line: string) => void; sideRuns?: number }): Bench {
+    const raw = makeBench(this.runner, spec, dirs, opts);
+    const n = spec.oracle.noise === "noisy" ? (opts.sideRuns ?? this.sideRuns()) : 1;
+    return repeatBench(raw, spec, n);
+  }
+
+  /** The calibrated side runs of this host (1 before calibration, or for segments calibrated before v0.2.4). */
+  sideRuns(): number {
+    const row = this.ctx.store.benchHost(this.study.id, this.host.host_id) ?? this.host;
+    return Math.max(1, row.side_runs ?? 1);
   }
 }
 

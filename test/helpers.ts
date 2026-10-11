@@ -94,6 +94,8 @@ export class FakeHost implements HostRunner {
   nextSnapshotFor = new Map<string, Partial<SnapshotResult> & { tree?: string }>();
   /** Metric value by tree id. */
   metric = new Map<string, number>();
+  /** Milliseconds a measure run reports, by tree (default 5000: one side run under side_runs = "auto"). */
+  runMs = new Map<string, number>();
   /** Guardrail metric rss by tree id (default 100). */
   rss = new Map<string, number>();
   noise: () => number = () => 0;
@@ -304,7 +306,7 @@ export class FakeHost implements HostRunner {
       const v = this.metric.get(tree);
       if (v === undefined) return { exitCode: 2, timedOut: false, durationMs: 5, stdout: "", stderr: "no such tree" };
       const rss = (this.rss.get(tree) ?? 100) * (1 + this.rssNoise());
-      return { exitCode: 0, timedOut: false, durationMs: 1000, stdout: `METRIC size=${v * (1 + this.noise())}\nMETRIC rss=${rss}\nDIAG tree=${tree}\n`, stderr: "" };
+      return { exitCode: 0, timedOut: false, durationMs: this.runMs.get(tree) ?? 5000, stdout: `METRIC size=${v * (1 + this.noise())}\nMETRIC rss=${rss}\nDIAG tree=${tree}\n`, stderr: "" };
     }
     if (input.command.startsWith("holdout")) {
       const v = this.holdoutMetric.get(tree) ?? this.metric.get(tree);

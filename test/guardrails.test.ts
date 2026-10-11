@@ -269,7 +269,7 @@ describe("confirmation", () => {
     const pooled = decideVerdict({ ...win, guardrailEstimates: { rss: { regression: 0.09, lo: 0.08, hi: 0.1, n: 12 } } }, s);
     const v = applyConfirmation(first, pooled);
     expect(v.verdict).toBe("lose");
-    expect(v.reasons[0]).toMatch(/^primary metric improved 60\.00%/u);
+    expect(v.reasons[0]).toMatch(/^primary metric improved 60\.0% \(CI \+[\d.]+% to \+[\d.]+%, \d+ pairs\)$/u);
     expect(v.reasons[1]).toMatch(/^confirmed: primary metric improved/u);
     expect(v.reasons[2]).toContain("beyond the 5.0% limit");
     expect(v.guardrails!.rss!.state).toBe("broken");

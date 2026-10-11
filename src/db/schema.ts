@@ -436,4 +436,11 @@ export const MIGRATIONS: string[] = [
   /** Seconds the candidate's gates ran (with single-machine mode they held the bench lock). */
   `ALTER TABLE candidates ADD COLUMN gate_seconds REAL NOT NULL DEFAULT 0`,
   `CREATE INDEX bench_intervals_open ON bench_intervals (host_id, ended_at)`,
+  // ---- v0.2.4 ----
+  /** Runs of the measure command per side of a pair on this host (side_runs, chosen at calibration when "auto"). */
+  `ALTER TABLE bench_hosts ADD COLUMN side_runs INTEGER`,
+  /** Median seconds of one run of the measure command at calibration (the auto-recalibration trigger compares best's runs with it). */
+  `ALTER TABLE bench_hosts ADD COLUMN run_seconds REAL`,
+  /** An automatic recalibration is due at the next free bench slot (JSON: why, when). */
+  `ALTER TABLE studies ADD COLUMN recalibrate_due TEXT`,
 ];

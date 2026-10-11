@@ -62,7 +62,7 @@ describe("parseSpec", () => {
     expect(r.spec.agents).toMatchObject({ max_submissions_per_worker: 3, strategist_every: 5, stall_after: 10 });
     expect(r.spec.agents.worker.provider).toBe("codex");
     expect(r.spec.oracle.holdout).toMatchObject({ runs: 3, max_regression: 0.01 });
-    expect(r.spec.oracle.drift).toEqual({ every: 10, pairs: 6, max_ratio: 2 });
+    expect(r.spec.oracle.drift).toEqual({ every: 10, pairs: 6, max_ratio: 2, recalibrate_below: 0.6 });
     expect(r.spec.oracle.health).toMatchObject({ enabled: true, max_load: 0.8, retry_seconds: 60 });
     expect(r.warnings.some((w) => w.includes("W=1"))).toBe(false);
   });

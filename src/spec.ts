@@ -196,6 +196,12 @@ export const specSchema = z
             every: z.number().int().min(0).max(10_000).default(10),
             pairs: z.number().int().min(2).max(200).default(6),
             max_ratio: z.number().min(1).max(100).default(2),
+            /**
+             * Recalibrate automatically (A/A on best, a new segment, same oracle) when best's
+             * per-run time drops below this share of the segment's calibration: shorter runs are
+             * noisier relative to themselves, which is not drift. 0 turns it off.
+             */
+            recalibrate_below: z.number().min(0).max(0.99).default(0.6),
           })
           .strict()
           .prefault({}),
@@ -218,6 +224,20 @@ export const specSchema = z
             calibration_runs: z.number().int().min(3).max(50).default(5),
             calibration_pairs: z.number().int().min(4).max(500).default(12),
             bootstrap: z.number().int().min(200).max(20_000).default(2000),
+            /** noisy: after n_min, stop as inconclusive once the CI's upper bound is below the win threshold (it can no longer win). */
+            futility: z.boolean().default(true),
+            /** noisy: from this many pairs (before n_min), a CI entirely below 0 at `early_lose_confidence` is an early lose. 0 turns it off. */
+            early_lose_from: z.number().int().min(0).max(500).default(3),
+            early_lose_confidence: z.number().min(0.5).max(0.9999).default(0.99),
+            /** noisy: skip the confirmation when the measurement's CI lower bound is at least this many times the win threshold. 0: always confirm. */
+            skip_confirm_factor: z.number().min(0).max(100).default(3),
+            /**
+             * noisy: runs of the measure command per side of a pair, keeping the best value of each
+             * metric (in its direction). "auto" picks the count at calibration so a side lasts at
+             * least `min_side_seconds`.
+             */
+            side_runs: z.union([z.literal("auto"), z.number().int().min(1).max(100)]).default("auto"),
+            min_side_seconds: z.number().min(0).max(3600).default(5),
           })
           .strict()
           .prefault({}),
@@ -363,10 +383,30 @@ export function validateSemantics(spec: StudySpec): SpecResult {
 export function normalizeSpec(spec: StudySpec): StudySpec {
   const guardrail = (spec.guardrail ?? []).map((g) => ({ ...g, direction: g.direction ?? "lower", max_total_regression: g.max_total_regression ?? g.max_regression }));
   const scope = { ...spec.scope, ignore: spec.scope.ignore ?? [...DEFAULT_IGNORE] };
-  const oracle = { ...spec.oracle, single_machine: spec.oracle.single_machine ?? "auto", quiet_bench: spec.oracle.quiet_bench ?? false };
+  const oracle = {
+    ...spec.oracle,
+    single_machine: spec.oracle.single_machine ?? "auto",
+    quiet_bench: spec.oracle.quiet_bench ?? false,
+    protocol: { ...PROTOCOL_V024_DEFAULTS, ...spec.oracle.protocol } as StudySpec["oracle"]["protocol"],
+    drift: { ...spec.oracle.drift, recalibrate_below: spec.oracle.drift?.recalibrate_below ?? 0.6 },
+  };
   const git = { ...(spec.git ?? {}), identity: spec.git?.identity ?? "repo" };
   return { ...spec, guardrail, scope, oracle, git };
 }
+
+/**
+ * Protocol keys added in v0.2.4, with their defaults. Specs stored before
+ * them are read with these filled in, and the oracle hash leaves a key out
+ * while it has its default, so a stored segment's hash stays the same.
+ */
+export const PROTOCOL_V024_DEFAULTS = {
+  futility: true,
+  early_lose_from: 3,
+  early_lose_confidence: 0.99,
+  skip_confirm_factor: 3,
+  side_runs: "auto" as "auto" | number,
+  min_side_seconds: 5,
+} as const;
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -387,7 +427,10 @@ export function oracleHash(spec: StudySpec, protectedContentHash = ""): string {
   // Bench operations (health thresholds, drift schedule, transfer cap, offline
   // grace) and scheduling (single-machine mode, quiet bench) don't change how a
   // commit is judged, so tuning them is not a new segment.
-  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, ...oracle } = spec.oracle;
+  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, ...rest } = spec.oracle;
+  const protocol: Record<string, unknown> = { ...rest.protocol };
+  for (const [k, v] of Object.entries(PROTOCOL_V024_DEFAULTS)) if (protocol[k] === undefined || protocol[k] === v) delete protocol[k];
+  const oracle = { ...rest, protocol };
   const judged = {
     metric: spec.metric,
     guardrail: spec.guardrail,

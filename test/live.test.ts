@@ -434,7 +434,8 @@ describe("live recorder and view (fake host)", () => {
       [1, "promoted"],
       [2, "verdict"],
     ]);
-    expect(v.cards[0]).toMatchObject({ verdict: "win", effectText: "10.0% lower size", pairs: { run: "confirm" } });
+    // A 10% win against a 1% threshold skips its confirmation (v0.2.4), so its pairs are the measurement's.
+    expect(v.cards[0]).toMatchObject({ verdict: "win", effectText: "10.0% lower size", pairs: { run: "measure" } });
     expect(v.best).toMatchObject({ text: "10.0% lower size", n: 1 });
     expect(v.ideas.next.map((i) => i.title)).toEqual(["Idea D"]);
     expect(v.bench).toHaveLength(1);
@@ -445,7 +446,7 @@ describe("live recorder and view (fake host)", () => {
     expect(texts.some((t) => /^c\/1 tests passed in [\d.]+ s, queued for the bench$/u.test(t))).toBe(true);
     // Promotion is recorded before the verdict, but the feed tells the win first.
     expect(texts.indexOf("c/1 won: 10.0% lower size")).toBeLessThan(texts.indexOf("Best moved: c/1 promoted, workers notified"));
-    expect(texts.some((t) => /^c\/1 measured: \d+ pairs, then \d+ confirmation pairs? in /u.test(t))).toBe(true);
+    expect(texts.some((t) => /^c\/1 measured: \d+ pairs in .*\(confirmation skipped: far beyond the win threshold\)$/u.test(t))).toBe(true);
     expect(texts.some((t) => /^c\/2 (lost|inconclusive): /u.test(t))).toBe(true);
     expect(v.feed.find((f) => f.text.startsWith("c/1 won"))).toMatchObject({ candidate: 1, tone: "win" });
     expect(texts.some((t) => t.startsWith("A worker picked idea #1 (Idea A)"))).toBe(true);
