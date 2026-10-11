@@ -216,6 +216,53 @@ describe("frontend: M3 study tabs", () => {
     expect((await page.findByLabelText("Study report")).textContent).toContain("toy-size");
   });
 
+  it("harvest: numbered per study, folds in words, and a long PR preview collapses behind Show more / Show less", async () => {
+    const s = study();
+    const { store } = engine.ctx;
+    // Another study's harvest takes global id 1: this study's first harvest is still h1.
+    store.insertHarvest({ study_id: "st_other", from_state: "running", measure_standalone: 1 }, "test");
+    store.setStudyState(s.id, "harvesting", "test");
+    const h = store.insertHarvest({ study_id: s.id, from_state: "running", measure_standalone: 1 }, "test");
+    expect(h.id).toBe(2);
+    expect(h.seq).toBe(1);
+    const cs1 = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 1, title: "Add the parser", rationale: "", candidates_json: "[1]", commits_json: "[]", paths_json: '["src/x.ts"]' });
+    const cs2 = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 2, title: "Use the parser", rationale: "", candidates_json: "[1]", commits_json: "[]", paths_json: '["src/x.ts"]' });
+    const cs3 = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 3, title: "Tune the lexer", rationale: "", candidates_json: "[1]", commits_json: "[]", paths_json: '["src/y.ts"]' });
+    const long = ["## Findings", ...Array.from({ length: 60 }, (_, i) => `- Finding ${i + 1}: something learned about the lexer.`), "Last-finding-marker"].join("\n");
+    store.updateChangeset(cs1.id, { ablation_status: "measured", contribution: 0.1, ci_lo: 0.09, ci_hi: 0.11, n: 5, stack: 1, layer: 1, pr_base: "base", branch: "studies/toy-size/harvest/h1/01-add-the-parser", standalone_status: "pass", pr_title: "Add the parser", pr_body: "Short-body-marker" });
+    store.updateChangeset(cs2.id, { ablation_status: "measured", contribution: 0.05, ci_lo: 0.04, ci_hi: 0.06, n: 5, stack: 1, layer: 1, folded_into: cs1.id, fold_reason: "#2 needs src/x.ts, which #1 adds or changes, so it doesn't apply on `main` alone", standalone_status: "folded", depends_on_json: JSON.stringify([cs1.id]), dependency_reason: "depends on #1: reverting #1 from best conflicts in src/x.ts" });
+    store.updateChangeset(cs3.id, { ablation_status: "measured", contribution: 0.05, ci_lo: 0.04, ci_hi: 0.06, n: 5, pr_base: "base", branch: "studies/toy-size/harvest/h1/03-tune-the-lexer", standalone_status: "pass", pr_title: "Tune the lexer", pr_body: long });
+    store.updateHarvest(h.id, { state: "ready", finished_at: Date.now(), grouping_source: "strategist", total_effect: 0.2, total_ci_lo: 0.19, total_ci_hi: 0.21, total_n: 5, stacks_json: JSON.stringify([{ stack: 1, members: [cs1.id, cs2.id], layers: [{ host: cs1.id, members: [cs1.id, cs2.id] }], status: "not_needed", estimate: null, n: null, detail: null }]), publish_state: "dry-run" });
+    const page = await open("toy-size/harvest");
+    const list = await page.findByLabelText("Changesets");
+    expect(page.getByText("Harvest h1")).toBeTruthy();
+    expect(page.queryByText("Harvest h2")).toBeNull();
+    expect(list.textContent).toContain("#2 ships inside #1's PR: #2 needs src/x.ts, which #1 adds or changes, so it doesn't apply on `main` alone.");
+    expect(list.textContent).toContain("Its PR also ships #2");
+    expect(list.textContent).toContain("ships inside #1's PR");
+    expect(page.getByLabelText("Stacks").textContent).toContain("#1 (with #2)");
+    // A short body shows whole, with no toggle.
+    fireEvent.click(page.getByText(/PR preview: Add the parser/u));
+    expect(page.getByText("Short-body-marker")).toBeTruthy();
+    // (only the long body below has one)
+    expect(page.queryAllByRole("button", { name: "Show more" })).toHaveLength(1);
+    // A long one starts collapsed behind a fade, with a toggle (no inner scroll box).
+    fireEvent.click(page.getByText(/PR preview: Tune the lexer/u));
+    const more = page.getByRole("button", { name: "Show more" });
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    const box = page.container.querySelector(`#${more.getAttribute("aria-controls")}`)!;
+    expect(box.className).toContain("max-h-96");
+    expect(box.className).toContain("overflow-hidden");
+    expect(box.className).not.toContain("overflow-auto");
+    expect(box.textContent).toContain("Last-finding-marker");
+    fireEvent.click(more);
+    const less = page.getByRole("button", { name: "Show less" });
+    expect(less.getAttribute("aria-expanded")).toBe("true");
+    expect(box.className).not.toContain("max-h-96");
+    fireEvent.click(less);
+    expect(page.getByRole("button", { name: "Show more" })).toBeTruthy();
+  });
+
   it("overview: provider usage line and a harvest link", async () => {
     const s = study();
     const h = engine.ctx.store.insertHarvest({ study_id: s.id, from_state: "running", measure_standalone: 1 }, "test");

@@ -312,6 +312,8 @@ export type HarvestState = (typeof HARVEST_STATES)[number];
 export interface HarvestRow {
   id: number;
   study_id: string;
+  /** The harvest's number within its study: shown as h<seq> (the id stays internal). */
+  seq: number;
   state: HarvestState;
   phase_detail: string | null;
   /** The lifecycle state the study returns to with "keep exploring". */
@@ -348,7 +350,8 @@ export interface HarvestRow {
 }
 
 export type AblationStatus = "pending" | "measured" | "conflict" | "gate_failed" | "error";
-export type StandaloneStatus = "pending" | "pass" | "conflict" | "gate_failed" | "error" | "skipped";
+/** "applied": applies and passes gates on its PR base, effect not measured yet; "folded": ships inside another changeset's PR. */
+export type StandaloneStatus = "pending" | "applied" | "pass" | "conflict" | "gate_failed" | "error" | "skipped" | "folded";
 
 export interface ChangesetRow {
   id: number;
@@ -392,6 +395,12 @@ export interface ChangesetRow {
   human_choice: "keep" | "drop" | null;
   /** Per guardrail: what this changeset costs it (best vs best without it), relative to best, positive = worse. */
   guardrails_json: string | null;
+  /** The changeset (id) whose PR ships this one, when it doesn't apply on its own PR base; null when it has its own PR. */
+  folded_into: number | null;
+  /** Why it is folded, in words ("#6 needs src/x.py, which #7 adds or changes, …"). */
+  fold_reason: string | null;
+  /** Position in its stack's PR order (1 = bottom); folded changesets share their host's. */
+  layer: number | null;
 }
 
 export interface Budget {
@@ -934,10 +943,12 @@ export class Store {
   insertHarvest(row: Pick<HarvestRow, "study_id" | "from_state" | "measure_standalone"> & { grouping_source?: "fallback" | null }, actor: string): HarvestRow {
     return this.tx(() => {
       const r = this.db
-        .prepare(`INSERT INTO harvests (study_id, state, from_state, measure_standalone, started_at, grouping_source, grouping_notes) VALUES (?, 'waiting', ?, ?, ?, ?, ?)`)
-        .run(row.study_id, row.from_state, row.measure_standalone, this.now(), row.grouping_source ?? null, row.grouping_source === "fallback" ? "one changeset per promotion, as you asked" : null);
+        .prepare(
+          `INSERT INTO harvests (study_id, seq, state, from_state, measure_standalone, started_at, grouping_source, grouping_notes) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM harvests WHERE study_id = ?), 'waiting', ?, ?, ?, ?, ?)`,
+        )
+        .run(row.study_id, row.study_id, row.from_state, row.measure_standalone, this.now(), row.grouping_source ?? null, row.grouping_source === "fallback" ? "one changeset per promotion, as you asked" : null);
       const id = Number(r.lastInsertRowid);
-      this.event(row.study_id, "harvest.started", actor, { harvest: id, from: row.from_state });
+      this.event(row.study_id, "harvest.started", actor, { harvest: id, seq: this.harvest(id)!.seq, from: row.from_state });
       return this.harvest(id)!;
     });
   }

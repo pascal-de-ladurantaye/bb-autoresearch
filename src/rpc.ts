@@ -184,20 +184,20 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
     "study.harvest.publish": async ({ slug, harvestId, confirm }, ctx) => {
       const caller = humanOnly(ctx);
       const plan = await engine.publishPlan(slug, harvestId);
-      requireConfirm(confirm, `pushes ${plan.prs.filter((p) => p.push).length} branch(es) of harvest h${harvestId} to ${plan.remote} and opens draft PRs on GitHub`);
+      requireConfirm(confirm, `pushes ${plan.prs.filter((p) => p.push).length} branch(es) of harvest h${plan.seq} to ${plan.remote} and opens draft PRs on GitHub`);
       try {
         const message = await engine.publishHarvest(slug, ACTOR, true, harvestId);
-        await engine.auditControl(slug, "publish", caller, `harvest h${harvestId} published (GitHub draft PRs)`, { harvest: harvestId });
+        await engine.auditControl(slug, "publish", caller, `harvest h${plan.seq} published (GitHub draft PRs)`, { harvest: harvestId });
         return { ok: true, message };
       } catch (e) {
-        await engine.auditControl(slug, "publish", caller, `harvest h${harvestId} publish attempted and failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`, { harvest: harvestId, failed: true });
+        await engine.auditControl(slug, "publish", caller, `harvest h${plan.seq} publish attempted and failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`, { harvest: harvestId, failed: true });
         throw e;
       }
     },
     "study.harvest.choice": async ({ slug, harvestId, k, choice }, ctx) => {
       const caller = humanOnly(ctx);
       const message = engine.setChangesetChoice(slug, harvestId, k, choice, ACTOR);
-      await engine.auditControl(slug, "harvest_choice", caller, `harvest h${harvestId} #${k}: ${choice ?? "choice cleared"}`, { harvest: harvestId, changeset: k, choice });
+      await engine.auditControl(slug, "harvest_choice", caller, `harvest ${harvestLabel(engine, harvestId)} #${k}: ${choice ?? "choice cleared"}`, { harvest: harvestId, changeset: k, choice });
       return { ok: true, message };
     },
     "study.archive": async ({ slug, confirm, archiveThread }, ctx) => {
@@ -209,7 +209,7 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
     "study.harvest.start": async ({ slug, restart, onePerPromotion }, ctx) => {
       const caller = humanOnly(ctx);
       const r = engine.startHarvest(slug, ACTOR, { restart: restart ?? false, onePerPromotion: onePerPromotion ?? false });
-      await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.id} started (dry run)`, { harvest: r.harvest.id });
+      await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.seq} started (dry run)`, { harvest: r.harvest.id });
       return { ok: true, message: r.text };
     },
     "study.pause": async ({ slug }, ctx) => {
@@ -257,4 +257,10 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
       return { ok: true, message: `Idea #${id} vetoed.` };
     },
   });
+}
+
+/** A harvest as people see it: h<seq> (the RPC's harvestId is the internal id). */
+function harvestLabel(engine: Engine, harvestId: number): string {
+  const h = engine.ctx.store.harvest(harvestId);
+  return h ? `h${h.seq}` : `id ${harvestId}`;
 }

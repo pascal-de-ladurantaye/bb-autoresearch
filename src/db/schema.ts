@@ -443,4 +443,12 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE bench_hosts ADD COLUMN run_seconds REAL`,
   /** An automatic recalibration is due at the next free bench slot (JSON: why, when). */
   `ALTER TABLE studies ADD COLUMN recalibrate_due TEXT`,
+  // ---- v0.2.4: harvest ----
+  /** The harvest's number within its study (h1, h2, …), shown everywhere instead of the global id; backfilled in id order per study. */
+  `ALTER TABLE harvests ADD COLUMN seq INTEGER`,
+  `UPDATE harvests SET seq = (SELECT r.n FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY study_id ORDER BY id) AS n FROM harvests) r WHERE r.id = harvests.id) WHERE seq IS NULL`,
+  /** Stacks that apply: the changeset whose PR ships this one (null when it has its own), why, and its position in its stack's PR order. */
+  `ALTER TABLE changesets ADD COLUMN folded_into INTEGER`,
+  `ALTER TABLE changesets ADD COLUMN fold_reason TEXT`,
+  `ALTER TABLE changesets ADD COLUMN layer INTEGER`,
 ];

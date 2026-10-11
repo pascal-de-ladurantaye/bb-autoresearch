@@ -4,7 +4,7 @@
 // holdout numbers or the holdout command (only pass/fail on candidates).
 import type { Ctx } from "./context.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
-import { harvestAccounting, type Accounting, type Estimate } from "./harvest-math.ts";
+import { dependencyReasons, foldLines, harvestAccounting, prOrder, stackOrderText, type Accounting, type Estimate } from "./harvest-math.ts";
 import type { GuardrailCost, StackRecord } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
 import { bestGuardrailPositions, guardrailChainBase, segmentGuardrailCalibration } from "./pipeline.ts";
@@ -111,13 +111,40 @@ export function revertedWords(contribution: number): string {
   return `best with this change reverted is ${magnitudePct(contribution, 2)} ${contribution > 0 ? "worse" : "better"} than best`;
 }
 
-/** PR body for one changeset: what and why, measured contribution, standalone effect, findings, study link. */
+/**
+ * "Depends on" lines, one per dependency, the stored reason without the
+ * repeated "depends on #k:" prefix: "Depends on #4 Title: reverting #4 from
+ * best conflicts in …". Older rows whose reason doesn't parse show it whole on each.
+ */
+export function dependencyLines(members: ChangesetRow[], all: ChangesetRow[]): string[] {
+  const inside = new Set(members.map((m) => m.id));
+  const deps = [...new Set(members.flatMap((m) => safeJson<number[]>(m.depends_on_json) ?? []))]
+    .filter((id) => !inside.has(id))
+    .map((id) => all.find((c) => c.id === id))
+    .filter((c): c is ChangesetRow => Boolean(c))
+    .sort((a, b) => a.k - b.k);
+  if (!deps.length) return [];
+  const reasons = new Map<number | null, string[]>();
+  for (const m of members) for (const [k, rs] of dependencyReasons(m.dependency_reason)) reasons.set(k, [...(reasons.get(k) ?? []), ...rs]);
+  return deps.map((d) => {
+    const why = [...new Set(reasons.get(d.k) ?? reasons.get(null) ?? [])];
+    return `Depends on #${d.k} ${clipWords(d.title, 60)}${why.length ? `: ${clipWords(why.join("; "), 300)}` : ""}`;
+  });
+}
+
+/** PR body for one changeset: what and why, measured contribution, standalone effect, findings, study link. A host's PR also covers the changesets folded into it. */
 export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow, cs: ChangesetRow, all: ChangesetRow[]): string {
-  const nums = safeJson<number[]>(cs.candidates_json) ?? [];
+  const folded = all.filter((c) => c.folded_into === cs.id).sort((a, b) => a.k - b.k);
+  const members = [cs, ...folded];
+  const nums = [...new Set(members.flatMap((m) => safeJson<number[]>(m.candidates_json) ?? []))].sort((a, b) => a - b);
   const cands = nums.map((n) => ctx.store.candidateByN(study.id, n)).filter((c): c is CandidateRow => Boolean(c));
-  const deps = (safeJson<number[]>(cs.depends_on_json) ?? []).map((id) => all.find((c) => c.id === id)).filter((c): c is ChangesetRow => Boolean(c));
   const metric = metricOf(spec);
   const raw = bestRaw(ctx, study, spec);
+  const host = cs.folded_into !== null ? all.find((c) => c.id === cs.folded_into) : undefined;
+  const contribution = (c: ChangesetRow) =>
+    c.contribution === null
+      ? `not measured alone (${c.ablation_status}${c.ablation_detail ? `: ${clipWords(c.ablation_detail, 200)}` : ""})`
+      : `${shareText({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, h.total_effect, metric, raw)} the study found (${c.n ?? "?"} pairs; ablation: ${revertedWords(c.contribution)})`;
   const lines = [
     `## What`,
     clipWords(cs.title, 200),
@@ -126,20 +153,24 @@ export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow
     "",
     `## Why`,
     clipWords(cs.rationale || "Promoted by the autoresearch study because it measurably improved the metric.", 2000),
+    ...folded.flatMap((f) => (f.rationale ? ["", `#${f.k} ${clipWords(f.title, 80)}: ${clipWords(f.rationale, 1000)}`] : [])),
     "",
     `## Measured effect on \`${spec.metric.name}\` (${spec.metric.direction} is better, ${spec.oracle.noise} oracle)`,
-    `- Contribution: ${cs.contribution === null ? `not measured alone (${cs.ablation_status}${cs.ablation_detail ? `: ${clipWords(cs.ablation_detail, 200)}` : ""})` : `${shareText({ value: cs.contribution, lo: cs.ci_lo, hi: cs.ci_hi }, h.total_effect, metric, raw)} the study found (${cs.n ?? "?"} pairs; ablation: ${revertedWords(cs.contribution)})`}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
-    `- Alone on ${cs.pr_base === "base" || !cs.pr_base ? `\`${spec.study.base}\`, the study base` : `the PR below it (${cs.pr_base})`}: ${standaloneText(cs, spec)}`,
+    `- Contribution: ${contribution(cs)}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
+    ...folded.map((f) => `- Also includes #${f.k} ${clipWords(f.title, 60)}: ${f.fold_reason ? clipWords(f.fold_reason, 300) : "it doesn't apply on its own PR base"}. Its contribution: ${contribution(f)}.`),
   ];
-  if (deps.length) lines.push(`- Depends on: ${deps.map((d) => `#${d.k} ${clipWords(d.title, 60)}`).join(", ")}${cs.dependency_reason ? ` (${clipWords(cs.dependency_reason, 300)})` : ""}`);
-  const dependents = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(cs.id));
+  if (host) lines.push(`- Ships inside #${host.k}'s PR${cs.fold_reason ? `: ${clipWords(cs.fold_reason, 300)}` : ""}.`);
+  else lines.push(`- Alone on ${cs.pr_base === "base" || !cs.pr_base ? `\`${spec.study.base}\`, the study base` : `the PR below it (${cs.pr_base})`}${folded.length ? ` (with ${folded.map((f) => `#${f.k}`).join(", ")})` : ""}: ${standaloneText(cs, spec)}`);
+  for (const l of dependencyLines(members, all)) lines.push(`- ${l}`);
+  const outside = (id: number) => !members.some((m) => m.id === id);
+  const dependents = all.filter((o) => outside(o.id) && (safeJson<number[]>(o.depends_on_json) ?? []).some((id) => members.some((m) => m.id === id)));
   if (dependents.length) lines.push(`- Needed by: ${dependents.map((d) => `#${d.k} ${clipWords(d.title, 60)}`).join(", ")}`);
-  const f = linkedFindings(ctx, study, cs);
+  const f = [...new Set(members.flatMap((m) => linkedFindings(ctx, study, m)))];
   if (f.length) lines.push("", "## Findings", ...f);
   lines.push(
     "",
     "---",
-    `From autoresearch study \`${study.slug}\` (harvest h${h.id}, changeset #${cs.k} of ${all.length}). Study: ${studyLink(ctx, study)}. Every number above is a plugin measurement on the study's bench, not an agent's claim.`,
+    `From autoresearch study \`${study.slug}\` (harvest h${h.seq}, changeset #${cs.k} of ${all.length}${folded.length ? `, with ${folded.map((x) => `#${x.k}`).join(", ")}` : ""}). Study: ${studyLink(ctx, study)}. Every number above is a plugin measurement on the study's bench, not an agent's claim.`,
   );
   return clip(lines.join("\n"), 60_000);
 }
@@ -154,6 +185,10 @@ export function standaloneText(cs: ChangesetRow, spec?: StudySpec): string {
           : `gates pass; effect ${pct(cs.standalone_effect)}${ci(cs.standalone_ci_lo, cs.standalone_ci_hi)}`;
     case "pending":
       return "not checked yet";
+    case "applied":
+      return "gates pass (effect not measured yet)";
+    case "folded":
+      return "ships inside another changeset's PR";
     default:
       return `${cs.standalone_status}${cs.standalone_detail ? `: ${clipWords(cs.standalone_detail, 200)}` : ""}`;
   }
@@ -229,22 +264,25 @@ export function harvestSection(ctx: Ctx, study: StudyRow, spec: StudySpec, h: Ha
   const cs = ctx.store.changesets(h.id);
   const stacks = safeJson<StackRecord[]>(h.stacks_json) ?? [];
   const lines = [
-    `## Harvest h${h.id} (${h.state})`,
+    `## Harvest h${h.seq} (${h.state})`,
     "",
     `Grouping: ${h.grouping_source ?? "pending"}${h.grouping_notes ? ` (${mdText(h.grouping_notes, 300)})` : ""}. Base \`${h.base_sha?.slice(0, 10) ?? "?"}\`, best \`${h.best_sha?.slice(0, 10) ?? "?"}\`. Contributions come from ablation: best with the changeset reverted, measured against best with the study's ${spec.oracle.noise} protocol. Each is shown as its share of the measured base→best gain.`,
     "",
     "| # | Changeset | Candidates | Share of the gain | Alone on its PR base | Depends on | PR branch |",
     "|---|---|---|---|---|---|---|",
   ];
-  for (const c of cs) {
+  for (const c of prOrder(cs)) {
     const deps = (safeJson<number[]>(c.depends_on_json) ?? []).map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`);
+    const host = c.folded_into !== null ? cs.find((x) => x.id === c.folded_into) : undefined;
     lines.push(
-      `| ${c.k} | ${mdCell(c.title, 60)}${c.droppable ? " (droppable)" : ""} | ${(safeJson<number[]>(c.candidates_json) ?? []).map((n) => `c/${n}`).join(", ")} | ${c.contribution === null ? `not measured alone (${c.ablation_status})` : mdCell(shareText({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, h.total_effect, metricOf(spec)), 80)} | ${mdCell(standaloneText(c, spec), 80)} | ${deps.join(", ") || "—"} | ${c.branch ? `\`${c.branch}\`` : "—"} |`,
+      `| ${c.k} | ${mdCell(c.title, 60)}${c.droppable ? " (droppable)" : ""} | ${(safeJson<number[]>(c.candidates_json) ?? []).map((n) => `c/${n}`).join(", ")} | ${c.contribution === null ? `not measured alone (${c.ablation_status})` : mdCell(shareText({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, h.total_effect, metricOf(spec)), 80)} | ${host ? `ships inside #${host.k}'s PR` : mdCell(standaloneText(c, spec), 80)} | ${deps.join(", ") || "—"} | ${c.branch ? `\`${c.branch}\`` : host ? `in #${host.k}'s` : "—"} |`,
     );
   }
+  const folds = foldLines(cs);
+  if (folds.length) lines.push("", "Folded (a changeset that doesn't apply on its own PR base ships inside the PR it needs):", ...folds.map((f) => `- ${mdText(f, 600)}`));
   if (stacks.length) {
     lines.push("", "Stacks (dependent changesets, PRs stacked in this order):");
-    for (const s of stacks) lines.push(`- Stack ${s.stack}: ${s.members.map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`).join(" → ")}${s.status === "measured" ? `; together: ${shareText(s.estimate, h.total_effect, metricOf(spec))}` : s.status === "not_needed" ? "" : `; joint ablation ${s.status}${s.detail ? ` (${mdText(s.detail, 200)})` : ""}`}`);
+    for (const s of stacks) lines.push(`- Stack ${s.stack}: ${s.layers ? stackOrderText(cs, s.stack) : s.members.map((id) => `#${cs.find((x) => x.id === id)?.k ?? "?"}`).join(" → ")}${s.status === "measured" ? `; together: ${shareText(s.estimate, h.total_effect, metricOf(spec))}` : s.status === "not_needed" ? "" : `; joint ablation ${s.status}${s.detail ? ` (${mdText(s.detail, 200)})` : ""}`}`);
   }
   const drop = cs.filter((c) => c.droppable);
   if (drop.length) lines.push("", `Droppable (no measurable contribution; the human decides): ${drop.map((c) => `#${c.k} ${mdText(c.title, 60)}`).join(", ")}.`);

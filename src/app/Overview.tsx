@@ -212,7 +212,7 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
 
       {o.harvest ? (
         <p className="text-sm">
-          Harvest h{o.harvest.id}: {o.harvest.state}
+          Harvest h{o.harvest.seq}: {o.harvest.state}
           {o.harvest.detail ? ` (${o.harvest.detail})` : ""} · {o.harvest.changesets} changeset(s) · started {ago(o.harvest.startedAt)}{" "}
           <button type="button" className="rounded underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => go("harvest")}>
             Open Harvest

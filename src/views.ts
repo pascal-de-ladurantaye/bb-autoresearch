@@ -4,6 +4,7 @@ import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
 import type { StackRecord } from "./harvest.ts";
+import { dependencyReasons, prOrder, stackOrderText } from "./harvest-math.ts";
 import { changeFrom, changeWords, checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
 import { singleMachineText } from "./single-machine.ts";
@@ -928,30 +929,49 @@ export function contributionView(e: { value: number | null; lo: number | null; h
   };
 }
 
-function prBaseText(c: ChangesetRow, baseBranch: string): string {
+function prBaseText(c: ChangesetRow, baseBranch: string, all: ChangesetRow[] = []): string {
+  if (c.folded_into !== null) return `inside #${all.find((x) => x.id === c.folded_into)?.k ?? "?"}'s PR`;
   if (!c.pr_base || c.pr_base === "base") return `${baseBranch}, the study base`;
   return `stacked on ${c.pr_base}`;
 }
 
-/** Why a changeset is (or isn't) in a stack, in words. */
+/** Each dependency with its reason, parsed from the stored "depends on #k: …" list (older rows: the whole text on each). */
+function dependencyList(c: ChangesetRow, all: ChangesetRow[]): Array<{ k: number; title: string; reason: string | null }> {
+  const reasons = dependencyReasons(c.dependency_reason);
+  const legacy = reasons.get(null)?.join("; ") ?? null;
+  return (safeJson<number[]>(c.depends_on_json) ?? [])
+    .map((id) => all.find((x) => x.id === id))
+    .filter((x): x is ChangesetRow => Boolean(x))
+    .sort((a, b) => a.k - b.k)
+    .map((d) => ({ k: d.k, title: d.title, reason: reasons.get(d.k)?.join("; ") ?? legacy }));
+}
+
+/** Why a changeset is (or isn't) in a stack, and which PR ships it, in words. */
 export function dependencyText(c: ChangesetRow, all: ChangesetRow[], baseBranch: string): string[] {
-  const byId = (id: number) => all.find((x) => x.id === id);
   const neededBy = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(c.id));
-  const deps = (safeJson<number[]>(c.depends_on_json) ?? []).map(byId).filter((x): x is ChangesetRow => Boolean(x));
-  const list = (xs: ChangesetRow[]) => xs.map((x) => `#${x.k}`).join(", ").replace(/, ([^,]*)$/u, " and $1");
+  const deps = dependencyList(c, all);
+  const list = (xs: Array<{ k: number }>) => xs.map((x) => `#${x.k}`).join(", ").replace(/, ([^,]*)$/u, " and $1");
   const paths = /in (.+)$/u.exec(c.ablation_detail ?? "")?.[1];
+  const host = c.folded_into !== null ? all.find((x) => x.id === c.folded_into) : undefined;
+  const inside = all.filter((x) => x.folded_into === c.id).sort((a, b) => a.k - b.k);
   const out: string[] = [];
+  if (host) out.push(`#${c.k} ships inside #${host.k}'s PR${c.fold_reason ? `: ${clip(c.fold_reason, 400)}` : ""}.`);
+  for (const f of inside) out.push(`Its PR also ships #${f.k}${f.fold_reason ? `: ${clip(f.fold_reason, 400)}` : ""}.`);
   if (neededBy.length) {
     if (c.ablation_status === "conflict") out.push(`Reverting this from best conflicts with ${list(neededBy)}${paths ? ` (in ${clip(paths, 120)})` : ""}, so it can't be measured alone: ${neededBy.length === 1 ? "that changeset builds" : "those changesets build"} on it.`);
     else if (c.ablation_status === "gate_failed") out.push(`Reverting this from best breaks the gates unless ${list(neededBy)} ${neededBy.length === 1 ? "is" : "are"} reverted too, so it can't be measured alone.`);
     else out.push(`${list(neededBy)} build${neededBy.length === 1 ? "s" : ""} on this one.`);
   }
-  // Name what can't be reverted: "it" read as this changeset.
-  if (deps.length) out.push(`Builds on ${list(deps)}: reverting ${list(deps)} from best fails while this changeset stays.`);
+  // Name what can't be reverted: "it" read as this changeset. Dependencies found applying on the base say so.
+  const onBase = deps.filter((d) => d.reason !== null && /does not apply to|fails the gates on/u.test(d.reason));
+  const reverting = deps.filter((d) => !onBase.includes(d));
+  if (reverting.length) out.push(`Builds on ${list(reverting)}: reverting ${list(reverting)} from best fails while this changeset stays.`);
+  if (onBase.length) out.push(`Needs ${list(onBase)}: it doesn't apply on ${baseBranch} without ${onBase.length === 1 ? "it" : "them"}.`);
   if (c.stack !== null) {
-    const members = all.filter((x) => x.stack === c.stack).sort((a, b) => a.k - b.k);
-    out.push(`Ships in stack ${c.stack} (${members.map((m) => `#${m.k}`).join(" → ")})${c.pr_base && c.pr_base !== "base" ? `, as a PR stacked on ${c.pr_base}` : `, as the first PR, based on ${baseBranch}`}${c.contribution === null ? "; the stack's contribution is measured together" : ""}.`);
-  } else if (!neededBy.length && !deps.length) out.push(`Independent: its PR is based on ${baseBranch} and can be reviewed and reverted alone.`);
+    const order = stackOrderText(all, c.stack);
+    if (host) out.push(`Ships in stack ${c.stack} (${order}), inside #${host.k}'s PR.`);
+    else out.push(`Ships in stack ${c.stack} (${order})${c.pr_base && c.pr_base !== "base" ? `, as a PR stacked on ${c.pr_base}` : `, as the first PR, based on ${baseBranch}`}${c.contribution === null ? "; the stack's contribution is measured together" : ""}.`);
+  } else if (!neededBy.length && !deps.length && !host) out.push(`Independent: its PR is based on ${baseBranch} and can be reviewed and reverted alone.`);
   return out;
 }
 
@@ -973,15 +993,23 @@ function changesetView(c: ChangesetRow, all: ChangesetRow[], ctx: { total: numbe
     droppable: c.droppable === 1,
     /** The human's choice for this changeset; dropping is only possible when nothing builds on it. */
     choice: c.human_choice,
-    canDrop: neededBy.length === 0,
+    canDrop: neededBy.length === 0 && c.folded_into === null && !all.some((x) => x.folded_into === c.id),
     dependsOn: (safeJson<number[]>(c.depends_on_json) ?? []).map(k).filter((x): x is number => x !== null),
     neededBy,
     dependencyReason: c.dependency_reason,
+    /** One entry per dependency: "Depends on #4 Title: reverting #4 from best conflicts in …". */
+    dependencies: dependencyList(c, all),
+    /** The changeset (k) whose PR ships this one, and why; null when it has its own PR. */
+    foldedInto: c.folded_into === null ? null : k(c.folded_into),
+    foldReason: c.fold_reason,
+    /** Changesets (k) that ship inside this one's PR. */
+    ships: all.filter((x) => x.folded_into === c.id).map((x) => x.k).sort((a, b) => a - b),
+    layer: c.layer,
     /** Dependencies and stack placement in words. */
     explanation: dependencyText(c, all, ctx.baseBranch),
     stack: c.stack,
     prBase: c.pr_base,
-    prBaseText: prBaseText(c, ctx.baseBranch),
+    prBaseText: prBaseText(c, ctx.baseBranch, all),
     standalone: {
       status: c.standalone_status,
       detail: c.standalone_detail,
@@ -996,7 +1024,11 @@ function changesetView(c: ChangesetRow, all: ChangesetRow[], ctx: { total: numbe
           ? `gates pass${c.standalone_effect !== null ? ` · ${improvementText(c.standalone_effect, ctx.metric, { factor: false })} on its PR base${c.standalone_ci_lo !== null && c.standalone_ci_hi !== null ? ` (${ciText(c.standalone_ci_lo, c.standalone_ci_hi)})` : ""}` : " (effect not measured)"}`
           : c.standalone_status === "pending"
             ? "not checked yet"
-            : `${c.standalone_status.replace(/_/gu, " ")}${c.standalone_detail ? `: ${clip(c.standalone_detail, 200)}` : ""}`,
+            : c.standalone_status === "folded"
+              ? `checked with #${k(c.folded_into ?? -1) ?? "?"}: ${all.find((x) => x.id === c.folded_into)?.standalone_status === "pass" ? "gates pass on that PR's base" : "see that PR"}`
+              : c.standalone_status === "applied"
+                ? "gates pass (effect not measured yet)"
+                : `${c.standalone_status.replace(/_/gu, " ")}${c.standalone_detail ? `: ${clip(c.standalone_detail, 200)}` : ""}`,
     },
     pr: { branch: c.branch, title: c.pr_title, body: c.pr_body, url: c.pr_url ?? published?.url ?? null, status: c.pr_status, published },
   };
@@ -1015,7 +1047,7 @@ interface PublishedPrLite {
 function harvestSummary(engine: Engine, s: StudyRow) {
   const h = engine.ctx.store.latestHarvest(s.id);
   if (!h) return null;
-  return { id: h.id, state: h.state, detail: h.phase_detail, changesets: engine.ctx.store.changesets(h.id).length, startedAt: h.started_at, finishedAt: h.finished_at, publishState: h.publish_state };
+  return { id: h.id, seq: h.seq, state: h.state, detail: h.phase_detail, changesets: engine.ctx.store.changesets(h.id).length, startedAt: h.started_at, finishedAt: h.finished_at, publishState: h.publish_state };
 }
 
 /** Harvest tab: the latest harvest's changesets, ablations, dependency stacks, PR drafts, accounting and publish state. */
@@ -1042,7 +1074,7 @@ export function harvestView(engine: Engine, s: StudyRow) {
     canStart,
     cannotStartReason,
     startCommand: `bb study harvest ${s.slug}`,
-    history: all.map((x) => ({ id: x.id, state: x.state, startedAt: x.started_at, finishedAt: x.finished_at, publishState: x.publish_state })),
+    history: all.map((x) => ({ id: x.id, seq: x.seq, state: x.state, startedAt: x.started_at, finishedAt: x.finished_at, publishState: x.publish_state })),
   };
   if (!h) return { ...base, harvest: null };
   const cs = store.changesets(h.id);
@@ -1063,6 +1095,8 @@ export function harvestView(engine: Engine, s: StudyRow) {
     ...base,
     harvest: {
       id: h.id,
+      /** Shown as h<seq>: the harvest's number within the study (id stays internal). */
+      seq: h.seq,
       state: h.state,
       detail: h.phase_detail,
       error: h.error,
@@ -1099,10 +1133,14 @@ export function harvestView(engine: Engine, s: StudyRow) {
         unexplainedHalfWidth: share(acc.gapHalfWidth),
         items: acc.items.map((i) => ({ label: i.label, source: i.source, value: i.estimate?.value ?? null, lo: i.estimate?.lo ?? null, hi: i.estimate?.hi ?? null, share: share(i.estimate?.value ?? null) })),
       },
-      changesets: cs.map((c) => changesetView(c, cs, ctx)),
+      /** In PR order: independent PRs and stacks by their first changeset, each stack bottom first. */
+      changesets: prOrder(cs).map((c) => changesetView(c, cs, ctx)),
       stacks: stacks.map((st) => ({
         stack: st.stack,
+        /** PR order, bottom first (folded changesets right after the PR that ships them). */
         members: st.members.map((id) => cs.find((c) => c.id === id)?.k ?? null).filter((x): x is number => x !== null),
+        /** "#3 → #1 (with #4)" */
+        order: stackOrderText(cs, st.stack),
         status: st.status,
         estimate: st.estimate,
         contribution: st.estimate ? contributionView(st.estimate, t, vsBase, bestRaw, metric) : null,
@@ -1607,7 +1645,7 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
         id: `harvest_ready:${h.id}`,
         kind: h.publish_state === "failed" ? "publish_failed" : "harvest_ready",
         tone: h.publish_state === "failed" ? "alert" : "action",
-        title: h.publish_state === "failed" ? `Publishing harvest h${h.id} failed` : `Harvest h${h.id} is ready for review`,
+        title: h.publish_state === "failed" ? `Publishing harvest h${h.seq} failed` : `Harvest h${h.seq} is ready for review`,
         short: h.publish_state === "failed" ? "publish failed" : "harvest ready",
         detail: h.publish_state === "failed" ? clip(h.error ?? "see the Harvest tab for each PR's result", 300) : `${store.changesets(h.id).length} changeset(s) with measured contributions. Review them, then publish draft PRs, keep exploring, or archive.`,
         tab: "harvest",
@@ -1616,7 +1654,7 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
         at: h.finished_at,
       });
     } else if (h.state === "failed") {
-      items.push({ id: `harvest_failed:${h.id}`, kind: "harvest_failed", tone: "alert", title: `Harvest h${h.id} failed`, short: "harvest failed", detail: clip(h.error ?? "", 300), tab: "harvest", action: { kind: "open_harvest" }, command: `bb study harvest ${slug} --restart`, at: h.finished_at });
+      items.push({ id: `harvest_failed:${h.id}`, kind: "harvest_failed", tone: "alert", title: `Harvest h${h.seq} failed`, short: "harvest failed", detail: clip(h.error ?? "", 300), tab: "harvest", action: { kind: "open_harvest" }, command: `bb study harvest ${slug} --restart`, at: h.finished_at });
     }
   }
   const order = { alert: 0, action: 1 } as const;
@@ -1659,7 +1697,7 @@ export function statusLine(engine: Engine, s: StudyRow): string {
     }
     case "harvesting": {
       const h = store.latestHarvest(s.id);
-      return h ? `Harvesting (h${h.id}): ${h.state}${h.phase_detail ? `, ${clip(h.phase_detail, 120)}` : ""}.` : "Harvesting.";
+      return h ? `Harvesting (h${h.seq}): ${h.state}${h.phase_detail ? `, ${clip(h.phase_detail, 120)}` : ""}.` : "Harvesting.";
     }
     case "archived":
       return "Archived: workers stopped; candidate refs and the best branch are kept.";

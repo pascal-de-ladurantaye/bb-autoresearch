@@ -453,7 +453,7 @@ export function studyCli(engine: Engine): PluginCliRegistration {
             if (engine.study(slug).state === "archived" && before && !input.options.restart) return respond(input.options.json, () => harvestText(engine, slug), () => view());
             const r = engine.startHarvest(slug, actor, { restart: Boolean(input.options.restart), measureStandalone: !input.options["no-measure-standalone"], onePerPromotion: Boolean(input.options["one-per-promotion"]) });
             const started = r.harvest.id !== before?.id;
-            if (started) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.id} started (dry run)`, { harvest: r.harvest.id });
+            if (started) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.seq} started (dry run)`, { harvest: r.harvest.id });
             if (input.options.wait) await engine.waitForHarvest(slug, input.options.timeout ?? 25 * 60_000);
             return respond(
               input.options.json,
@@ -618,7 +618,7 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
       ["Status", o.status],
       ["Best vs base", bestLine(o)],
       ["Needs you", o.needs.length ? `${o.needs.length} item(s), below` : "nothing"],
-      ["Harvest", hv ? `h${hv.id} ${hv.state}${hv.headline ? ` · measured ${hv.headline.text}` : ""} · \`bb study harvest ${s.slug}\`` : null],
+      ["Harvest", hv ? `h${hv.seq} ${hv.state}${hv.headline ? ` · measured ${hv.headline.text}` : ""} · \`bb study harvest ${s.slug}\`` : null],
     ]),
   ];
   if (o.needs.length) lines.push(...section("Needs you", needsLines(o.needs, true)));
@@ -695,7 +695,7 @@ export function harvestText(engine: Engine, slug: string): string {
   if (!h) return `${slug}: no harvest yet. ${v.canStart ? `\`${v.startCommand}\` starts one (dry run).` : (v.cannotStartReason ?? "")}`;
   const acc = h.accounting;
   const lines = [
-    `Harvest h${h.id} of ${s.slug} · ${h.state}${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
+    `Harvest h${h.seq} of ${s.slug} · ${h.state}${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
     ...kv([
       ["Error", h.error ? clip(h.error, 300) : null],
       ["Base → best", `${h.baseSha?.slice(0, 10) ?? "?"} → ${h.bestSha?.slice(0, 10) ?? "?"} · grouping ${h.groupingSource ?? "pending"}${h.groupingNotes ? ` (${clip(h.groupingNotes, 200)})` : ""} · bench ${formatDuration(h.benchSeconds)}`],
@@ -721,13 +721,13 @@ export function harvestText(engine: Engine, slug: string): string {
     body.push(...kv([
       ["PR base", c.prBaseText],
       ["Standalone", clip(c.standalone.summary, 240)],
-      ["Branch", c.pr.branch ? `${c.pr.branch}${c.pr.url ? ` · ${c.pr.url}` : ""}` : null],
+      ["Branch", c.pr.branch ? `${c.pr.branch}${c.pr.url ? ` · ${c.pr.url}` : ""}` : c.foldedInto !== null ? `none: ships inside #${c.foldedInto}'s PR` : null],
     ], "      "));
     for (const e of c.explanation) body.push(`      ${e}`);
   }
   lines.push(...section(`Changesets: ${cs.length}`, body.length ? body : ["  none"]));
   if (h.stacks.length) {
-    lines.push(...section("Stacks", h.stacks.map((st) => `  stack ${st.stack}: ${st.members.map((k) => `#${k}`).join(" → ")}${st.contribution ? ` · together ${st.contribution.text}` : ` · ${st.status}`}`)));
+    lines.push(...section("Stacks (PR order)", h.stacks.map((st) => `  stack ${st.stack}: ${st.order}${st.contribution ? ` · together ${st.contribution.text}` : ` · ${st.status}`}`)));
   }
   const next = [
     h.exportDir ? `Dry-run export (report.md, prs/*.md, manifest.json): ${h.exportDir}` : "",

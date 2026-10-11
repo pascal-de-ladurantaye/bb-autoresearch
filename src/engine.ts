@@ -6,7 +6,7 @@ import { resolveBenchHosts } from "./bench.ts";
 import { recordCalibration, runAutoRecalibration, runCalibration, type AutoRecalibration, type CalibrationReport } from "./calibration.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
-import { applyProposal, type Promotion } from "./harvest-math.ts";
+import { applyProposal, harvestBranch, harvestExportKey, prOrder, type Promotion } from "./harvest-math.ts";
 import { Harvester, harvestReadyText } from "./harvest.ts";
 import { checkHealth } from "./health.ts";
 import type { DispatchDecision, DispatchQuery } from "./ports.ts";
@@ -454,7 +454,7 @@ export class Engine {
       this.pipeline.resetAttempts(study.id);
       this.store.setStudyState(study.id, "running", actor, { from_harvest: h?.id ?? null });
       this.kick();
-      return `${slug} is running again (keep exploring)${cancelled ? `; harvest h${h!.id} was cancelled` : h?.state === "ready" ? `; harvest h${h.id} stays available for review (a new \`bb study harvest\` starts a fresh one)` : ""}.`;
+      return `${slug} is running again (keep exploring)${cancelled ? `; harvest h${h!.seq} was cancelled` : h?.state === "ready" ? `; harvest h${h.seq} stays available for review (a new \`bb study harvest\` starts a fresh one)` : ""}.`;
     }
     if (study.state !== "paused") throw new EngineError(`${slug} is ${study.state}, not paused`);
     this.pipeline.resetAttempts(study.id);
@@ -479,7 +479,7 @@ export class Engine {
       const active = !["ready", "failed", "cancelled"].includes(latest.state);
       if (!opts.restart || active) {
         if (active && !this.harvester.running(latest.id)) this.harvester.start(latest.id);
-        return { harvest: latest, text: `${slug} is harvesting: harvest h${latest.id} is ${latest.state}${latest.phase_detail ? ` (${latest.phase_detail})` : ""}.${active && opts.restart ? " It is still running; wait for it or `bb study resume` to cancel it." : ""}` };
+        return { harvest: latest, text: `${slug} is harvesting: harvest h${latest.seq} is ${latest.state}${latest.phase_detail ? ` (${latest.phase_detail})` : ""}.${active && opts.restart ? " It is still running; wait for it or `bb study resume` to cancel it." : ""}` };
       }
     } else if (!["running", "paused"].includes(study.state)) {
       throw new EngineError(`${slug} is ${study.state}; harvest starts from Running or Paused`);
@@ -496,7 +496,7 @@ export class Engine {
     return {
       harvest: h,
       text: [
-        `${slug} is harvesting (h${h.id}, dry run). No new workers start and submissions are closed${live ? `; ${live} live worker(s) finish their current idea` : ""}.`,
+        `${slug} is harvesting (h${h.seq}, dry run). No new workers start and submissions are closed${live ? `; ${live} live worker(s) finish their current idea` : ""}.`,
         inFlight ? `First, ${inFlight} in-flight candidate(s) finish so best is final.` : "",
         `Then: ${opts.onePerPromotion ? "one changeset per promotion (no strategist round)" : "the strategist groups the promotions into changesets (or one per promotion)"}, each changeset is ablated from best and measured (${spec.oracle.noise} protocol), checked alone on its PR base${spec.harvest.measure_standalone && opts.measureStandalone !== false ? " and measured" : ""}, and drafted as a local branch with a PR body. Nothing is pushed.`,
         `Follow it on the Harvest tab or with \`bb study harvest ${slug}\`.`,
@@ -520,14 +520,14 @@ export class Engine {
   async publishPlan(slug: string, harvestId?: number) {
     const study = this.study(slug);
     const h = this.store.latestHarvest(study.id);
-    if (!h || (harvestId !== undefined && h.id !== harvestId)) throw new EngineError(`${slug} has no such harvest${harvestId !== undefined ? ` (h${harvestId})` : ""}; reload the Harvest tab`);
+    if (!h || (harvestId !== undefined && h.id !== harvestId)) throw new EngineError(`${slug} has no such harvest${harvestId !== undefined ? ` (id ${harvestId})` : ""}; reload the Harvest tab`);
     const spec = this.store.spec(study);
     const runner = this.ctx.bb.hostRunner(study.host_id!);
     const publisher = new GithubPublisher(runner, study.repo_path!, spec.harvest.remote, true);
     let remoteUrl: string | null = null;
     let problem: string | null = null;
-    if (h.state !== "ready") problem = `harvest h${h.id} is ${h.state}, not ready`;
-    else if (h.publish_state === "published") problem = `harvest h${h.id} was already published`;
+    if (h.state !== "ready") problem = `harvest h${h.seq} is ${h.state}, not ready`;
+    else if (h.publish_state === "published") problem = `harvest h${h.seq} was already published`;
     else {
       try {
         remoteUrl = (await publisher.preflight()).remoteUrl;
@@ -538,6 +538,8 @@ export class Engine {
     const drafts = this.publishDrafts(study, spec, h);
     return {
       harvestId: h.id,
+      /** Shown as h<seq>. */
+      seq: h.seq,
       remote: spec.harvest.remote,
       remoteUrl,
       ok: problem === null,
@@ -546,16 +548,22 @@ export class Engine {
     };
   }
 
-  /** The PR drafts of a harvest in publish order, with the reason a changeset is skipped (no branch, dropped by the human, or stacked on a skipped one). */
-  private publishDrafts(study: StudyRow, spec: StudySpec, h: HarvestRow): Array<{ draft: PrDraft; skip: string | null }> {
+  /**
+   * The PR drafts of a harvest in publish order (PR order: each stack bottom
+   * first), with the reason a changeset is skipped (no branch, dropped by the
+   * human, or stacked on a skipped one). A changeset folded into another's PR
+   * is listed with `folded` (it ships inside that PR, never on its own).
+   */
+  private publishDrafts(study: StudyRow, spec: StudySpec, h: HarvestRow): Array<{ draft: PrDraft; skip: string | null; folded: boolean }> {
     const changesets = this.store.changesets(h.id);
     const skipped = new Set<string>();
-    return changesets.map((c) => {
+    return prOrder(changesets).map((c) => {
       const base = c.pr_base && c.pr_base !== "base" ? changesets.find((x) => `#${x.k}` === c.pr_base) : undefined;
-      const draft: PrDraft = { changesetId: c.id, k: c.k, branch: c.branch ?? `studies/${study.slug}/harvest/h${h.id}/${c.k}`, baseBranch: base?.branch ?? spec.study.base, title: c.pr_title ?? c.title, body: c.pr_body ?? "", sha: c.branch ? c.standalone_sha : null, stacked: Boolean(base) };
-      const skip = !draft.sha ? "did not apply on its PR base: no branch" : c.human_choice === "drop" ? "dropped by you" : draft.stacked && skipped.has(draft.baseBranch) ? `its base ${draft.baseBranch} is not published` : null;
-      if (skip) skipped.add(draft.branch);
-      return { draft, skip };
+      const host = c.folded_into !== null ? changesets.find((x) => x.id === c.folded_into) : undefined;
+      const draft: PrDraft = { changesetId: c.id, k: c.k, branch: c.branch ?? harvestBranch(study, h, c), baseBranch: base ? (base.branch ?? harvestBranch(study, h, base)) : spec.study.base, title: c.pr_title ?? c.title, body: c.pr_body ?? "", sha: c.branch ? c.standalone_sha : null, stacked: Boolean(base) };
+      const skip = host ? `ships inside #${host.k}'s PR` : !draft.sha ? "did not apply on its PR base: no branch" : c.human_choice === "drop" ? "dropped by you" : draft.stacked && skipped.has(draft.baseBranch) ? `its base ${draft.baseBranch} is not published` : null;
+      if (skip && !host) skipped.add(draft.branch);
+      return { draft, skip, folded: Boolean(host) };
     });
   }
 
@@ -563,11 +571,15 @@ export class Engine {
   setChangesetChoice(slug: string, harvestId: number, k: number, choice: "keep" | "drop" | null, actor: string): string {
     const study = this.study(slug);
     const h = this.store.latestHarvest(study.id);
-    if (!h || h.id !== harvestId) throw new EngineError(`harvest h${harvestId} is not ${slug}'s latest harvest; reload the Harvest tab`);
-    if (h.publish_state === "published") throw new EngineError(`harvest h${h.id} was already published`);
+    if (!h || h.id !== harvestId) throw new EngineError(`that harvest (id ${harvestId}) is not ${slug}'s latest harvest; reload the Harvest tab`);
+    if (h.publish_state === "published") throw new EngineError(`harvest h${h.seq} was already published`);
     const all = this.store.changesets(h.id);
     const c = all.find((x) => x.k === k);
-    if (!c) throw new EngineError(`harvest h${h.id} has no changeset #${k}`);
+    if (!c) throw new EngineError(`harvest h${h.seq} has no changeset #${k}`);
+    const host = c.folded_into !== null ? all.find((x) => x.id === c.folded_into) : undefined;
+    if (choice === "drop" && host) throw new EngineError(`#${k} can't be dropped alone: it ships inside #${host.k}'s PR`);
+    const inside = all.filter((x) => x.folded_into === c.id);
+    if (choice === "drop" && inside.length) throw new EngineError(`#${k} can't be dropped: its PR also ships ${inside.map((x) => `#${x.k}`).join(", ")}`);
     const dependents = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(c.id));
     if (choice === "drop" && dependents.length) throw new EngineError(`#${k} can't be dropped: ${dependents.map((d) => `#${d.k}`).join(", ")} build${dependents.length === 1 ? "s" : ""} on it`);
     this.store.updateChangeset(c.id, { human_choice: choice });
@@ -606,8 +618,8 @@ export class Engine {
     const study = this.study(slug);
     const h = this.store.latestHarvest(study.id);
     if (!h || h.state !== "ready") throw new EngineError(`${slug} has no ready harvest to publish; run \`bb study harvest ${slug}\` (a dry run) first and review it`);
-    if (harvestId !== undefined && h.id !== harvestId) throw new EngineError(`harvest h${harvestId} is not the latest (h${h.id} is); review h${h.id} first`);
-    if (h.publish_state === "published") throw new EngineError(`harvest h${h.id} was already published`);
+    if (harvestId !== undefined && h.id !== harvestId) throw new EngineError(`that harvest (id ${harvestId}) is not the latest (h${h.seq} is); review h${h.seq} first`);
+    if (h.publish_state === "published") throw new EngineError(`harvest h${h.seq} was already published`);
     const spec = this.store.spec(study);
     const runner = this.ctx.bb.hostRunner(study.host_id!);
     const publisher = new GithubPublisher(runner, study.repo_path!, spec.harvest.remote, confirmed);
@@ -625,11 +637,11 @@ export class Engine {
     }
     const changesets = this.store.changesets(h.id);
     // A dropped changeset goes in without a sha, so the publisher skips it (and anything stacked on it).
-    const all: PrDraft[] = this.publishDrafts(study, spec, h).map(({ draft }) => ({ ...draft, sha: changesets.find((c) => c.id === draft.changesetId)?.human_choice === "drop" ? null : draft.sha }));
+    const all: PrDraft[] = this.publishDrafts(study, spec, h).filter((d) => !d.folded).map(({ draft }) => ({ ...draft, sha: changesets.find((c) => c.id === draft.changesetId)?.human_choice === "drop" ? null : draft.sha }));
     this.store.updateHarvest(h.id, { publisher: "github", publish_state: "publishing", error: null });
     this.store.event(study.id, "harvest.publishing", actor, { harvest: h.id, prs: all.length });
     try {
-      const out = await publisher.publish({ key: `${study.slug}-harvest-h${h.id}`, drafts: all, report: studyReport(this.ctx, study, spec, h) });
+      const out = await publisher.publish({ key: harvestExportKey(study, h), drafts: all, report: studyReport(this.ctx, study, spec, h) });
       // A dropped changeset has no sha in its draft, so the publisher skips it; say why.
       for (const p of out.prs) if (changesets.find((c) => c.id === p.changesetId)?.human_choice === "drop") Object.assign(p, { status: "skipped", detail: "dropped by you" });
       for (const p of out.prs) {
@@ -639,9 +651,9 @@ export class Engine {
       this.store.updateHarvest(h.id, { publish_state: opened.length === out.prs.filter((p) => p.status !== "skipped").length ? "published" : "failed", publish_json: JSON.stringify(out) });
       this.store.event(study.id, "harvest.published", actor, { harvest: h.id, opened: opened.length, prs: out.prs.length });
       const failed = out.prs.filter((p) => p.status === "failed" || p.status === "pushed");
-      await this.notify(study.id, "harvest.published", `Harvest h${h.id} of \`${study.slug}\`: ${opened.length} draft PR(s) opened${failed.length ? `, ${failed.length} failed` : ""}.${failed.length ? " Next: see each PR's error on the Harvest tab." : ""}\n${out.prs.map((p) => `- #${p.k} ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 160)})` : ""}`).join("\n")}`);
+      await this.notify(study.id, "harvest.published", `Harvest h${h.seq} of \`${study.slug}\`: ${opened.length} draft PR(s) opened${failed.length ? `, ${failed.length} failed` : ""}.${failed.length ? " Next: see each PR's error on the Harvest tab." : ""}\n${out.prs.map((p) => `- #${p.k} ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 160)})` : ""}`).join("\n")}`);
       this.publish(study.id);
-      return [`Harvest h${h.id}: ${opened.length} draft PR(s) opened.`, ...out.prs.map((p) => `#${p.k} ${p.branch} → ${p.baseBranch}: ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 200)})` : ""}`)].join("\n");
+      return [`Harvest h${h.seq}: ${opened.length} draft PR(s) opened.`, ...out.prs.map((p) => `#${p.k} ${p.branch} → ${p.baseBranch}: ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 200)})` : ""}`)].join("\n");
     } catch (e) {
       this.store.updateHarvest(h.id, { publish_state: "failed", error: clip(errText(e), 500) });
       throw e;
@@ -986,7 +998,7 @@ export class Engine {
     if (!r.ok) throw new EngineError(`Grouping not accepted; fix it and call study_propose_harvest again:\n${r.errors.map((e) => `- ${e}`).join("\n")}`);
     const id = this.store.addHarvestProposal(study!.id, groups, threadId, h.id);
     this.publish(study!.id);
-    return [`Harvest grouping #${id} accepted for harvest h${h.id}: ${r.changesets.length} changeset(s).`, ...r.notes.map((n) => `Note: ${n}.`), "The plugin now ablates and measures each changeset; end your turn."].join("\n");
+    return [`Harvest grouping #${id} accepted for harvest h${h.seq}: ${r.changesets.length} changeset(s).`, ...r.notes.map((n) => `Note: ${n}.`), "The plugin now ablates and measures each changeset; end your turn."].join("\n");
   }
 
   // -------------------------------------------------------- thread events
