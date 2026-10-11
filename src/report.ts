@@ -93,7 +93,7 @@ function linkedFindings(ctx: Ctx, study: StudyRow, cs: ChangesetRow): string[] {
     const c = ctx.store.candidateByN(study.id, n);
     if (!c) continue;
     const fs = ctx.store.db.prepare(`SELECT * FROM findings WHERE study_id = ? AND (candidate_id = ? OR (idea_id IS NOT NULL AND idea_id = ?)) ORDER BY id LIMIT 5`).all(study.id, c.id, c.idea_id ?? -1) as Array<{ id: number; outcome: string; learned: string; revisit_if: string }>;
-    for (const f of fs) out.push(`- Finding #${f.id} (c/${n}, ${f.outcome}): ${clip(f.learned.replace(/\s+/gu, " "), 400)}${f.revisit_if ? ` Revisit if: ${clip(f.revisit_if, 160)}` : ""}`);
+    for (const f of fs) out.push(`- Finding #${f.id} (c/${n}, ${f.outcome}): ${clipWords(f.learned.replace(/\s+/gu, " "), 400)}${f.revisit_if ? ` Revisit if: ${clipWords(f.revisit_if, 160)}` : ""}`);
   }
   return [...new Set(out)];
 }

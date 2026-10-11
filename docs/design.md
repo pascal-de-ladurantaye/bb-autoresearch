@@ -1636,6 +1636,20 @@ Replay showed every bench host as "not checked yet": only unhealthy streaks were
 - **Pause and harvest** already changed the state synchronously before anything else; they shared only the late-spawn race, which the same check covers. A pause still lets running workers finish.
 - **Tests.** Archiving with free slots and five queued ideas records no `worker.spawned` after it starts, and its `study.state` event comes before the first `worker.abandoned`; a spawn held until after the archive (and one held until after a pause) ends with its thread stopped and archived and no second `worker.spawned`. All three fail on v0.2.2.
 
+### Live check (BB 0.45, one MacBook, a toy repo under /tmp, a temporary project)
+
+- **Toy.** `src/toy.py` (a loop sum, a recursive fib, a quadratic dedupe, a bubble sort); the metric is opcodes of `toy.run()` counted with `sys.settrace` and 1% synthetic noise, guardrail `src_lines`; noisy, `n_min` 4, `n_max` 10; single-machine mode on (auto). Study 1: `max_workers` 3, `max_candidates` 6, four ideas added from the CLI. Study 2: `max_workers` 2, `max_candidates` 20, six ideas, archived as soon as two workers were live.
+- **Status line.** Read every few seconds: "Running: 3 workers: 1 reading the code, 1 being measured, 1 reading a verdict; measuring c/3.", "… 1 refining, 1 waiting for the bench, 1 being measured; measuring c/4, 1 in tests.", "Running: 1 worker finishing." The view's counts carried `finishing` (2 of 3 at one point).
+- **Before the first pair.** A measurement at pair 0 had a band with no points (the placeholder case) and progress "first pair of ≤10 running".
+- **Notices.** Round 1 said "1 notice for you" (calibration ready) with six control notices (four ideas added from the CLI, calibrate, start) listed apart as the audit trail. On the Overview, `calibration.ready` offered "See calibration" once started; `budget.exhausted` offered "Start harvest" while paused on the budget and "Open Harvest" once the harvest ran.
+- **Code block.** Rounds 1 and 2 carried it with the base commit, then best's new commit and "2 promotions so far", and the `git -C <study repo path>` form.
+- **Candidate detail and replay.** `study.candidate` returned the stored band (10 pairs, exact) and "median of the per-pair changes, the verdict's estimate"; the replay bundle carried 12 `bench.health` events and `healthChecks: true`.
+- **PR bodies.** A long summary was clipped at a word boundary with its code spans closed ("… `list(dict.fromkeys(xs))` … dedupe order…"), and the ablation read "best with this change reverted is 100.00% worse than best". Findings in PR bodies used the old clip and were switched to `clipWords` after the run.
+- **Archive.** Study 2: `control.archive` at t, `study.state running → archived` at t + 3 ms, the two workers abandoned at t + 3 ms and t + 2.1 s, no `worker.spawned` after t; both worker threads and the study thread ended archived.
+- **Seen, not fixed.** The toy's tracer stopped counting on the promoted best (0 opcodes, a bug in the toy's bench under Python 3.13 that the workers themselves reported), which made harvest's shares degenerate (two changesets each "100% of the gain") and the Overview call a zero-width CI of a noisy oracle "single runs, no CI". Both are what the numbers say for a metric of 0; neither occurs with a working bench.
+- **Not checked live:** the rendered pages (screenshots are re-captured separately; the components are covered by jsdom tests), a spawn resolving after an archive (tested with a held spawn only), and an expensive-class band.
+- **Cleanup.** Both studies archived with their threads, the temporary project and `/tmp` files deleted, and the released plugin reinstalled from GitHub (its database kept every study).
+
 ### Data model
 
 No migrations. New events: `bench.health` (every health check), `worker.spawn_discarded`. The replay bundle's `spec` gains `healthChecks`; `LiveBenchHost` gains `healthRecord`; `LiveView.counts` gains `finishing`; the candidate detail gains `band`, `noise`, `effectStatistic` and `hostName`.
