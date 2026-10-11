@@ -9,7 +9,7 @@ import { autoSideRuns, combineRuns, repeatBench, type Bench } from "../src/noise
 import { parseSpec, oracleHash, normalizeSpec, type StudySpec } from "../src/spec.ts";
 import { seededRng } from "../src/stats.ts";
 import { FakeHost, makeCtx, type FakePort } from "./helpers.ts";
-import { bestView, secondaryMetricsView, trajectory, candidateDetail } from "../src/views.ts";
+import { bestView, candidateDetail, harvestView } from "../src/views.ts";
 import { liveView } from "../src/live.ts";
 import { showStudy } from "../src/cli.ts";
 import { studyReport } from "../src/report.ts";
@@ -287,6 +287,10 @@ describe("v0.2.4 engine (fake hosts)", () => {
     const live = liveView(engine, s);
     expect(live.best).toMatchObject({ text: "75.0% lower size (4.0×) across 2 segments", segments: 2, raw: "this segment 500 → 250 ms" });
     expect(studyReport(engine.ctx, s, store.spec(s), null)).toContain("75.0% lower size (4.0×) across 2 segments (compounded from the promoted candidates) · this segment 500 → 250 ms");
+    // A harvest after a recalibration: the base's raw value comes from its own base-vs-best measurement, not the segment's baseline.
+    const h = store.insertHarvest({ study_id: id, from_state: "paused", measure_standalone: 1 }, "human");
+    store.updateHarvest(h.id, { state: "ready", base_sha: s.base_sha, best_sha: s.best_sha, total_effect: 3, total_ci_lo: 2.9, total_ci_hi: 3.1 });
+    expect((harvestView(engine, store.study(id)!).harvest as { headline: { raw: string } }).headline.raw).toBe("≈ 1,000 → 250 ms");
   });
 
   it("a candidate's verdict reasons read like the rest of the page (CI +x% to +y%, n pairs)", async () => {

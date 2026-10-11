@@ -4,7 +4,7 @@
 import type { CandidateRow, FindingRow, IdeaRow, StudyRow, ThreadRow } from "./db/store.ts";
 import { formatPct, type StudySpec } from "./spec.ts";
 import type { RoundTrigger } from "./scheduler.ts";
-import { ciText as ciRange, improvementText, type MetricInfo } from "./present.ts";
+import { ciText as ciRange, improvementText, type MetricInfo, bestHeadlineText } from "./present.ts";
 import { changeWords, headroom, headroomWords, rangeWords, relativeWords, type GuardrailJudgement, type Position } from "./guardrails.ts";
 
 /**
@@ -325,7 +325,7 @@ export function strategistDigest(d: DigestInput): AgentMessage {
     : "no new verdicts";
   const summary =
     `[autoresearch] Strategist round ${d.round} (${TRIGGER_TEXT[d.trigger]}): ${verdictSummary}` +
-    `${wins.length ? `, best now ${improvementText(d.cumulative, metric)} vs base` : d.cumulative !== null ? `, best ${improvementText(d.cumulative, metric)} vs base` : ""}` +
+    `${wins.length ? `, best now ${bestHeadlineText(d.cumulative, metric, Math.max(1, d.study.segment ?? 1))} vs base` : d.cumulative !== null ? `, best ${bestHeadlineText(d.cumulative, metric, Math.max(1, d.study.segment ?? 1))} vs base` : ""}` +
     ` · ${queued.length} idea${queued.length === 1 ? "" : "s"} queued · ${d.workers.length} worker${d.workers.length === 1 ? "" : "s"}${forHuman.length ? ` · ${forHuman.length} notice${forHuman.length === 1 ? "" : "s"} for you on the Studies page` : ""}` +
     `${tight.length ? ` · guardrail ${tight.join(", ")} near its total limit` : ""}.`;
   const lines = [

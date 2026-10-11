@@ -1086,7 +1086,11 @@ export function harvestView(engine: Engine, s: StudyRow) {
   const vsHi = vsBaseFromVsBest(h.total_ci_hi, metric.direction);
   const snap = metricSnapshot(engine, s);
   const bestRaw = snap.bestSha === h.best_sha ? (snap.best?.[metric.name] ?? null) : null;
-  const baseRaw = snap.baseline?.[metric.name] ?? null;
+  // The study base's raw value: measured when the current segment starts at the base; otherwise (later segments) from
+  // best's value and the harvest's own base-vs-best measurement (relative to best: base = best × (1 ± t)), marked "≈".
+  const tTotal = h.total_effect;
+  const baseMeasured = snap.baselineSha === h.base_sha ? (snap.baseline?.[metric.name] ?? null) : null;
+  const baseRaw = baseMeasured ?? (bestRaw !== null && tTotal !== null ? bestRaw * (metric.direction === "lower" ? 1 + tTotal : 1 - tTotal) : null);
   const publish = safeJson<{ mode?: string; exportDir?: string; prs?: PublishedPrLite[] }>(h.publish_json);
   const githubPrs = publish?.mode === "github" ? (publish.prs ?? []) : [];
   const ctx = { total: t, vsBase, bestRaw, metric, baseBranch: spec?.study.base ?? "main", publish: githubPrs };
@@ -1114,7 +1118,7 @@ export function harvestView(engine: Engine, s: StudyRow) {
           : {
               text: improvementText(vsBase, metric),
               ci: vsLo !== null && vsHi !== null ? ciText(vsLo, vsHi) : "",
-              raw: rawChange(baseRaw, bestRaw, metric.unit),
+              raw: baseMeasured === null && baseRaw !== null ? `≈ ${rawChange(baseRaw, bestRaw, metric.unit)}` : rawChange(baseRaw, bestRaw, metric.unit),
               vsBest: `${signedPct(t, 2)} vs best`,
             },
       accounting: {
