@@ -11,6 +11,7 @@ import { createLocalBenchProvider, type LocalBenchProvider } from "../examples/b
 import { benchProviderContract, type BenchProviderMethod } from "../src/bench-provider/contract.ts";
 import type { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";
+import { gatesSerialized } from "../src/pipeline.ts";
 import { Clock, localRunner, makeCtx, waitFor, type FakePort } from "./helpers.ts";
 
 const SLUG = "toy-remote";
@@ -378,6 +379,30 @@ describe("remote bench hosts (example provider, real git)", () => {
     await engine.calibrate(SLUG, "human");
     await engine.waitForCalibration(SLUG, 60_000);
     expect((JSON.parse(store.study(SLUG)!.calibration_json!).problems as string[]).join("\n")).toMatch(/did not answer describe/u);
+  });
+
+  it("gates = true: gates run on the remote machines (baseline and candidates), not on the edit host", async () => {
+    setup();
+    writeFileSync(join(repo, "bench/gate.sh"), `v=$(head -1 src/a.txt | tr -dc 0-9); [ -n "$AUTORESEARCH_REMOTE" ] || { echo "not remote" >&2; exit 9; }; [ "$v" != 13 ]\n`);
+    sh(repo, "commit", "-qam", "remote-only gate");
+    await started(spec({ benchHosts: '"local"', remote: "gates = true" }));
+    const sid = studyId();
+    expect(gatesSerialized(store, store.study(SLUG)!)).toBe(false);
+    expect(store.benchIntervals(sid).some((i) => i.kind === "gate" && i.host_id.startsWith("remote-"))).toBe(true);
+    const gateCand = (value: number) => {
+      const id = queue(value);
+      store.updateCandidate(id, { stage: "gating", prepared_sha: null, queued_at: null });
+      return id;
+    };
+    const good = gateCand(40);
+    const bad = gateCand(13);
+    const g = await decided(good);
+    expect(g.verdict).toBe("win");
+    const b = await decided(bad);
+    expect(b.verdict).toBe("gate_failed");
+    const started2 = store.events(sid, { kinds: ["gate.started"] }).map((e) => JSON.parse(e.data_json).host as string);
+    expect(started2.length).toBeGreaterThanOrEqual(2);
+    expect(started2.every((h) => h.startsWith("remote-"))).toBe(true);
   });
 
   it("measures on local and remote hosts together, each with its own calibration", async () => {
