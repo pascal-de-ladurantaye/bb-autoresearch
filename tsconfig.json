@@ -13,5 +13,5 @@
     "allowImportingTsExtensions": true,
     "noUncheckedIndexedAccess": true
   },
-  "include": ["server.ts", "host.ts", "app.tsx", "src", "components", "lib", "hooks", "test", "vitest.config.ts"]
+  "include": ["server.ts", "host.ts", "app.tsx", "src", "components", "lib", "hooks", "test", "vitest.config.ts", "examples"]
 }
