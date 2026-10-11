@@ -67,6 +67,9 @@ interface Failure {
   seedKey?: string;
 }
 
+/** How long calibrated machines wait for the human to approve a finished calibration. */
+const KEEP_AFTER_CALIBRATION_MS = 30 * 60_000;
+
 /** Machine states that are joining (not measuring yet). */
 const JOINING = ["creating", "joining", "calibrating"] as const;
 
@@ -261,7 +264,9 @@ export class RemoteFleet {
       }
       const current = this.store.remoteHosts(study.id, { live: true });
       if (this.wants(study)) this.fillSlots(study, spec, current, now);
-      else this.release(study, spec, current, study.state === "archived" ? "study archived" : study.state === "paused" ? "study paused" : `study ${study.state}`);
+      else if (this.keeps(study, now)) {
+        // A finished calibration waits for the human: its machines stay (no new ones) for a while.
+      } else this.release(study, spec, current, study.state === "archived" ? "study archived" : study.state === "paused" ? "study paused" : `study ${study.state}`);
       // Retiring machines go once nothing runs on them.
       for (const row of this.store.remoteHosts(study.id, { live: true })) {
         if (row.state === "retiring" && !this.pipeline.lockKeyBusy(benchLockKey(study, spec, row.bench_host_id))) this.leave(row, row.left_reason ?? "retired", { expected: true });
@@ -307,6 +312,13 @@ export class RemoteFleet {
       else if (r.state === "ready") this.retire(r, why);
     }
     if (study.state !== "draft") this.startJob(`orphans:${study.id}`, () => this.cleanupOrphans([...new Set(live.map((r) => r.provider))]).then(() => undefined));
+  }
+
+  /** Calibrated machines are kept for half an hour while a finished calibration waits for approval. */
+  private keeps(study: StudyRow, now: number): boolean {
+    if (study.state !== "calibrating" || study.calibration_status !== "ready") return false;
+    const finished = (JSON.parse(study.calibration_json ?? "{}") as { finishedAt?: number }).finishedAt ?? 0;
+    return now - finished < KEEP_AFTER_CALIBRATION_MS;
   }
 
   private failureKey(studyId: string, entry: number): string {
@@ -475,6 +487,9 @@ export class RemoteFleet {
       }
       await this.arrivalCalibration(rowId, signal);
     } catch (e) {
+      // Ended meanwhile: make sure the machine doesn't outlive its row.
+      const now = this.store.remoteHost(rowId);
+      if (now?.state === "gone" && now.remote_id && !this.ctx.disposed) await this.destroy(now.provider, now.remote_id);
       if (signal.aborted || this.ctx.disposed) return;
       this.joinFailed(rowId, e);
     }
@@ -503,6 +518,11 @@ export class RemoteFleet {
     const providerExp = created.expiresAt ? Date.parse(created.expiresAt) : NaN;
     const ownExp = this.ctx.now() + row0.lifetime_seconds * 1000;
     this.store.updateRemoteHost(rowId, { remote_id: created.hostId, expires_at: Number.isFinite(providerExp) ? Math.min(providerExp, ownExp) : ownExp });
+    // Left while create was in flight (pause, archive, unload): the new machine has no use.
+    if (signal.aborted || this.store.remoteHost(rowId)?.state === "gone") {
+      await this.destroy(row0.provider, created.hostId);
+      return;
+    }
     this.store.event(study.id, "remote.created", "plugin", { remote: rowId, host: row0.bench_host_id, provider: row0.provider, slot: row0.slot, state: created.state });
     if (signal.aborted) return;
     let state = created.state;
@@ -729,7 +749,8 @@ export class RemoteFleet {
             const mine = live.filter((r) => r.slot === slot);
             if (mine.some((r) => r.state === "ready" || this.joined.has(r.id))) continue;
             const f = this.failures.get(this.failureKey(study.id, i));
-            if (f && (f.seedKey !== undefined || f.n >= this.config.maxFailures)) problems.push(`remote bench ${i + 1} (${e.provider}) slot ${k}: ${clip(f.last, 400)}`);
+            const seedBlocked = f?.seedKey !== undefined && f.seedKey === this.seedKey(study, baseline);
+            if (f && (seedBlocked || (f.seedKey === undefined && f.n >= this.config.maxFailures))) problems.push(`remote bench ${i + 1} (${e.provider}) slot ${k}: ${clip(f.last, 400)}`);
             else waiting = true;
           }
         });
