@@ -4,6 +4,8 @@
 // differ by shape as well as color (win ●, lose ×, other ○). Plain SVG;
 // colors come from text tokens through currentColor.
 import { useMemo, useState } from "react";
+import { niceTicks, pctTickDigits, trendDomain } from "../chart.ts";
+import { useBoxWidth } from "./useBoxWidth.ts";
 import { cn } from "@/lib/utils";
 import { improvementText, pct, VERDICT, VERDICT_TONE, type MetricInfo } from "./format.ts";
 
@@ -12,9 +14,32 @@ export interface TrajectoryData {
   steps: Array<{ n: number; value: number }>;
 }
 
-const W = 640;
 const H = 220;
-const PAD = { l: 52, r: 12, t: 12, b: 26 };
+const PAD = { l: 52, r: 12, t: 12, b: 30 };
+/** Pixel font size of the axis labels: the chart draws at its box's width, so text never scales with it. */
+const FONT = 10;
+
+/**
+ * The chart's axes: nice y ticks (round percentages, the domain widened to
+ * them) and candidate-number ticks on x. Pure, for tests.
+ */
+export function trajectoryAxes(data: TrajectoryData, lastN: number, direction: MetricInfo["direction"], width: number) {
+  const maxN = Math.max(1, lastN, ...data.points.map((p) => p.n));
+  const ys = [0, ...data.points.map((p) => p.position), ...data.steps.map((s) => s.value)];
+  let lo = Math.min(...ys);
+  let hi = Math.max(...ys);
+  if (hi - lo < 0.02) {
+    lo -= 0.01;
+    hi += 0.01;
+  }
+  // A reduction can't pass 100%: don't draw ticks above it for lower-is-better metrics.
+  if (direction === "lower") hi = Math.min(hi, 1);
+  const y = niceTicks(lo, hi, 5);
+  const plotW = Math.max(40, width - PAD.l - PAD.r);
+  const x = niceTicks(0, maxN, Math.max(2, Math.min(10, Math.floor(plotW / 60))), { integer: true });
+  const xTicks = x.ticks.filter((n) => n >= 1 && n <= maxN);
+  return { maxN, yTicks: y.ticks, yLo: y.lo, yHi: y.hi, yDigits: pctTickDigits(y.step), xTicks };
+}
 
 function Mark({ verdict, x, y, big }: { verdict: string; x: number; y: number; big: boolean }) {
   const r = big ? 5 : 3.6;
@@ -31,22 +56,12 @@ function Mark({ verdict, x, y, big }: { verdict: string; x: number; y: number; b
 
 export function TrajectoryChart({ data, metric, lastN, onSelect }: { data: TrajectoryData; metric: MetricInfo; lastN: number; onSelect?: (n: number) => void }) {
   const [hover, setHover] = useState<number | null>(null);
+  const [box, W] = useBoxWidth(640);
   const geo = useMemo(() => {
-    const maxN = Math.max(1, lastN, ...data.points.map((p) => p.n));
-    const ys = [0, ...data.points.map((p) => p.position), ...data.steps.map((s) => s.value)];
-    let lo = Math.min(...ys);
-    let hi = Math.max(...ys);
-    if (hi - lo < 0.02) {
-      lo -= 0.01;
-      hi += 0.01;
-    }
-    const padY = (hi - lo) * 0.08;
-    lo -= padY;
-    // A reduction can't pass 100%: don't draw ticks above it for lower-is-better metrics.
-    hi = metric.direction === "lower" ? Math.min(hi + padY, Math.max(hi, 1)) : hi + padY;
+    const a = trajectoryAxes(data, lastN, metric.direction, W);
+    const { maxN, yLo: lo, yHi: hi } = a;
     const x = (n: number) => PAD.l + (n / maxN) * (W - PAD.l - PAD.r);
     const y = (v: number) => PAD.t + (1 - (v - lo) / (hi - lo)) * (H - PAD.t - PAD.b);
-    const ticks = Array.from({ length: 5 }, (_, i) => lo + ((hi - lo) * i) / 4);
     let path = `M ${x(0)} ${y(0)}`;
     let cur = 0;
     for (const s of data.steps.slice(1)) {
@@ -54,26 +69,36 @@ export function TrajectoryChart({ data, metric, lastN, onSelect }: { data: Traje
       cur = s.value;
     }
     path += ` H ${x(maxN)}`;
-    return { x, y, ticks, path, maxN, cur };
-  }, [data, lastN, metric.direction]);
+    return { x, y, ticks: a.yTicks, digits: a.yDigits, xTicks: a.xTicks, path, maxN, cur };
+  }, [data, lastN, metric.direction, W]);
   const hovered = hover !== null ? data.points.find((p) => p.n === hover) : undefined;
   return (
-    <div className="relative">
-      <svg viewBox={`0 0 ${W} ${H}`} className="h-auto w-full" role="img" aria-label={`Trajectory: ${data.points.length} measured candidates; best is ${improvementText(geo.cur, metric)} than base`}>
+    <div className="relative" ref={box}>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label={`Trajectory: ${data.points.length} measured candidates; best is ${improvementText(geo.cur, metric)} than base`}>
         <g className="text-border">
           {geo.ticks.map((t) => (
             <g key={t}>
               <line x1={PAD.l} x2={W - PAD.r} y1={geo.y(t)} y2={geo.y(t)} stroke="currentColor" strokeWidth={1} />
-              <text x={PAD.l - 6} y={geo.y(t) + 3} textAnchor="end" className="fill-muted-foreground text-[10px]">
-                {pct(t)}
+              <text x={PAD.l - 6} y={geo.y(t) + 3} textAnchor="end" className="fill-muted-foreground" style={{ fontSize: FONT }}>
+                {t === 0 ? "0%" : pct(t, geo.digits)}
               </text>
             </g>
           ))}
           <line x1={PAD.l} x2={W - PAD.r} y1={geo.y(0)} y2={geo.y(0)} stroke="currentColor" strokeWidth={1.5} strokeDasharray="3 3" className="text-muted-foreground/60" />
         </g>
-        <text x={W - PAD.r} y={H - 6} textAnchor="end" className="fill-muted-foreground text-[10px]">
-          candidate #
-        </text>
+        <g className="fill-muted-foreground" style={{ fontSize: FONT }} data-x-axis>
+          {geo.xTicks.map((n) => (
+            <g key={n}>
+              <line x1={geo.x(n)} x2={geo.x(n)} y1={H - PAD.b} y2={H - PAD.b + 3} stroke="currentColor" className="text-border" />
+              <text x={geo.x(n)} y={H - PAD.b + 13} textAnchor="middle">
+                {n}
+              </text>
+            </g>
+          ))}
+          <text x={(PAD.l + W - PAD.r) / 2} y={H - 3} textAnchor="middle">
+            candidate (c/N)
+          </text>
+        </g>
         <path d={geo.path} fill="none" stroke="currentColor" strokeWidth={2} className="text-foreground" />
         {data.points.map((p) => (
           <g
@@ -123,11 +148,8 @@ export function Sparkline({ points, label }: { points: Array<{ n: number; value:
   const xs = points.map((p) => p.n);
   const ys = points.map((p) => p.value);
   const [x0, x1] = [Math.min(...xs), Math.max(...xs) || 1];
-  let [y0, y1] = [Math.min(...ys), Math.max(...ys)];
-  if (y1 - y0 < 1e-12) {
-    y0 -= 1;
-    y1 += 1;
-  }
+  // At least 5% of the values' size: a change of a fraction of a percent stays flat instead of filling the height.
+  const [y0, y1] = trendDomain(ys);
   const d = points.map((p, i) => `${i ? "L" : "M"} ${(((p.n - x0) / (x1 - x0 || 1)) * (w - 4) + 2).toFixed(1)} ${(h - 2 - ((p.value - y0) / (y1 - y0)) * (h - 4)).toFixed(1)}`).join(" ");
   return (
     <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} role="img" aria-label={`${label}: ${points.map((p) => p.value.toPrecision(4)).join(", ")}`} className="text-muted-foreground">

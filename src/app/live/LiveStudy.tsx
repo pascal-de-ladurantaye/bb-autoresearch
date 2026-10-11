@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { bandEnd, type MeasureBand } from "../../band.ts";
-import { COLUMN_INFO, COLUMNS, PHASE_INFO, PHASE_STEPS, progressText, REBASE_NOTICE_MS, STAGE_LABEL, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
+import { benchHealthText, COLUMN_INFO, COLUMNS, ordinal, PHASE_INFO, PHASE_STEPS, progressText, queuePosition, REBASE_NOTICE_MS, STAGE_LABEL, workerCountText, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
 import { improvementText } from "../../present.ts";
 import { VERDICT } from "../format.ts";
 import { EmptyState, ErrorLine, FOCUS_RING, Skeleton, StatePill } from "../ui.tsx";
@@ -264,7 +264,7 @@ function LiveHeader({ v, now, compact, mode, flowing, onOpenBeside, onReplay }: 
             )}
           </div>
           <div className="text-xs tabular-nums text-muted-foreground">
-            {v.counts.candidates} of {v.counts.maxCandidates} candidates · {v.counts.workers} worker{v.counts.workers === 1 ? "" : "s"} (up to {v.counts.targetWorkers})
+            {v.counts.candidates} of {v.counts.maxCandidates} candidates · {workerCountText(v.workers.map((w) => w.phase), v.counts.targetWorkers)}
           </div>
         </div>
       </div>
@@ -342,7 +342,7 @@ function WorkerLanes({ v, now, compact, selected, onSelect, state, transcript }:
         <ul className="space-y-1.5">
           {workers.map((w) => (
             <li key={w.key}>
-              <Lane w={w} now={now} compact={compact} selected={selected === w.key} onSelect={() => onSelect(w.key)} rebasing={rebasing?.has(w.key) ?? false} />
+              <Lane w={w} queue={v.queue} now={now} compact={compact} selected={selected === w.key} onSelect={() => onSelect(w.key)} rebasing={rebasing?.has(w.key) ?? false} />
             </li>
           ))}
         </ul>
@@ -355,15 +355,17 @@ function WorkerLanes({ v, now, compact, selected, onSelect, state, transcript }:
   );
 }
 
-function Lane({ w, now, compact, selected, onSelect, rebasing }: { w: LiveWorker; now: number; compact: boolean; selected: boolean; onSelect: () => void; rebasing: boolean }) {
+function Lane({ w, queue, now, compact, selected, onSelect, rebasing }: { w: LiveWorker; queue: readonly number[]; now: number; compact: boolean; selected: boolean; onSelect: () => void; rebasing: boolean }) {
   const info = PHASE_INFO[w.phase];
   const inPhase = now - w.phaseAt;
   const total = now - w.spawnedAt;
   const titleRef = useFlip<HTMLSpanElement>(`idea-${w.ideaId ?? `w${w.key}`}`);
   const flash = useFlash(w.phase, 1200);
+  // The same position as the Queue card: both read the view's bench queue.
+  const qpos = w.candidateStage === "queued" ? (queuePosition(queue, w.candidate) ?? w.queuePosition) : null;
   const waitingOn =
     w.candidate !== null && w.candidateStage && w.candidateStage !== "decided"
-      ? `c/${w.candidate} ${w.candidateStage === "queued" && w.queuePosition ? `queued, ${ordinal(w.queuePosition)} for the bench` : STAGE_LABEL[w.candidateStage]}`
+      ? `c/${w.candidate} ${w.candidateStage === "queued" && qpos ? `queued, ${ordinal(qpos)} in line` : STAGE_LABEL[w.candidateStage]}`
       : w.candidate !== null
         ? `last: c/${w.candidate}`
         : null;
@@ -545,7 +547,8 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
   const flash = useFlash(c.verdict, 2200);
   const vd = c.verdict ? (VERDICT[c.verdict] ?? { label: c.verdict, icon: "Circle", tone: "text-muted-foreground" }) : null;
   const elapsed = clock(now - c.stageAt);
-  const qpos = c.stage === "queued" ? v.queue.indexOf(c.n) + 1 : 0;
+  // One source of truth for queue positions: the view's bench queue (the lanes read the same).
+  const qpos = c.stage === "queued" ? (queuePosition(v.queue, c.n) ?? 0) : 0;
   const band = v.bands.find((b) => b.n === c.n) ?? null;
   const pairsText = (p: Pairs, opts: { short?: boolean; spoken?: boolean } = {}) => progressText(p, v.noise, { ...opts, band });
   const detail =
@@ -666,7 +669,7 @@ function BenchStrip({ v, now, compact, onOpenCandidate }: { v: LiveView; now: nu
 
 function BenchHost({ h, now, compact, noise, band, onOpenCandidate }: { h: LiveBenchHost; now: number; compact: boolean; noise: LiveView["noise"]; band: MeasureBand | null; onOpenCandidate: (n: number) => void }) {
   const cur = h.current;
-  const health = h.status === "offline" ? "offline" : h.deferredUntil ? "waiting for the machine to calm down" : h.healthOk === false ? "unhealthy" : h.healthOk ? "healthy" : "not checked yet";
+  const health = benchHealthText(h);
   return (
     <div className={cn("rounded-lg border border-border bg-card px-3 py-2", compact && "px-2.5")}>
       <div className="flex items-center gap-2 text-sm">
@@ -873,12 +876,6 @@ function CalmState({ v, onOpenOverview, onOpenCandidate, onReplay, now, compact 
 }
 
 // --------------------------------------------------------------- helpers
-
-function ordinal(n: number): string {
-  const s = ["th", "st", "nd", "rd"];
-  const v = n % 100;
-  return `${n}${s[(v - 20) % 10] ?? s[v] ?? s[0]}`;
-}
 
 function hhmm(at: number): string {
   const d = new Date(at);

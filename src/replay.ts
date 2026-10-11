@@ -12,8 +12,10 @@ import { feedItems } from "./live-feed.ts";
 import {
   bandShown,
   bestHistory,
+  benchQueueOrder,
   columnOf,
   mergeProgress,
+  queuePosition,
   rebaseLanes,
   reducePairs,
   utilization,
@@ -42,7 +44,8 @@ export interface ReplayBundle {
   start: number;
   end: number;
   now: number;
-  spec: { maxCandidates: number; maxSubmissions: number; maxWorkers: number; noise?: NoiseClass };
+  /** `healthChecks`: the spec's [oracle.health] enabled (missing in older bundles: assume on). */
+  spec: { maxCandidates: number; maxSubmissions: number; maxWorkers: number; noise?: NoiseClass; healthChecks?: boolean };
   /** Single-machine mode as configured now (not historical): gates hold the bench lock. */
   singleMachine?: { text: string; quietBench: boolean } | null;
   hosts: Array<{ hostId: string; name: string }>;
@@ -94,6 +97,7 @@ export const REPLAY_VIEW_KINDS = [
   "bench.offline",
   "bench.healthy",
   "bench.unhealthy",
+  "bench.health",
 ] as const;
 
 /** The kinds the live feed reads (the same list as the server's live view, so both tell the same story). */
@@ -219,6 +223,8 @@ export class ReplayModel {
   private readonly keyByThread = new Map<string, number>();
   private readonly bandByN = new Map<number, MeasureBand>();
   private readonly hostName = new Map<string, string>();
+  /** Whether the study recorded every health check as an event (v0.2.3 on); older studies only have unhealthy streaks. */
+  private readonly healthRecorded: boolean;
   readonly keyframeEvery: number;
 
   constructor(
@@ -238,6 +244,7 @@ export class ReplayModel {
     }
     for (const b of bundle.bands) this.bandByN.set(b.n, b);
     for (const h of bundle.hosts) this.hostName.set(h.hostId, h.name);
+    this.healthRecorded = bundle.events.some((e) => e.kind === "bench.health");
     // Times, made non-decreasing so a binary search is valid even if the clock stepped back.
     this.ats = [];
     let max = Number.NEGATIVE_INFINITY;
@@ -444,6 +451,10 @@ export class ReplayModel {
       case "bench.unhealthy":
         if (str(d.host)) s.hostStatus[str(d.host)!] = { status: s.hostStatus[str(d.host)!]?.status ?? "online", healthOk: e.kind === "bench.healthy" };
         break;
+      case "bench.health":
+        // Every check's result (recorded since v0.2.3).
+        if (str(d.host) && typeof d.ok === "boolean") s.hostStatus[str(d.host)!] = { status: s.hostStatus[str(d.host)!]?.status ?? "online", healthOk: d.ok };
+        break;
     }
   }
 
@@ -467,7 +478,11 @@ export class ReplayModel {
       }
     }
     const queued = cands.filter((c) => c.stage === "queued").sort((x, y) => (x.queuedAt ?? 0) - (y.queuedAt ?? 0) || x.id - y.id);
-    const onBench = cands.filter((c) => c.stage === "measuring" || c.stage === "confirming").length;
+    // Single-machine mode: candidates waiting to test share the bench queue (oldest first).
+    const testingN = new Set(Object.values(s.gates).map((g) => g.n));
+    const waitingTests = b.singleMachine ? inFlight.filter((c) => c.stage === "gating" && !testingN.has(c.n)) : [];
+    const benchQueue = benchQueueOrder([...waitingTests, ...queued].map((c) => ({ id: c.id, n: c.n, stage: c.stage, queuedAt: c.queuedAt, submittedAt: c.submittedAt })));
+    const queueNs = benchQueue.map((c) => c.n);
     const card = (c: RC): LiveCard => {
       const meta = this.candByN.get(c.n);
       return {
@@ -499,7 +514,7 @@ export class ReplayModel {
         const thread = w.threadId ?? null;
         const latestN = s.latestByWorker[w.key] ?? null;
         const latest = latestN !== null ? s.cands[latestN] : undefined;
-        const qpos = latest?.stage === "queued" ? queued.findIndex((q) => q.n === latest.n) + 1 + onBench : null;
+        const qpos = latest?.stage === "queued" ? queuePosition(queueNs, latest.n) : null;
         return {
           key: w.key,
           threadId: thread,
@@ -517,10 +532,6 @@ export class ReplayModel {
           action: w.action,
         };
       });
-    // Single-machine mode: candidates waiting to test share the bench queue (oldest first).
-    const testingN = new Set(Object.values(s.gates).map((g) => g.n));
-    const waitingTests = b.singleMachine ? inFlight.filter((c) => c.stage === "gating" && !testingN.has(c.n)) : [];
-    const benchQueue = [...waitingTests, ...queued].sort((x, y) => (x.queuedAt ?? x.submittedAt) - (y.queuedAt ?? y.submittedAt) || x.id - y.id);
     const bench: LiveBenchHost[] = b.hosts.map((h) => {
       const m = inFlight.find((c) => c.host === h.hostId && (c.stage === "measuring" || c.stage === "confirming" || c.stage === "promoting"));
       const st = s.hostStatus[h.hostId];
@@ -530,6 +541,8 @@ export class ReplayModel {
         name: h.name,
         status: st?.status ?? "online",
         healthOk: st?.healthOk ?? null,
+        // No result at t: checks are off, the study predates health events ("health not recorded"), or none ran yet.
+        healthRecord: b.spec.healthChecks === false ? ("off" as const) : this.healthRecorded ? null : ("missing" as const),
         deferredUntil: null,
         current: m
           ? { kind: "measure" as const, n: m.n, stage: m.stage, pairs: cardByN.get(m.n)?.pairs ?? null, startedAt: m.startedAt ?? m.queuedAt ?? m.submittedAt }
@@ -565,7 +578,7 @@ export class ReplayModel {
       studyId: b.studyId,
       slug: b.slug,
       state: s.state,
-      statusLine: replayStatusLine(s.state, workers.length, measuring, { queued: queued.length, inTests }, s.pauseReason, Object.values(s.gates).filter((g) => s.cands[g.n]?.stage === "gating").map((g) => `c/${g.n}`)),
+      statusLine: replayStatusLine(s.state, workers.map((w) => w.phase), measuring, { queued: queued.length, inTests }, s.pauseReason, Object.values(s.gates).filter((g) => s.cands[g.n]?.stage === "gating").map((g) => `c/${g.n}`)),
       metric,
       noise: b.spec.noise ?? "noisy",
       now: t,
@@ -580,10 +593,10 @@ export class ReplayModel {
         history,
         rebases: s.best !== null ? rebaseLanes(workers, winnerKey) : [],
       },
-      counts: { candidates: s.candCount, maxCandidates: b.spec.maxCandidates, workers: workers.length, targetWorkers: w, queue: queued.length },
+      counts: { candidates: s.candCount, maxCandidates: b.spec.maxCandidates, workers: workers.length, finishing: workers.filter((x) => x.phase === "finishing").length, targetWorkers: w, queue: queued.length },
       workers,
       cards,
-      queue: benchQueue.map((c) => c.n),
+      queue: queueNs,
       queueTests: benchQueue.filter((c) => c.stage === "gating").map((c) => c.n),
       singleMachine: b.singleMachine ?? null,
       bench,
@@ -645,10 +658,11 @@ export function nextMilestone(milestones: readonly Milestone[], t: number, kind:
 }
 
 /** The status line at a replayed moment (the live one also reads the harvest and pause details from the database). */
-export function replayStatusLine(state: string, workers: number, measuring: readonly string[], waiting: { queued: number; inTests: number }, pauseReason: string | null, testing: readonly string[] = []): string {
+export function replayStatusLine(state: string, phases: readonly string[], measuring: readonly string[], waiting: { queued: number; inTests: number }, pauseReason: string | null, testing: readonly string[] = []): string {
+  const workers = phases.length;
   switch (state) {
     case "running":
-      return runningStatusText(workers, measuring, waiting.queued, waiting.inTests, testing);
+      return runningStatusText(phases, measuring, waiting.queued, waiting.inTests, testing);
     case "paused":
       return `Paused: ${clip(pauseReason ?? "no reason recorded", 200)}.${workers ? ` ${workers} worker${workers === 1 ? "" : "s"} finishing.` : ""}`;
     case "harvesting":

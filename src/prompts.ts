@@ -236,7 +236,15 @@ const TRIGGER_TEXT: Record<RoundTrigger, string> = {
   human: "the human sent a message",
 };
 
+/** The human's own control actions (control.* notices: pauses, ideas added from the CLI, approvals): an audit trail, never something that needs them. */
+export function isControlNotice(kind: string): boolean {
+  return kind.startsWith("control.");
+}
+
 export function strategistDigest(d: DigestInput): AgentMessage {
+  // Only notices that need the human count as "for you"; their own controls are listed for the strategist, apart.
+  const forHuman = d.notices.filter((n) => !isControlNotice(n.kind));
+  const controls = d.notices.filter((n) => isControlNotice(n.kind));
   const queued = d.ideas.filter((i) => i.status === "queued");
   const running = d.ideas.filter((i) => i.status === "running");
   const counts = new Map<string, number>();
@@ -257,7 +265,7 @@ export function strategistDigest(d: DigestInput): AgentMessage {
   const summary =
     `[autoresearch] Strategist round ${d.round} (${TRIGGER_TEXT[d.trigger]}): ${verdictSummary}` +
     `${wins.length ? `, best now ${improvementText(d.cumulative, metric)} vs base` : d.cumulative !== null ? `, best ${improvementText(d.cumulative, metric)} vs base` : ""}` +
-    ` · ${queued.length} idea${queued.length === 1 ? "" : "s"} queued · ${d.workers.length} worker${d.workers.length === 1 ? "" : "s"}${d.notices.length ? ` · ${d.notices.length} notice${d.notices.length === 1 ? "" : "s"} for you on the Studies page` : ""}` +
+    ` · ${queued.length} idea${queued.length === 1 ? "" : "s"} queued · ${d.workers.length} worker${d.workers.length === 1 ? "" : "s"}${forHuman.length ? ` · ${forHuman.length} notice${forHuman.length === 1 ? "" : "s"} for you on the Studies page` : ""}` +
     `${tight.length ? ` · guardrail ${tight.join(", ")} near its total limit` : ""}.`;
   const lines = [
     `Strategist round ${d.round} · study \`${d.study.slug}\` · trigger: ${TRIGGER_TEXT[d.trigger]}`,
@@ -273,9 +281,14 @@ export function strategistDigest(d: DigestInput): AgentMessage {
       : []),
     "",
   ];
-  if (d.notices.length) {
-    lines.push(`## Notices for the human (${d.notices.length})`, "Relay these to the human in one or two lines; do not act on them yourself.");
-    for (const n of d.notices.slice(0, 10)) lines.push(`- ${new Date(n.at).toISOString().slice(0, 16).replace("T", " ")} [${n.kind}] ${quoted(n.text, 500)}`);
+  if (forHuman.length) {
+    lines.push(`## Notices for the human (${forHuman.length})`, "Relay these to the human in one or two lines; do not act on them yourself.");
+    for (const n of forHuman.slice(0, 10)) lines.push(`- ${new Date(n.at).toISOString().slice(0, 16).replace("T", " ")} [${n.kind}] ${quoted(n.text, 500)}`);
+    lines.push("");
+  }
+  if (controls.length) {
+    lines.push(`## The human's own controls (${controls.length}, audit trail)`, "Actions taken from the study page or the CLI. They need nothing from the human: don't count or relay them as notices; mention one only if it looks like something the human wouldn't have done.");
+    for (const n of controls.slice(0, 10)) lines.push(`- ${new Date(n.at).toISOString().slice(0, 16).replace("T", " ")} [${n.kind}] ${quoted(n.text, 300)}`);
     lines.push("");
   }
   if (d.trigger === "stall") {

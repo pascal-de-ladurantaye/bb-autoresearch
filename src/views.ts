@@ -7,6 +7,7 @@ import type { StackRecord } from "./harvest.ts";
 import { checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
 import { singleMachineText } from "./single-machine.ts";
+import { benchQueueOrder, queuePosition } from "./live-model.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { accountingFor, standaloneText } from "./report.ts";
 import { oracleHash, type StudySpec } from "./spec.ts";
@@ -27,6 +28,7 @@ import {
   isPointCi,
   noiseFloorText,
   runningStatusText,
+  effectStatisticText,
   valueWithUnit,
   verdictCause,
   vsBaseFromVsBest,
@@ -144,6 +146,19 @@ export function gatesOnBench(engine: Engine, s: StudyRow): Array<{ hostId: strin
     if (c) out.push({ hostId: i.host_id, n: c.n, candidateId: c.id, startedAt: i.started_at });
   }
   return out;
+}
+
+/**
+ * A candidate's place in the shared bench queue (1 = next), the same order
+ * the Live view's queue, lanes and cards show (live-model.ts benchQueueOrder):
+ * queued candidates and, in single-machine mode, the ones waiting to test.
+ */
+export function benchQueuePosition(engine: Engine, s: StudyRow, n: number): number | null {
+  const { store } = engine.ctx;
+  const testing = gatesOnBench(engine, s);
+  const serialized = Boolean(singleMachineView(engine, s)?.serialized);
+  const rows = store.candidates(s.id, { stages: serialized ? ["gating", "queued"] : ["queued"] }).filter((c) => c.stage === "queued" || !testing.some((g) => g.candidateId === c.id));
+  return queuePosition(benchQueueOrder(rows.map((c) => ({ id: c.id, n: c.n, queuedAt: c.queued_at, submittedAt: c.submitted_at }))).map((c) => c.n), n);
 }
 
 /** Running periods [start, end) from the append-only state log. */
@@ -265,11 +280,7 @@ function workerPhase(engine: Engine, s: StudyRow, worker: ThreadRow): { phase: s
   const mine = store.workerCandidates(s.id, worker).find((c) => c.stage !== "decided" || c.reported_at === null);
   if (!mine && !worker.thread_id) return { phase: "spawning", candidate: null, position: null };
   if (!mine) return { phase: "thinking", candidate: null, position: null };
-  if (mine.stage === "queued") {
-    const queued = store.candidates(s.id, { stages: ["queued"] }).sort((a, b) => (a.queued_at ?? 0) - (b.queued_at ?? 0) || a.id - b.id);
-    const onBench = store.candidates(s.id, { stages: ["measuring", "confirming"] }).length;
-    return { phase: "queued", candidate: mine.n, position: queued.findIndex((c) => c.id === mine.id) + 1 + onBench };
-  }
+  if (mine.stage === "queued") return { phase: "queued", candidate: mine.n, position: benchQueuePosition(engine, s, mine.n) };
   if (mine.stage === "gating" && gatesOnBench(engine, s).some((g) => g.candidateId === mine.id)) return { phase: "testing on the bench", candidate: mine.n, position: null };
   return { phase: mine.stage === "decided" ? "verdict pending delivery" : mine.stage, candidate: mine.n, position: null };
 }
@@ -527,9 +538,24 @@ export async function candidateDetail(engine: Engine, s: StudyRow, n: number) {
     gateOutput: c.gate_output,
     changedPaths: (safeJson<string[]>(c.changed_paths_json) ?? []).slice(0, 200),
     samples,
+    /** The oracle's noise class: how to read the samples (pairs, a single run, baseline and screening runs). */
+    noise: spec?.oracle.noise ?? "noisy",
+    /** Which statistic the headline improvement is (it can differ from the change between the medians in the metrics table). */
+    effectStatistic: effectStatisticText(spec?.oracle.noise ?? "noisy"),
+    /** How the verdict formed: the measurement's CI band (the Live view's), null before the first sample. */
+    band: bandOrNull(engine, s, c),
+    hostName: c.bench_host_id ? (store.benchHost(s.id, c.bench_host_id)?.name ?? null) : null,
     diff,
     diffError,
   };
+}
+
+function bandOrNull(engine: Engine, s: StudyRow, c: CandidateRow) {
+  try {
+    return engine.live.bandFor(c, s);
+  } catch {
+    return null;
+  }
 }
 
 /** Header badge text for a study or worker thread; null for other threads. */
@@ -558,7 +584,7 @@ export function threadBadge(
   const spec = specOf(engine, s);
   const phase = workerPhase(engine, s, row);
   const where =
-    phase.phase === "queued" && phase.position !== null ? `queued ${ordinal(phase.position)}` : phase.phase === "thinking" ? (row.state === "active" ? "working" : row.state) : phase.phase;
+    phase.phase === "queued" && phase.position !== null ? `queued, ${ordinal(phase.position)} in line` : phase.phase === "thinking" ? (row.state === "active" ? "working" : row.state) : phase.phase;
   const text = `${s.slug} · idea #${row.idea_id ?? "?"} · submission ${row.submissions}/${spec?.agents.max_submissions_per_worker ?? "?"} · ${where}`;
   return { kind: "worker", slug: s.slug, state: s.state, tone: s.state === "running" ? "running" : s.state === "paused" ? "paused" : "idle", text, needsYou: 0, label: `Worker for study ${text}` };
 }
@@ -899,7 +925,8 @@ export function dependencyText(c: ChangesetRow, all: ChangesetRow[], baseBranch:
     else if (c.ablation_status === "gate_failed") out.push(`Reverting this from best breaks the gates unless ${list(neededBy)} ${neededBy.length === 1 ? "is" : "are"} reverted too, so it can't be measured alone.`);
     else out.push(`${list(neededBy)} build${neededBy.length === 1 ? "s" : ""} on this one.`);
   }
-  if (deps.length) out.push(`Builds on ${list(deps)}: reverting ${deps.length === 1 ? "it" : "them"} from best fails while this one stays.`);
+  // Name what can't be reverted: "it" read as this changeset.
+  if (deps.length) out.push(`Builds on ${list(deps)}: reverting ${list(deps)} from best fails while this changeset stays.`);
   if (c.stack !== null) {
     const members = all.filter((x) => x.stack === c.stack).sort((a, b) => a.k - b.k);
     out.push(`Ships in stack ${c.stack} (${members.map((m) => `#${m.k}`).join(" → ")})${c.pr_base && c.pr_base !== "base" ? `, as a PR stacked on ${c.pr_base}` : `, as the first PR, based on ${baseBranch}`}${c.contribution === null ? "; the stack's contribution is measured together" : ""}.`);
@@ -1181,7 +1208,7 @@ export interface GuardrailStatus {
   state: GuardrailState;
   /** "ok", "near limit", "inconclusive", "BROKEN", "not measured": text that carries the state without color. */
   label: string;
-  /** One sentence: "0.4% worse vs best (limit 5.0% worse) · 3.1% worse vs the segment base (total limit 10.0% worse)". */
+  /** One sentence: "0.4% worse than best (limit 5.0% worse) · 3.1% worse than the segment base (total limit 10.0% worse)". */
   text: string;
   against: "best" | "base";
   ci: { lo: number; hi: number } | null;
@@ -1202,10 +1229,11 @@ function guardrailCheck(regression: number, lo: number | null | undefined, hi: n
   return { regression, lo: c.lo, hi: c.hi, limit, used: Number.isFinite(used) ? used : null, state: c.state, headroom: limit - regression };
 }
 
-function checkText(c: GuardrailCheck, where: string, limitWord: string): string {
-  const change = Math.abs(c.regression) < 0.00005 ? "no change" : `${magnitudePct(c.regression, 1)} ${c.regression > 0 ? "worse" : "better"}`;
+/** "no change from best (limit 5.0% worse)", "3.1% worse than the segment base (CI …; total limit 10.0% worse)". */
+function checkText(c: GuardrailCheck, against: string, limitWord: string): string {
+  const change = Math.abs(c.regression) < 0.00005 ? `no change from ${against}` : `${magnitudePct(c.regression, 1)} ${c.regression > 0 ? "worse" : "better"} than ${against}`;
   const ci = rangeWords(c.lo, c.hi);
-  return `${change} ${where} (${ci ? `${ci}; ` : ""}${limitWord} ${magnitudePct(c.limit, 1)} worse)`;
+  return `${change} (${ci ? `${ci}; ` : ""}${limitWord} ${magnitudePct(c.limit, 1)} worse)`;
 }
 
 /**
@@ -1238,12 +1266,12 @@ export function guardrailStatus(g: GuardrailInput): GuardrailStatus {
   if (g.against === "base") {
     check = guardrailCheck(regression, ci?.lo, ci?.hi, totalLimit);
     cumulative = check;
-    text = `${checkText(check, "vs the segment base", "total limit")}${totalLimit !== g.limit ? ` · ${magnitudePct(g.limit, 1)} per step` : ""}`;
+    text = `${checkText(check, "the segment base", "total limit")}${totalLimit !== g.limit ? ` · ${magnitudePct(g.limit, 1)} per step` : ""}`;
   } else {
     check = guardrailCheck(regression, ci?.lo, ci?.hi, g.limit);
     const cum = g.cumulative;
     if (cum && finiteNum(cum.regression)) cumulative = guardrailCheck(cum.regression, cum.lo, cum.hi, finiteNum(cum.limit) ? cum.limit : totalLimit);
-    text = checkText(check, "vs best", "limit") + (cumulative ? ` · ${checkText(cumulative, "vs the segment base", "total limit")}` : "");
+    text = checkText(check, "best", "limit") + (cumulative ? ` · ${checkText(cumulative, "the segment base", "total limit")}` : "");
   }
   const checks = [check, ...(cumulative && cumulative !== check ? [cumulative] : [])];
   const usedList = checks.map((c) => c.used).filter((u): u is number => u !== null);
@@ -1600,7 +1628,10 @@ function unhealthySince(engine: Engine, s: StudyRow, hostId: string): number | n
 /** One plain sentence: what the study is doing right now. */
 export function statusLine(engine: Engine, s: StudyRow): string {
   const { store } = engine.ctx;
-  const live = store.threads(s.id, { role: "worker", states: ["spawning", "active", "finishing"] }).length;
+  const liveRows = store.threads(s.id, { role: "worker", states: ["spawning", "active", "finishing"] });
+  const live = liveRows.length;
+  // What each live worker is doing: its recorded phase (the live view's), else what its state says.
+  const phases = liveRows.map((w) => w.phase ?? (w.state === "spawning" ? "starting" : w.state === "finishing" ? "finishing" : "working"));
   const measuring = store.candidates(s.id, { stages: ["measuring", "confirming"] }).map((c) => `c/${c.n}`);
   const testing = gatesOnBench(engine, s).map((g) => `c/${g.n}`);
   switch (s.state) {
@@ -1609,7 +1640,7 @@ export function statusLine(engine: Engine, s: StudyRow): string {
     case "calibrating":
       return s.calibration_status === "running" ? "Calibrating: gates on the base commit, then A/A measurements to learn the noise." : s.calibration_status === "ready" ? "Calibration finished: review it and start the study." : "Calibrating.";
     case "running":
-      return runningStatusText(live, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length, testing);
+      return runningStatusText(phases, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length, testing);
     case "paused": {
       const p = pauseInfo(engine, s);
       return `Paused${p.system ? " by the system" : " by you"}: ${clip(s.pause_reason ?? "no reason recorded", 200)}.${live ? ` ${live} worker${live === 1 ? "" : "s"} finishing.` : ""}`;
@@ -1626,21 +1657,38 @@ export function statusLine(engine: Engine, s: StudyRow): string {
 }
 
 /** The action a notice asks for: a tab of the study page and the CLI equivalent. Control notices are an audit trail and ask for nothing. */
-export function noticeAction(kind: string, s: Pick<StudyRow, "slug">): { label: string; tab: "overview" | "oracle" | "bench" | "harvest" | "ideas" | "candidates"; command: string | null } | null {
+/**
+ * The action a notice asks for, given the study's state now: a notice is
+ * stored once, but the step it named may be done or under way (a harvest
+ * running after "budget used up", a started study after "calibration
+ * ready"), so the button follows the state instead of offering a stale action.
+ */
+export function noticeAction(
+  kind: string,
+  s: Pick<StudyRow, "slug"> & Partial<Pick<StudyRow, "state" | "calibration_status" | "calibration_approved_at" | "pending_spec_version">>,
+  harvest: { state: string } | null = null,
+): { label: string; tab: "overview" | "oracle" | "bench" | "harvest" | "ideas" | "candidates"; command: string | null } | null {
   const slug = s.slug;
   if (kind.startsWith("control.")) return null;
+  const known = s.state !== undefined;
   switch (kind) {
     case "calibration.ready":
+      if (known && !(s.state === "calibrating" && s.calibration_status === "ready" && !s.calibration_approved_at)) return { label: "See calibration", tab: "oracle", command: `bb study show ${slug}` };
       return { label: "Review calibration and start", tab: "oracle", command: `bb study start ${slug}` };
     case "calibration.failed":
       return { label: "See what failed", tab: "oracle", command: `bb study show ${slug}` };
     case "spec.proposed":
+      if (known && s.pending_spec_version === null) return { label: "See the spec", tab: "oracle", command: `bb study show ${slug}` };
       return { label: "Review the pending spec", tab: "oracle", command: `bb study show ${slug}` };
     case "best.new":
       return { label: "See candidates", tab: "candidates", command: null };
     case "budget.threshold":
       return { label: "See budget", tab: "overview", command: `bb study show ${slug}` };
     case "budget.exhausted":
+      // Offer to start a harvest only while one can start (paused on the budget); once it runs or is ready, open it.
+      if (s.state === "harvesting") return { label: harvest?.state === "ready" ? "Review harvest" : "Open Harvest", tab: "harvest", command: `bb study harvest ${slug}` };
+      if (s.state === "archived") return harvest ? { label: "Open Harvest", tab: "harvest", command: `bb study harvest ${slug}` } : null;
+      if (known && s.state !== "paused") return { label: "See budget", tab: "overview", command: `bb study show ${slug}` };
       return { label: "Start harvest", tab: "harvest", command: `bb study harvest ${slug}` };
     case "oracle.broken":
     case "drift":
@@ -1663,6 +1711,7 @@ export function noticeAction(kind: string, s: Pick<StudyRow, "slug">): { label: 
 
 /** Notices for the page, newest first: the first line is the summary, the rest is detail. */
 export function noticesView(engine: Engine, s: StudyRow, limit = 30) {
+  const harvest = engine.ctx.store.latestHarvest(s.id) ?? null;
   return engine.ctx.store.notices(s.id, { limit }).map((n) => {
     const [first, ...rest] = n.text.split("\n");
     return {
@@ -1673,7 +1722,7 @@ export function noticesView(engine: Engine, s: StudyRow, limit = 30) {
       summary: clip(first ?? "", 400),
       detail: clip(rest.join("\n").trim(), 1200),
       text: clip(n.text, 1600),
-      action: noticeAction(n.kind, s),
+      action: noticeAction(n.kind, s, harvest),
       unseen: n.at > (s.notices_seen_at ?? 0),
       delivered: n.delivered_round !== null,
     };

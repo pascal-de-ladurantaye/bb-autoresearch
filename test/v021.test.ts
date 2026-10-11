@@ -127,9 +127,9 @@ describe("formatting (pure)", () => {
   });
 
   it("the status line counts a candidate on the bench as measured, not queued", () => {
-    expect(runningStatusText(2, ["c/3"], 0, 0)).toBe("Running: 2 workers editing, measuring c/3.");
-    expect(runningStatusText(1, ["c/3"], 1, 2)).toBe("Running: 1 worker editing, measuring c/3, 1 queued for the bench, 2 in tests.");
-    expect(replayStatusLine("running", 2, ["c/3"], { queued: 0, inTests: 0 }, null)).toBe("Running: 2 workers editing, measuring c/3.");
+    expect(runningStatusText(["editing", "editing"], ["c/3"], 0, 0)).toBe("Running: 2 workers editing; measuring c/3.");
+    expect(runningStatusText(["editing"], ["c/3"], 1, 2)).toBe("Running: 1 worker editing; measuring c/3, 1 queued for the bench, 2 in tests.");
+    expect(replayStatusLine("running", ["editing", "measuring"], ["c/3"], { queued: 0, inTests: 0 }, null)).toBe("Running: 2 workers: 1 editing, 1 being measured; measuring c/3.");
   });
 
   it("the feed, deltas and replay events say a guardrail loss lost on the guardrail", () => {
@@ -257,7 +257,8 @@ describe("v0.2.1 (fake host)", () => {
     await submit("thr_w2", "TB", 950);
     await settle();
     expect(lines.length).toBeGreaterThan(0);
-    expect(lines[0]).toBe("Running: 2 workers editing, measuring c/1, 1 queued for the bench.");
+    // Workers are described by their phases: c/1's worker is being measured, c/2's waits for the bench.
+    expect(lines[0]).toBe("Running: 2 workers: 1 waiting for the bench, 1 being measured; measuring c/1, 1 queued for the bench.");
     expect(lines.join("\n")).not.toMatch(/in the bench queue/u);
   });
 

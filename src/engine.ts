@@ -1022,7 +1022,13 @@ export class Engine {
     const notices = this.store.notices(study.id, { undelivered: true, limit: 10 }).reverse();
     if (!notices.length) return;
     this.store.markNoticesDelivered(notices.map((n) => n.id), 0);
-    const text = [`[autoresearch] Notices for study \`${study.slug}\` (for the human; relay briefly):`, ...notices.map((n) => `- [${n.kind}] ${clip(n.text, 1500)}`)].join("\n");
+    // The human's own controls are an audit trail, not notices for them (prompts.ts isControlNotice).
+    const forHuman = notices.filter((n) => !n.kind.startsWith("control."));
+    const controls = notices.filter((n) => n.kind.startsWith("control."));
+    const text = [
+      ...(forHuman.length ? [`[autoresearch] Notices for study \`${study.slug}\` (for the human; relay briefly):`, ...forHuman.map((n) => `- [${n.kind}] ${clip(n.text, 1500)}`)] : [`[autoresearch] Study \`${study.slug}\`: no notices for the human.`]),
+      ...(controls.length ? [`The human's own controls (audit trail; nothing to relay unless one looks unexpected):`, ...controls.map((n) => `- [${n.kind}] ${clip(n.text, 300)}`)] : []),
+    ].join("\n");
     await this.ctx.bb.steer(threadId, text).catch(() => this.ctx.bb.send(threadId, text));
   }
 

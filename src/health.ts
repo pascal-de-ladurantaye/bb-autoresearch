@@ -65,6 +65,8 @@ export async function checkHealth(
   const a = assessHealth(report, policy);
   const now = ctx.now();
   store.addHealthCheck({ study_id: study.id, host_id: host.host_id, context, ok: a.ok ? 1 : 0, problems_json: JSON.stringify(a.problems), report_json: JSON.stringify(report) });
+  // Every result is also an event, so a replay shows the bench's health at any moment (append-only; since v0.2.3).
+  store.event(study.id, "bench.health", "plugin", { host: host.host_id, ok: a.ok, context });
   const fresh = store.benchHost(study.id, host.host_id) ?? host;
   if (a.ok) {
     store.updateBenchHost(study.id, host.host_id, { health_ok: 1, health_at: now, health_json: JSON.stringify({ summary: a.summary, problems: [] }), unhealthy_since: null, unhealthy_notified_at: null, deferred_until: null });

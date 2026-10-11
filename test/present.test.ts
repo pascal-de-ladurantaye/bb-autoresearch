@@ -110,7 +110,7 @@ describe("views: guardrail status (the one place the UI decides it)", () => {
     expect(guardrailStatus({ ...base, reference: 100, value: 104.5 })).toMatchObject({ state: "warn", label: "near limit" });
     expect(guardrailStatus({ ...base, reference: 100, value: 106 })).toMatchObject({ state: "broken", label: "BROKEN" });
     expect(guardrailStatus({ ...base, reference: null, value: 106 })).toMatchObject({ state: "missing", label: "not measured", regression: null });
-    expect(guardrailStatus({ ...base, reference: 100, value: 95 }).text).toBe("5.0% better vs best (limit 5.0% worse)");
+    expect(guardrailStatus({ ...base, reference: 100, value: 95 }).text).toBe("5.0% better than best (limit 5.0% worse)");
   });
   it("higher is better: a decrease is the regression", () => {
     const g = { name: "precision", direction: "higher" as const, limit: 0.05, against: "best" as const };
@@ -122,7 +122,7 @@ describe("views: guardrail status (the one place the UI decides it)", () => {
   });
   it("against the segment base: judged on the total limit with its CI", () => {
     const s = guardrailStatus({ ...base, against: "base", totalLimit: 0.1, reference: 100, value: 102, ci: { lo: 0.01, hi: 0.03 } });
-    expect(s.text).toBe("2.0% worse vs the segment base (CI 1.0% to 3.0% worse; total limit 10.0% worse) · 5.0% per step");
+    expect(s.text).toBe("2.0% worse than the segment base (CI 1.0% to 3.0% worse; total limit 10.0% worse) · 5.0% per step");
     expect(s.ci).toEqual({ lo: 0.01, hi: 0.03 });
     expect(s.cumulative).toMatchObject({ regression: 0.02, limit: 0.1, state: "ok", headroom: expect.closeTo(0.08, 9) });
     expect(s).toMatchObject({ state: "pass", used: expect.closeTo(0.2, 9) });

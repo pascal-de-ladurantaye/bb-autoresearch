@@ -203,7 +203,8 @@ describe("harvest (real git)", () => {
     expect(sh(repo, "remote")).toBe("");
     // PR body: what/why, contribution with CI, standalone effect, findings, study link.
     expect(a.pr_body).toMatch(/Contribution: [\d.]+% of the gain \(CI [\d.]+% to [\d.]+%\).* the study found \(\d+ pairs; ablation/u);
-    expect(a.pr_body).toContain("+15.69%");
+    expect(a.pr_body).toContain("best with this change reverted is 15.69% worse than best");
+    expect(a.pr_body).not.toMatch(/\+[\d.]+% worse/u);
     expect(a.pr_body).toContain("Alone on `main`, the study base: gates pass;");
     expect(a.pr_body).toContain("Finding #1");
     expect(a.pr_body).toContain(`studies/${SLUG}/harvest`);
@@ -222,7 +223,7 @@ describe("harvest (real git)", () => {
     expect(v.harvest!.changesets.find((c) => c.title === "Shrink c more")!.dependsOn).toEqual([3]);
     expect(v.harvest!.publishCommand).toBe(`bb study harvest ${SLUG} --publish`);
     const text = harvestText(engine, SLUG);
-    expect(text).toContain("Builds on #3: reverting it from best fails while this one stays.");
+    expect(text).toContain("Builds on #3: reverting #3 from best fails while this changeset stays.");
     expect(text).toContain("Reverting this from best conflicts with #4 (in src/c.txt)");
     expect(text).toMatch(/Measured gain:\s+36\.3% lower size/u);
     expect(text).toContain("#1 Shrink a [c/1] · 27.6% of the gain");

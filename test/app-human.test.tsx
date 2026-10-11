@@ -172,7 +172,7 @@ describe("frontend: human interface", () => {
     await page.findAllByText("20.0% lower size");
     expect(page.getByText(/1,000 → 800 bytes/u)).toBeTruthy();
     const sec = await page.findByLabelText("Secondary metrics");
-    expect(sec.textContent).toMatch(/rss.*guardrail · lower is better.*100 → 100.*no change vs the segment base.*ok/u);
+    expect(sec.textContent).toMatch(/rss.*guardrail · lower is better.*100 → 100.*no change from the segment base.*ok/u);
     const cands = await open("toy-size/candidates");
     const table = await cands.findByLabelText("Candidates");
     expect(table.textContent).toMatch(/c\/1.*win.*\+20\.0%.*ok \(1\)/u);
@@ -212,11 +212,11 @@ describe("frontend: human interface", () => {
     const list = await open("toy-size/candidates/1");
     expect((await list.findByLabelText("Candidates")).textContent).toContain("rss inconclusive");
     const metrics = await list.findByLabelText("Metrics");
-    expect(metrics.textContent).toMatch(/3\.0% worse vs best \(CI 1\.0% better to 7\.0% worse; limit 5\.0% worse\) · 3\.0% worse vs the segment base \(CI 1\.0% better to 7\.0% worse; total limit 5\.0% worse\).*inconclusive/u);
+    expect(metrics.textContent).toMatch(/3\.0% worse than best \(CI 1\.0% better to 7\.0% worse; limit 5\.0% worse\) · 3\.0% worse than the segment base \(CI 1\.0% better to 7\.0% worse; total limit 5\.0% worse\).*inconclusive/u);
     const ov = await open("toy-size/overview");
     const sec = await ov.findByLabelText("Secondary metrics");
     // c/1 is best: its step is the cumulative position (one promotion), straddling the 5% total limit.
-    expect(sec.textContent).toMatch(/3\.0% worse vs the segment base \(CI 1\.0% better to 7\.0% worse; total limit 5\.0% worse\).*inconclusive.*rss: 2\.0% of the 5\.0% total limit left \(best: 3\.0% worse than the segment base, CI 1\.0% better to 7\.0% worse\).*compounded over 1 promotion/u);
+    expect(sec.textContent).toMatch(/3\.0% worse than the segment base \(CI 1\.0% better to 7\.0% worse; total limit 5\.0% worse\).*inconclusive.*rss: 2\.0% of the 5\.0% total limit left \(best: 3\.0% worse than the segment base, CI 1\.0% better to 7\.0% worse\).*compounded over 1 promotion/u);
     // Oracle tab: calibrated guardrail noise, and a warning when it exceeds the limit.
     const cal = JSON.parse(s.calibration_json!) as Record<string, unknown>;
     store.updateStudy(s.id, {

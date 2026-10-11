@@ -126,7 +126,7 @@ describe("frontend: Live view part 2", () => {
     expect(c2.querySelector("[data-decision]")?.textContent).toBe("9 of 20");
     expect(c2.querySelectorAll("[data-seg]").length).toBe(7); // segments between the 8 points with a CI
     // Guardrails, compactly, with a running estimate.
-    expect(within(c2).getByRole("listitem", { name: /Guardrail rss: ok so far\. .*than best .*vs the 5\.0% limit · total .* vs 12\.0%/u })).toBeTruthy();
+    expect(within(c2).getByRole("listitem", { name: /Guardrail rss: ok so far\. .*than best .*, within the 5\.0% limit · in total .* than the segment base.*, within the 12\.0% total limit/u })).toBeTruthy();
     // Before n_min: no decision yet, said so.
     const c3 = within(section).getByRole("article", { name: "CI band of c/3" });
     expect(c3.textContent).toMatch(/Pair 3 of up to 20: no decision before pair 6/u);

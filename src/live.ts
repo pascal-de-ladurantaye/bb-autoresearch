@@ -17,7 +17,9 @@ import {
   bandShown,
   bestHistory,
   LIVE_CHANNEL,
+  benchQueueOrder,
   mergeProgress,
+  queuePosition,
   rebaseLanes,
   utilization,
   UTILIZATION_WINDOW_S,
@@ -320,6 +322,17 @@ export class LiveRecorder {
     this.bandPushed.delete(c.id);
   }
 
+  /**
+   * A candidate's band for its detail page: the stored band once measured
+   * (or recomputed for measurements from before bands were stored), the live
+   * one while it is on the bench, null before its first sample.
+   */
+  bandFor(c: CandidateRow, study: StudyRow): MeasureBand | null {
+    if (c.stage === "decided" || (c.stage === "promoting" && c.band_json)) return storedBand(this, this.ctx, study, c);
+    if (c.stage === "measuring" || c.stage === "confirming" || c.stage === "promoting") return this.band(c, study);
+    return null;
+  }
+
   dispose(): void {
     this.unsubscribe();
     this.bus.dispose();
@@ -454,8 +467,13 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const workerKeyOf = (c: CandidateRow): number | null => c.worker_id ?? (c.thread_id ? (workerKeyByThread.get(c.thread_id) ?? null) : null);
 
   const queuedRows = store.candidates(s.id, { stages: ["queued"] }).sort((a, b) => (a.queued_at ?? 0) - (b.queued_at ?? 0) || a.id - b.id);
-  const onBench = store.candidates(s.id, { stages: ["measuring", "confirming"] }).length;
   const inFlight = store.candidates(s.id, { stages: ["submitted", "gating", "queued", "measuring", "confirming", "promoting"] });
+  const testing = gatesOnBench(engine, s);
+  // Single-machine mode: candidates waiting to test share the bench queue, in its order (oldest first).
+  const sm = spec ? singleMachineView(engine, s) : null;
+  const waitingTests = sm?.serialized ? inFlight.filter((c) => c.stage === "gating" && !testing.some((g) => g.candidateId === c.id)) : [];
+  const benchQueue = benchQueueOrder([...waitingTests, ...queuedRows].map((c) => ({ id: c.id, n: c.n, stage: c.stage, queuedAt: c.queued_at, submittedAt: c.submitted_at })));
+  const queueNs = benchQueue.map((c) => c.n);
   const decided = store.decided(s.id, RECENT_DECIDED);
 
   // CI bands: measurements on the bench (from samples, incrementally) and ones that just ended (stored with the candidate).
@@ -496,7 +514,8 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
     .map((w) => {
       const latest = store.workerCandidates(s.id, w, { order: "desc", limit: 1 })[0];
       const idea = w.idea_id !== null ? ideas.get(w.idea_id) : undefined;
-      const qpos = latest?.stage === "queued" ? queuedRows.findIndex((q) => q.id === latest.id) + 1 + onBench : null;
+      // The same position the Queue card and the bench strip show (1 = next for the bench).
+      const qpos = latest?.stage === "queued" ? queuePosition(queueNs, latest.n) : null;
       return {
         key: w.id,
         threadId: w.thread_id,
@@ -519,7 +538,6 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const windowStart = now - UTILIZATION_WINDOW_S * 1000;
   const intervals = store.benchIntervals(s.id, { since: windowStart });
   const runningFrom = runningStart(store, s);
-  const testing = gatesOnBench(engine, s);
   const bench: LiveBenchHost[] = store.benchHosts(s.id).map((h) => {
     const m = measuringRows.find((c) => c.bench_host_id === h.host_id);
     const started = m ? lastAt(events, "measure.started", m.id) : null;
@@ -529,6 +547,7 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
       name: h.name,
       status: h.status,
       healthOk: h.health_ok === null ? null : h.health_ok === 1,
+      healthRecord: spec && !spec.oracle.health.enabled ? ("off" as const) : null,
       deferredUntil: h.deferred_until !== null && h.deferred_until > now ? h.deferred_until : null,
       current: m
         ? { kind: "measure" as const, n: m.n, stage: m.stage, pairs: cardByN.get(m.n)?.pairs ?? null, startedAt: started ?? m.queued_at ?? m.submitted_at }
@@ -540,11 +559,6 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
       ...utilization(intervals.filter((i) => i.host_id === h.host_id).map((i) => ({ start: i.started_at, end: i.ended_at })), now, runningFrom),
     };
   });
-
-  // Single-machine mode: candidates waiting to test share the bench queue, in its order (oldest first).
-  const sm = spec ? singleMachineView(engine, s) : null;
-  const waitingTests = sm?.serialized ? inFlight.filter((c) => c.stage === "gating" && !testing.some((g) => g.candidateId === c.id)) : [];
-  const benchQueue = [...waitingTests, ...queuedRows].sort((a, b) => (a.queued_at ?? a.submitted_at) - (b.queued_at ?? b.submitted_at) || a.id - b.id);
 
   // Up next: the queue in the scheduler's own pick order (theme cap and no-repeat rule included).
   const w = s.target_workers ?? engine.maxWorkers(s);
@@ -579,12 +593,13 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
       candidates: store.candidateCount(s.id),
       maxCandidates: spec?.budget.max_candidates ?? 0,
       workers: workers.length,
+      finishing: workers.filter((x) => x.phase === "finishing").length,
       targetWorkers: s.target_workers ?? engine.maxWorkers(s),
       queue: queuedRows.length,
     },
     workers,
     cards,
-    queue: benchQueue.map((c) => c.n),
+    queue: queueNs,
     queueTests: benchQueue.filter((c) => c.stage === "gating").map((c) => c.n),
     singleMachine: sm?.serialized ? { text: sm.text, quietBench: sm.quietBench } : null,
     bench,
@@ -707,7 +722,7 @@ export function replayBundle(engine: Engine, s: StudyRow): ReplayBundle {
     // A running study's replay reaches now; any other ends with its last event (no idle tail).
     end: s.state === "running" ? now : (events.at(-1)?.at ?? now),
     now,
-    spec: { maxCandidates: spec?.budget.max_candidates ?? 0, maxSubmissions: spec?.agents.max_submissions_per_worker ?? 0, maxWorkers: spec ? engine.maxWorkers(s) : 1, noise: spec?.oracle.noise ?? "noisy" },
+    spec: { maxCandidates: spec?.budget.max_candidates ?? 0, maxSubmissions: spec?.agents.max_submissions_per_worker ?? 0, maxWorkers: spec ? engine.maxWorkers(s) : 1, noise: spec?.oracle.noise ?? "noisy", healthChecks: spec ? spec.oracle.health.enabled : true },
     hosts: store.benchHosts(s.id).map((h) => ({ hostId: h.host_id, name: h.name })),
     ideas: ideas.map((i) => ({ id: i.id, title: i.title, theme: i.theme, source: i.source, variationOf: i.variation_of })),
     workers: store.threads(s.id, { role: "worker" }).map((w) => ({ key: w.id, threadId: w.thread_id, ideaId: w.idea_id, spawnedAt: w.spawned_at })),

@@ -43,6 +43,7 @@ import type { ComposeInput, ComposeResult } from "./host/contract.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { DryRunPublisher, type PrDraft } from "./publisher.ts";
 import { prBody, studyReport } from "./report.ts";
+import { clipWords } from "./present.ts";
 import { bestBranch, type StudySpec } from "./spec.ts";
 import { tail } from "./bench.ts";
 
@@ -681,7 +682,7 @@ export class Harvester {
       const branch = `studies/${study.slug}/harvest/h${h.id}/${String(cs.k).padStart(2, "0")}-${branchSlug(cs.title)}`;
       const base = cs.pr_base && cs.pr_base !== "base" ? changesets.find((c) => `#${c.k}` === cs.pr_base) : undefined;
       const baseBranch = base ? `studies/${study.slug}/harvest/h${h.id}/${String(base.k).padStart(2, "0")}-${branchSlug(base.title)}` : spec.study.base;
-      const title = clip(cs.title, 72);
+      const title = clipWords(cs.title, 72);
       const body = prBody(this.ctx, study, spec, h, cs, changesets);
       let status: ChangesetRow["pr_status"] = "drafted";
       if (cs.standalone_sha) {

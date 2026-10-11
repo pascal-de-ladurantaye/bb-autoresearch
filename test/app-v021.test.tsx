@@ -179,7 +179,7 @@ describe("frontend: v0.2.1 fixes", () => {
     const o = { workers: 0, targetWorkers: 2, maxWorkers: 3, maxWorkersOverride: null };
     expect(nowHint({ ...o, state: "draft" })).toBe("no workers before the study starts");
     expect(nowHint({ ...o, state: "calibrating" })).toBe("no workers before the study starts");
-    expect(nowHint({ ...o, state: "running" })).toBe("up to 2 now (W), max 3");
+    expect(nowHint({ ...o, state: "running" })).toBe("target 2 now (W), max 3");
     expect(nowHint({ ...o, state: "paused" })).toBe("paused: no new workers until you resume");
     expect(nowHint({ ...o, state: "paused", workers: 1 })).toBe("paused: 1 finishing, no new workers until you resume");
     expect(nowHint({ ...o, state: "harvesting" })).toBe("harvesting: no new workers");

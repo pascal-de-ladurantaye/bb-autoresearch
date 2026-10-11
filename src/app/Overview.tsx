@@ -14,6 +14,7 @@ import type { Rpc } from "./data.ts";
 import { ago, duration, formatValue, frac, nowHint, ratio, shortSha } from "./format.ts";
 import { BenchHostList } from "./BenchHosts.tsx";
 import { Sparkline, TrajectoryChart } from "./TrajectoryChart.tsx";
+import { ordinal } from "../live-model.ts";
 import { EmptyState, GuardrailBadge, Mono, Section, Stat } from "./ui.tsx";
 import type { Tab } from "./StudiesPage.tsx";
 
@@ -93,7 +94,7 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
                       </div>
                       <div className="text-xs text-muted-foreground">
                         {w.phase === "thinking" ? "editing" : w.phase}
-                        {w.queuePosition !== null ? ` (position ${w.queuePosition})` : ""} · submission {w.submissions} of {w.maxSubmissions}
+                        {w.queuePosition !== null ? ` (${ordinal(w.queuePosition)} in line for the bench)` : ""} · submission {w.submissions} of {w.maxSubmissions}
                         {w.candidate !== null ? ` · c/${w.candidate}` : ""} · started {ago(w.spawnedAt)}
                       </div>
                     </div>

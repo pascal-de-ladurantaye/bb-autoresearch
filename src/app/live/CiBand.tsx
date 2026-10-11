@@ -7,14 +7,16 @@
 // ones the runs against the calibrated σ band. Guardrails sit underneath,
 // compactly: the step against its limit and the total against its own.
 // Every state is also in words; color is never the only signal.
-import { useCallback, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { bandGuardrails, expensiveThresholds, pointDecision, runDecision, type BandDecision, type BandGuardrailState, type BandPoint, type BandRun, type DeterministicBand, type ExpensiveBand, type MeasureBand, type NoisyBand } from "../../band.ts";
-import { changeWords, rangeWords } from "../../guardrails.ts";
+import { limitCheckWords } from "../../guardrails.ts";
 import type { LiveCard } from "../../live-model.ts";
+import { layoutLabels } from "../../chart.ts";
 import { magnitudePct, signedPct, type MetricInfo } from "../../present.ts";
 import { animateIf, useMotionGate } from "./motion.tsx";
+import { useBoxWidth } from "../useBoxWidth.ts";
 
 const DECISION_WORD: Record<Exclude<BandDecision, "continue">, { label: string; icon: string; tone: string }> = {
   win: { label: "win", icon: "Check", tone: "text-success" },
@@ -26,7 +28,10 @@ const pct = (f: number, digits = 1) => signedPct(f, digits);
 
 export interface MeasurementProps {
   band: MeasureBand;
-  card: LiveCard | null;
+  /** What the band needs of the candidate (the Live view passes its card; the candidate detail its own fields). */
+  card: Pick<LiveCard, "stage" | "verdict" | "cause" | "ideaTitle"> | null;
+  /** Without the "c/N · idea" header (the candidate detail already shows it). */
+  bare?: boolean;
   hostName: string | null;
   metric: MetricInfo;
   compact: boolean;
@@ -34,11 +39,17 @@ export interface MeasurementProps {
 }
 
 /** One measurement: its title, chart(s), the decision in words, and the guardrails. */
-export function Measurement({ band, card, hostName, metric, compact, onOpenCandidate }: MeasurementProps) {
+export function Measurement({ band, card, hostName, metric, compact, onOpenCandidate, bare = false }: MeasurementProps) {
   const decided = band.final !== null;
   const stage = card?.stage === "confirming" ? "confirming" : card?.stage === "promoting" ? "promoting" : decided ? "measured" : "measuring";
   return (
     <article className={cn("min-w-0 space-y-2 rounded-lg border border-border bg-card p-3", compact && "p-2.5")} aria-label={`CI band of c/${band.n}`} data-band={band.n}>
+      {bare ? (
+        <p className="text-xs text-muted-foreground">
+          {stage}
+          {hostName ? ` on ${hostName}` : ""} · {band.kind === "deterministic" ? "deterministic, single run" : band.kind}
+        </p>
+      ) : (
       <header className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm">
         <button type="button" className="rounded font-mono font-medium underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => onOpenCandidate(band.n)}>
           c/{band.n}
@@ -49,6 +60,7 @@ export function Measurement({ band, card, hostName, metric, compact, onOpenCandi
           {hostName ? ` on ${hostName}` : ""} · {band.kind === "deterministic" ? "deterministic, single run" : band.kind}
         </span>
       </header>
+      )}
       {band.kind === "noisy" ? <NoisyBandView band={band} compact={compact} /> : band.kind === "deterministic" ? <DeterministicView band={band} metric={metric} /> : <ExpensiveView band={band} compact={compact} />}
       <Guardrails states={bandGuardrails(band)} compact={compact} />
       {card?.stage === "decided" && card.cause ? (
@@ -86,38 +98,73 @@ function domainOf(band: NoisyBand): [number, number] {
 
 function NoisyBandView({ band, compact }: { band: NoisyBand; compact: boolean }) {
   const domain = useMemo(() => domainOf(band), [band]);
-  const measure = band.runs.find((r) => r.run === "measure");
-  const confirm = band.runs.find((r) => r.run === "confirm");
+  const measure = band.runs.find((r) => r.run === "measure" && r.points.length);
+  const confirm = band.runs.find((r) => r.run === "confirm" && r.points.length);
+  const confirmStarted = band.runs.some((r) => r.run === "confirm");
+  if (!measure) return <BandPlaceholder text={noisyPlaceholder(band, "measure")} />;
   return (
     <div className={cn("grid gap-3", confirm && !compact ? "grid-cols-2" : "grid-cols-1")}>
       {measure ? <RunPanel band={band} run={measure} domain={domain} title={confirm ? "Measurement" : null} compact={compact} /> : null}
-      {confirm ? <RunPanel band={band} run={confirm} domain={domain} title="Confirmation · fresh pairs" compact={compact} /> : null}
+      {confirm ? <RunPanel band={band} run={confirm} domain={domain} title="Confirmation · fresh pairs" compact={compact} /> : confirmStarted ? <BandPlaceholder text={noisyPlaceholder(band, "confirm")} /> : null}
       {!band.exact ? <p className="text-[11px] text-muted-foreground">Recomputed from the samples (this measurement predates stored bands): the CI can differ slightly from the verdict's.</p> : null}
     </div>
   );
 }
 
-const M = { l: 40, r: 10, t: 12, b: 20 };
+/** Margins: the region labels (win, continue, lose) sit in the right margin, outside the plot, so they never cover the band or the decision line. */
+const M = { l: 40, r: 52, t: 12, b: 20 };
 
-/** The pixel width of a box (charts draw in pixels, so their text stays crisp); `fallback` until measured. */
-function useBoxWidth(fallback: number): [(el: HTMLDivElement | null) => void, number] {
-  const [w, setW] = useState(fallback);
-  const obs = useRef<ResizeObserver | null>(null);
-  const ref = useCallback((el: HTMLDivElement | null) => {
-    obs.current?.disconnect();
-    obs.current = null;
-    if (!el) return;
-    const width = el.getBoundingClientRect().width;
-    if (width > 0) setW(Math.round(width));
-    if (typeof ResizeObserver === "function") {
-      obs.current = new ResizeObserver((entries) => {
-        const x = entries[0]?.contentRect.width;
-        if (x && x > 0) setW(Math.round(x));
-      });
-      obs.current.observe(el);
-    }
-  }, []);
-  return [ref, w];
+/** What a noisy band shows before its first pair is done (no point to draw yet). */
+export function noisyPlaceholder(band: Pick<NoisyBand, "nMax">, run: "measure" | "confirm"): string {
+  return run === "confirm"
+    ? `Confirmation: running its first fresh pair (best and the candidate, in random order); its band starts once that pair is done.`
+    : `Running best and the candidate for the first pair (in random order) of up to ${band.nMax}; the band starts once that pair is done.`;
+}
+
+/** A band's space while there is nothing to draw yet: keeps the card's height and says what runs. */
+function BandPlaceholder({ text }: { text: string }) {
+  return (
+    <div className="flex min-h-[6rem] items-center gap-2 rounded-md border border-dashed border-border px-3 text-xs text-muted-foreground" role="status" data-band-placeholder>
+      <Icon name="Clock" className="size-3.5 shrink-0" aria-hidden />
+      <span>{text}</span>
+    </div>
+  );
+}
+/** Pixel font size of chart text (charts draw in pixels, so text never scales with the width). */
+const FONT = 9;
+/** Minimum distance between two stacked labels. */
+const LABEL_GAP = 11;
+
+export interface BandLabels {
+  /** Y-axis tick labels: 0, the win threshold, and the domain's ends when they fit. */
+  axis: Array<{ key: string; y: number; text: string }>;
+  /** Region labels in the right margin. */
+  regions: Array<{ key: "win" | "continue" | "lose"; y: number }>;
+}
+
+/**
+ * Where a noisy band's text goes, without overlaps (chart.ts layoutLabels):
+ * axis ticks on the left (0 and the threshold first; the domain's ends only
+ * where they fit) and the region names in the right margin, each near the
+ * middle of its region. `y` maps a value to pixels; `top`/`bottom` bound the plot.
+ */
+export function bandLabels(domain: [number, number], mde: number, y: (v: number) => number, top: number, bottom: number): BandLabels {
+  const [yMin, yMax] = domain;
+  const axisItems = [
+    { key: "zero", at: y(0), priority: 3, maxShift: 0, text: "0" },
+    { key: "mde", at: y(mde), priority: 2, maxShift: LABEL_GAP, text: pct(mde) },
+    { key: "max", at: top + 4, priority: 1, maxShift: 0, text: pct(yMax, 0) },
+    { key: "min", at: bottom - 3, priority: 1, maxShift: 0, text: pct(yMin, 0) },
+  ];
+  const axis = layoutLabels(axisItems, { gap: LABEL_GAP, min: top + 3, max: bottom - 2 }).map((p) => ({ key: p.key, y: p.at, text: axisItems.find((i) => i.key === p.key)!.text }));
+  const mid = (a: number, b: number) => (y(a) + y(b)) / 2;
+  const regionItems = [
+    { key: "win" as const, at: mid(Math.max(mde, yMin), yMax), priority: 3, maxShift: Math.max(LABEL_GAP, (y(mde) - y(yMax)) / 2) },
+    { key: "lose" as const, at: mid(yMin, Math.min(0, yMax)), priority: 2, maxShift: Math.max(LABEL_GAP, (y(yMin) - y(0)) / 2) },
+    { key: "continue" as const, at: mid(0, mde), priority: 1, maxShift: Math.max(0, (y(0) - y(mde)) / 2 - 2) },
+  ];
+  const regions = layoutLabels(regionItems, { gap: LABEL_GAP, min: top + 4, max: bottom - 2 }).map((p) => ({ key: p.key as BandLabels["regions"][number]["key"], y: p.at }));
+  return { axis, regions };
 }
 
 function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run: BandRun; domain: [number, number]; title: string | null; compact: boolean }) {
@@ -158,8 +205,9 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
     seen.current = pts.length;
     stopSeen.current = stop !== null;
   }, [pts.length, stop, motion]);
-  const yTicks = [0, band.mde];
-  const xTicks = [...new Set([1, band.nMin, band.nMax])];
+  const labels = bandLabels(domain, band.mde, y, M.t, H - M.b);
+  // Pair numbers: 1, n_min and n_max, minus any that would collide.
+  const xTicks = [...new Set([1, band.nMin, band.nMax])].filter((n, i, all) => i === 0 || n === band.nMax || all.every((m) => m === n || Math.abs(x(m) - x(n)) >= 16));
   return (
     <figure className="min-w-0 space-y-1" aria-label={`${title ?? "Measurement"} of c/${band.n}`}>
       {title ? <figcaption className="text-xs font-medium text-muted-foreground">{title}</figcaption> : null}
@@ -182,45 +230,30 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
               <rect fill={`url(#hatch-${clip})`} opacity={0.18} x={M.l} width={Math.max(0, x(band.nMin - 0.5) - M.l)} y={M.t} height={H - M.t - M.b} />
             </g>
           ) : null}
-          <g className="fill-muted-foreground text-[9px]" style={{ fontSize: 9 }}>
-            <text x={W - M.r - 3} y={y(yMax) + 10} textAnchor="end" className="fill-success">
-              win
-            </text>
-            <text x={W - M.r - 3} y={Math.min(H - M.b - 3, y(0) + 10)} textAnchor="end" className="fill-destructive">
-              lose
-            </text>
-            {y(0) - y(band.mde) > 12 ? (
-              <text x={W - M.r - 3} y={(y(0) + y(band.mde)) / 2 + 3} textAnchor="end">
-                continue
+          {/* Region names in the right margin, outside the plot (never over the band or the decision line). */}
+          <g className="fill-muted-foreground" style={{ fontSize: FONT }} data-region-labels>
+            {labels.regions.map((r) => (
+              <text key={r.key} data-label={r.key} x={W - M.r + 4} y={r.y + 3} textAnchor="start" className={r.key === "win" ? "fill-success" : r.key === "lose" ? "fill-destructive" : undefined}>
+                {r.key}
               </text>
-            ) : null}
+            ))}
           </g>
           {/* Zero and the win threshold. */}
           <line x1={M.l} x2={W - M.r} y1={y(0)} y2={y(0)} className="text-foreground" stroke="currentColor" strokeOpacity={0.45} strokeWidth={1} />
           <line x1={M.l} x2={W - M.r} y1={y(band.mde)} y2={y(band.mde)} className="text-success" stroke="currentColor" strokeDasharray="4 3" strokeWidth={1} />
           {/* Axes. */}
-          <g className="fill-muted-foreground" style={{ fontSize: 9 }}>
-            {yTicks.map((v) => (
-              <text key={v} x={M.l - 4} y={y(v) + 3} textAnchor="end">
-                {v === 0 ? "0" : pct(v)}
+          <g className="fill-muted-foreground" style={{ fontSize: FONT }} data-axis-labels>
+            {labels.axis.map((a) => (
+              <text key={a.key} data-label={a.key} x={M.l - 4} y={a.y + 3} textAnchor="end">
+                {a.text}
               </text>
             ))}
-            {Math.min(...yTicks.map((v) => Math.abs(y(v) - (M.t + 4)))) > 11 ? (
-              <text x={M.l - 4} y={M.t + 7} textAnchor="end">
-                {pct(yMax, 0)}
-              </text>
-            ) : null}
-            {Math.min(...yTicks.map((v) => Math.abs(y(v) - (H - M.b - 3)))) > 11 ? (
-              <text x={M.l - 4} y={H - M.b} textAnchor="end">
-                {pct(yMin, 0)}
-              </text>
-            ) : null}
             {xTicks.map((n) => (
               <text key={n} x={x(n)} y={H - 6} textAnchor="middle">
                 {n}
               </text>
             ))}
-            <text x={(M.l + W - M.r) / 2} y={H - 6} textAnchor="middle" opacity={0.7}>
+            <text x={W - M.r + 4} y={H - 6} textAnchor="start" opacity={0.7}>
               pairs
             </text>
           </g>
@@ -238,7 +271,7 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
           {stop ? (
             <g data-decision className={DECISION_WORD[stop.decision].tone} style={{ transformBox: "fill-box", transformOrigin: "center bottom" }}>
               <line x1={x(stop.n)} x2={x(stop.n)} y1={M.t} y2={H - M.b} stroke="currentColor" strokeWidth={1.5} strokeDasharray="2 2" />
-              <text x={x(stop.n) > W - 80 ? x(stop.n) - 3 : x(stop.n) + 3} y={x(stop.n) > W - 80 ? M.t + 20 : M.t + 8} fill="currentColor" style={{ fontSize: 9, fontWeight: 600 }} textAnchor={x(stop.n) > W - 80 ? "end" : "start"}>
+              <text x={x(stop.n) > W - M.r - 50 ? x(stop.n) - 3 : x(stop.n) + 3} y={M.t + 8} fill="currentColor" style={{ fontSize: FONT, fontWeight: 600 }} textAnchor={x(stop.n) > W - M.r - 50 ? "end" : "start"}>
                 {stop.n} of {band.nMax}
               </text>
             </g>
@@ -340,13 +373,18 @@ function DeterministicView({ band, metric }: { band: DeterministicBand; metric: 
 
 function ExpensiveView({ band, compact }: { band: ExpensiveBand; compact: boolean }) {
   const thr = expensiveThresholds(band);
+  // Drawn in pixels at the box's width (no stretched viewBox), so labels keep their size and shape.
+  const [box, W] = useBoxWidth(320);
+  const H = compact ? 112 : 144;
+  const B = { l: 46, r: 8, t: 10, b: 18 };
   const vals = [...band.baseline, band.screen?.m ?? 0, ...band.confirm.map((p) => p.m), thr.screen * 1.4, -thr.screen * 1.4];
   const lo = Math.min(...vals);
   const hi = Math.max(...vals);
   const pad = (hi - lo) * 0.08 || 0.01;
-  const y = (v: number) => 10 + ((hi + pad - v) / (hi - lo + 2 * pad)) * 110;
+  const y = (v: number) => B.t + ((hi + pad - v) / (hi - lo + 2 * pad)) * (H - B.t - B.b);
   const cols = 2 + band.k;
-  const x = (i: number) => 46 + (i + 0.5) * ((310 - 46) / cols);
+  const colW = (W - B.l - B.r) / cols;
+  const x = (i: number) => B.l + (i + 0.5) * colW;
   const mean = band.confirm.at(-1) ?? null;
   const screenWords = !band.screen
     ? `Screening run pending (baseline: ${band.baseline.length} runs, σ ${magnitudePct(band.sigma)} per run).`
@@ -358,43 +396,54 @@ function ExpensiveView({ band, compact }: { band: ExpensiveBand; compact: boolea
   const confirmWords = mean
     ? `Confirmed mean ${pct(mean.m)} over ${band.confirm.length} of ${band.k} runs${band.confirm.length === band.k ? `: ${mean.m > thr.confirm ? "win" : mean.m < -thr.confirm ? "lose" : "inconclusive"} against ±${magnitudePct(thr.confirm)}` : ""}.`
     : null;
+  // Column labels shorten when columns get narrow ("mean 3" → "3"); y labels never overlap (0 wins).
+  const narrow = colW < 44;
+  const yLabels = layoutLabels(
+    [
+      { key: "zero", at: y(0), priority: 2, maxShift: 0 },
+      { key: "screen", at: y(thr.screen), priority: 1, maxShift: 0 },
+    ],
+    { gap: LABEL_GAP, min: B.t, max: H - B.b },
+  );
+  const half = Math.min(18, colW / 2 - 2);
   return (
     <figure className="space-y-1">
-      <svg viewBox="0 0 320 140" className={cn("w-full", compact ? "h-28" : "h-36")} role="img" aria-label={`${screenWords} ${confirmWords ?? ""}`} preserveAspectRatio="none">
-        {/* The screen's noise band (baseline and screen columns) and the confirmation's tighter one. */}
-        <rect className="text-muted-foreground" fill="currentColor" fillOpacity={0.12} x={x(0) - 18} width={x(1) - x(0) + 36} y={y(thr.screen)} height={y(-thr.screen) - y(thr.screen)} />
-        <rect className="text-muted-foreground" fill="currentColor" fillOpacity={0.12} x={x(2) - 14} width={x(cols - 1) - x(2) + 28} y={y(thr.confirm)} height={y(-thr.confirm) - y(thr.confirm)} />
-        <line x1={40} x2={312} y1={y(0)} y2={y(0)} className="text-foreground" stroke="currentColor" strokeOpacity={0.45} />
-        {band.baseline.map((v, i) => (
-          <circle key={i} cx={x(0) + ((i % 5) - 2) * 4} cy={y(v)} r={2.2} className="text-muted-foreground" fill="currentColor" />
-        ))}
-        {band.screen ? <circle cx={x(1)} cy={y(band.screen.m)} r={3.5} className={band.screen.m > thr.screen ? "text-success" : band.screen.m < -thr.screen ? "text-destructive" : "text-foreground"} fill="currentColor" /> : null}
-        {band.confirm.map((p, i) => (
-          <g key={p.n} className="text-success">
-            <circle cx={x(2 + i)} cy={y(p.m)} r={3} fill="currentColor" />
-            {p.lo !== null && p.hi !== null ? <line x1={x(2 + i)} x2={x(2 + i)} y1={y(p.hi)} y2={y(p.lo)} stroke="currentColor" strokeWidth={1.5} /> : null}
-          </g>
-        ))}
-        <g className="fill-muted-foreground" style={{ fontSize: 9 }}>
-          <text x={x(0)} y={134} textAnchor="middle">
-            baseline
-          </text>
-          <text x={x(1)} y={134} textAnchor="middle">
-            screen
-          </text>
-          {Array.from({ length: band.k }, (_, i) => (
-            <text key={i} x={x(2 + i)} y={134} textAnchor="middle">
-              mean {i + 1}
-            </text>
+      <div ref={box} className="w-full">
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label={`${screenWords} ${confirmWords ?? ""}`}>
+          {/* The screen's noise band (baseline and screen columns) and the confirmation's tighter one. */}
+          <rect className="text-muted-foreground" fill="currentColor" fillOpacity={0.12} x={x(0) - half} width={x(1) - x(0) + 2 * half} y={y(thr.screen)} height={y(-thr.screen) - y(thr.screen)} />
+          <rect className="text-muted-foreground" fill="currentColor" fillOpacity={0.12} x={x(2) - half} width={x(cols - 1) - x(2) + 2 * half} y={y(thr.confirm)} height={y(-thr.confirm) - y(thr.confirm)} />
+          <line x1={B.l - 6} x2={W - B.r} y1={y(0)} y2={y(0)} className="text-foreground" stroke="currentColor" strokeOpacity={0.45} />
+          {band.baseline.map((v, i) => (
+            <circle key={i} cx={x(0) + ((i % 5) - 2) * Math.min(4, half / 3)} cy={y(v)} r={2.2} className="text-muted-foreground" fill="currentColor" />
           ))}
-          <text x={38} y={y(0) + 3} textAnchor="end">
-            0
-          </text>
-          <text x={38} y={y(thr.screen) + 3} textAnchor="end">
-            {pct(thr.screen)}
-          </text>
-        </g>
-      </svg>
+          {band.screen ? <circle cx={x(1)} cy={y(band.screen.m)} r={3.5} className={band.screen.m > thr.screen ? "text-success" : band.screen.m < -thr.screen ? "text-destructive" : "text-foreground"} fill="currentColor" /> : null}
+          {band.confirm.map((p, i) => (
+            <g key={p.n} className="text-success">
+              <circle cx={x(2 + i)} cy={y(p.m)} r={3} fill="currentColor" />
+              {p.lo !== null && p.hi !== null ? <line x1={x(2 + i)} x2={x(2 + i)} y1={y(p.hi)} y2={y(p.lo)} stroke="currentColor" strokeWidth={1.5} /> : null}
+            </g>
+          ))}
+          <g className="fill-muted-foreground" style={{ fontSize: FONT }}>
+            <text x={x(0)} y={H - 5} textAnchor="middle">
+              baseline
+            </text>
+            <text x={x(1)} y={H - 5} textAnchor="middle">
+              screen
+            </text>
+            {Array.from({ length: band.k }, (_, i) => (
+              <text key={i} x={x(2 + i)} y={H - 5} textAnchor="middle">
+                {narrow ? i + 1 : `mean ${i + 1}`}
+              </text>
+            ))}
+            {yLabels.map((l) => (
+              <text key={l.key} x={B.l - 8} y={l.at + 3} textAnchor="end">
+                {l.key === "zero" ? "0" : pct(thr.screen)}
+              </text>
+            ))}
+          </g>
+        </svg>
+      </div>
       <p className="text-xs text-muted-foreground">{screenWords}</p>
       {confirmWords ? <p className="text-xs text-muted-foreground">{confirmWords}</p> : null}
     </figure>
@@ -425,9 +474,8 @@ function GuardrailRow({ g, compact }: { g: BandGuardrailState; compact: boolean 
   const w = GUARD_WORD[g.state] ?? GUARD_WORD.missing!;
   const step = g.step;
   const total = g.total;
-  const text = step
-    ? `${changeWords(step.regression)} than best${rangeWords(step.lo, step.hi) ? ` (${rangeWords(step.lo, step.hi)})` : ""} vs the ${magnitudePct(step.limit, 1)} limit${total ? ` · total ${changeWords(total.regression)} vs ${magnitudePct(total.limit, 1)}` : ""}`
-    : "not measured";
+  // Plain words (guardrails.ts limitCheckWords): "no change from best (CI …), within the 10.0% limit · in total 2.1% worse than the segment base, within the 15.0% total limit".
+  const text = step ? `${limitCheckWords(step, "best")}${total ? ` · in total ${limitCheckWords(total, "the segment base", "total limit")}` : ""}` : "not measured";
   return (
     <li className="grid grid-cols-[minmax(0,6rem)_1fr] items-center gap-x-2 text-xs" aria-label={`Guardrail ${g.name}: ${w.label}${g.final ? "" : " so far"}. ${text}.`}>
       <span className="flex min-w-0 items-center gap-1">

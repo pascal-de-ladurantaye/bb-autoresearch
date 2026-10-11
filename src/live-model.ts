@@ -36,6 +36,44 @@ export const PHASE_INFO: Record<WorkerPhase, { label: string; icon: string; step
   done: { label: "done", icon: "Check", step: 8 },
 };
 
+/**
+ * The header's worker count against the target W: live workers include
+ * finishing ones (they still hold a slot), and W can drop below the live
+ * count when think and eval times change; nobody is stopped for it, so the
+ * text says what happens instead. "2 workers \u00b7 target 2",
+ * "2 workers + 1 finishing \u00b7 target 2", "3 workers \u00b7 target now 2 (no new worker until fewer)".
+ */
+export function workerCountText(phases: readonly WorkerPhase[], target: number): string {
+  const finishing = phases.filter((p) => p === "finishing").length;
+  const working = phases.length - finishing;
+  const head = `${working} worker${working === 1 ? "" : "s"}${finishing ? ` + ${finishing} finishing` : ""}`;
+  return phases.length > target ? `${head} \u00b7 target now ${target} (no new worker until fewer)` : `${head} \u00b7 target ${target}`;
+}
+
+/** "1st", "2nd", "3rd", "11th". */
+export function ordinal(n: number): string {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return `${n}${s[(v - 20) % 10] ?? s[v] ?? s[0]}`;
+}
+
+/**
+ * The shared bench queue, next first: queued candidates and (single-machine
+ * mode) candidates waiting to run their tests on the bench, by when each
+ * started waiting. The one place its order is decided, so the lanes, the
+ * cards, the bench strip, the Overview and the badges agree on positions.
+ */
+export function benchQueueOrder<T extends { id: number; queuedAt: number | null; submittedAt: number }>(rows: readonly T[]): T[] {
+  return [...rows].sort((a, b) => (a.queuedAt ?? a.submittedAt) - (b.queuedAt ?? b.submittedAt) || a.id - b.id);
+}
+
+/** A candidate's place in the bench queue (1 = next), or null when it isn't in it. */
+export function queuePosition(queue: readonly number[], n: number | null): number | null {
+  if (n === null) return null;
+  const i = queue.indexOf(n);
+  return i < 0 ? null : i + 1;
+}
+
 /** The steps a lane's progress dots show, in order. */
 export const PHASE_STEPS: readonly WorkerPhase[] = ["reading", "editing", "testing", "waiting", "measuring", "verdict"];
 
@@ -239,6 +277,8 @@ export interface LiveBenchHost {
   name: string;
   status: "online" | "offline" | "unknown";
   healthOk: boolean | null;
+  /** Why there is no health result: checks are off in the spec, or (replay) the study predates recorded health events. */
+  healthRecord?: "off" | "missing" | null;
   deferredUntil: number | null;
   current:
     | { kind: "measure"; n: number; stage: Stage; pairs: Pairs | null; startedAt: number }
@@ -299,7 +339,8 @@ export interface LiveView {
     /** Lanes that rebase on their next submission because best moved (live workers other than the winner's). */
     rebases: number[];
   };
-  counts: { candidates: number; maxCandidates: number; workers: number; targetWorkers: number; queue: number };
+  /** `workers` counts live workers, finishing ones included (`finishing` of them); `targetWorkers` is W. */
+  counts: { candidates: number; maxCandidates: number; workers: number; finishing?: number; targetWorkers: number; queue: number };
   workers: LiveWorker[];
   /** In-flight candidates and the most recent decided ones. */
   cards: LiveCard[];
@@ -345,6 +386,8 @@ export function progressText(p: Pairs, noise: NoiseClass = "noisy", opts: { shor
   }
   if (opts.short) return `${p.done}${p.of > 1 ? `/${p.of}` : ""}`;
   const of = p.of > 1 ? (opts.spoken ? ` of up to ${p.of}` : ` of ≤${p.of}`) : "";
+  // Before the first pair is done there is nothing to count: say what runs ("pair 0" reads like a bug).
+  if (p.done <= 0) return `${opts.run && p.run === "confirm" ? "confirmation: " : ""}first pair${of} running`;
   return `${opts.run && p.run === "confirm" ? "confirmation " : ""}pair ${p.done}${of}`;
 }
 
@@ -611,6 +654,17 @@ export const REPLAY_KINDS = [
   "idea.status",
   "worker.action",
 ] as const;
+
+/** A bench host's health in words (the bench strip, live and replay). */
+export function benchHealthText(h: Pick<LiveBenchHost, "status" | "deferredUntil" | "healthOk" | "healthRecord">): string {
+  if (h.status === "offline") return "offline";
+  if (h.deferredUntil) return "waiting for the machine to calm down";
+  if (h.healthOk === false) return "unhealthy";
+  if (h.healthOk) return "healthy";
+  if (h.healthRecord === "off") return "health checks off";
+  if (h.healthRecord === "missing") return "health not recorded";
+  return "not checked yet";
+}
 
 /**
  * Pair progress of one candidate from its events (measure.started resets,

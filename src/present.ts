@@ -121,15 +121,92 @@ export function noiseFloorText(noise: NoiseClass, floors: ReadonlyArray<number |
   }
 }
 
+/** What a worker in each phase is doing, for the status line (live-model.ts WORKER_PHASES, in loop order). */
+const STATUS_PHASE_WORDS: ReadonlyArray<readonly [string, string]> = [
+  ["starting", "starting"],
+  ["reading", "reading the code"],
+  ["editing", "editing"],
+  ["refining", "refining"],
+  ["testing", "testing locally"],
+  ["working", "working"],
+  ["waiting", "waiting for the bench"],
+  ["measuring", "being measured"],
+  ["verdict", "reading a verdict"],
+  ["finishing", "finishing"],
+];
+
+/**
+ * Live workers by what they are doing: "2 workers editing",
+ * "3 workers: 1 editing, 1 being measured, 1 finishing", "no live workers".
+ * `phases` are the workers' recorded phases (an unknown one counts as "working").
+ */
+export function workersDoingText(phases: readonly string[]): string {
+  const n = phases.length;
+  if (!n) return "no live workers";
+  const counts = new Map<string, number>();
+  for (const p of phases) {
+    const key = STATUS_PHASE_WORDS.some(([k]) => k === p) ? p : "working";
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const parts = STATUS_PHASE_WORDS.filter(([k]) => counts.has(k)).map(([k, w]) => ({ n: counts.get(k)!, w }));
+  const head = `${n} worker${n === 1 ? "" : "s"}`;
+  return parts.length === 1 ? `${head} ${parts[0]!.w}` : `${head}: ${parts.map((p) => `${p.n} ${p.w}`).join(", ")}`;
+}
+
 /**
  * The Running status sentence, shared by the live status line and replay:
- * "Running: 2 workers editing, measuring c/3, 1 queued for the bench, 1 in tests."
- * A candidate on the bench is being measured, not queued, so it is counted once.
+ * "Running: 2 workers: 1 editing, 1 being measured; measuring c/3, 1 queued for the bench, 1 in tests."
+ * Workers are described by their phases (not all "editing"). A candidate on
+ * the bench is being measured, not queued, so it is counted once.
+ * `testing`: candidates whose gates hold the bench now (single-machine mode); they are not counted again in `inTests`.
  */
-/** `testing`: candidates whose gates hold the bench now (single-machine mode); they are not counted again in `inTests`. */
-export function runningStatusText(workers: number, measuring: readonly string[], queued: number, inTests: number, testing: readonly string[] = []): string {
+export function runningStatusText(phases: readonly string[], measuring: readonly string[], queued: number, inTests: number, testing: readonly string[] = []): string {
   const waitingTests = Math.max(0, inTests - testing.length);
-  return `Running: ${workers} worker${workers === 1 ? "" : "s"} editing${measuring.length ? `, measuring ${measuring.join(", ")}` : ""}${testing.length ? `, testing ${testing.join(", ")} on the bench` : ""}${queued ? `, ${queued} queued for the bench` : ""}${waitingTests ? `, ${waitingTests} in tests` : ""}.`;
+  const bench = [
+    measuring.length ? `measuring ${measuring.join(", ")}` : "",
+    testing.length ? `testing ${testing.join(", ")} on the bench` : "",
+    queued ? `${queued} queued for the bench` : "",
+    waitingTests ? `${waitingTests} in tests` : "",
+  ].filter(Boolean);
+  return `Running: ${workersDoingText(phases)}${bench.length ? `; ${bench.join(", ")}` : ""}.`;
+}
+
+/**
+ * Shorten text to at most `max` characters without cutting a word or a
+ * Markdown code span in half: the cut falls on the last word boundary before
+ * the limit, and moves before an opening backtick whose code span the limit
+ * would cut. Adds "…" when it shortened anything.
+ */
+export function clipWords(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const room = Math.max(1, max - 1);
+  let cut = room;
+  // Back to a word boundary (unless the first word alone is longer than the limit).
+  const ws = text.slice(0, room + 1).search(/\s\S*$/u);
+  if (ws > 0) cut = ws;
+  // Never inside a code span: an odd number of backticks before the cut means one is open.
+  let head = text.slice(0, cut);
+  const ticks = head.match(/`/gu)?.length ?? 0;
+  if (ticks % 2 === 1) head = head.slice(0, head.lastIndexOf("`"));
+  head = head.replace(/[\s,;:.(\-–—]+$/u, "");
+  if (!head) return `${text.slice(0, room).replace(/`/gu, "")}…`;
+  return `${head}…`;
+}
+
+/**
+ * Which statistic a candidate's headline improvement is, per noise class:
+ * the verdict's estimate, which can differ from the change between the two
+ * sides' medians shown in the metrics table.
+ */
+export function effectStatisticText(noise: NoiseClass): string {
+  switch (noise) {
+    case "deterministic":
+      return "single run of each side";
+    case "expensive":
+      return "mean of the confirmation runs (or the screening run) against the median of best's runs";
+    default:
+      return "median of the per-pair changes, the verdict's estimate";
+  }
 }
 
 const clipText = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`);

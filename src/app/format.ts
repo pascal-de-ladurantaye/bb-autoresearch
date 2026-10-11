@@ -101,7 +101,8 @@ export function bytes(n: number | null | undefined): string {
 export function nowHint(o: { state: string; workers: number; targetWorkers: number; maxWorkers: number; maxWorkersOverride: number | null }): string {
   switch (o.state) {
     case "running":
-      return `up to ${o.targetWorkers} now (W), max ${o.maxWorkers}${o.maxWorkersOverride !== null ? " (your override)" : ""}`;
+      // Live workers include finishing ones, so there can be more than W for a while (W adapts down; nobody is stopped).
+      return `target ${o.targetWorkers} now (W), max ${o.maxWorkers}${o.maxWorkersOverride !== null ? " (your override)" : ""}${o.workers > o.targetWorkers ? `; no new worker until fewer than ${o.targetWorkers} are live` : ""}`;
     case "paused":
       return o.workers ? `paused: ${o.workers} finishing, no new workers until you resume` : "paused: no new workers until you resume";
     case "harvesting":

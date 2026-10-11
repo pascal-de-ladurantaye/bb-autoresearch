@@ -149,12 +149,12 @@ describe("cumulative creep across kept wins (deterministic class, end to end)", 
     const g = o.secondary.guardrails[0]!;
     expect(g).toMatchObject({ state: "pass", label: "ok", promotions: 3, used: expect.closeTo(0.772, 3) });
     expect(g.regression).toBeCloseTo(1.049 ** 3 - 1, 6);
-    expect(g.text).toBe("15.4% worse vs the segment base (total limit 20.0% worse) · 5.0% per step");
+    expect(g.text).toBe("15.4% worse than the segment base (total limit 20.0% worse) · 5.0% per step");
     expect(g.headroomText).toBe("rss: 4.6% of the 20.0% total limit left (best: 15.4% worse than the segment base)");
     const detail = (await candidateDetail(engine, store.study("toy-size")!, 4))!;
     const row = detail.metricRows.find((r) => r.name === "rss")!;
     expect(row.guardrail).toMatchObject({ state: "broken", label: "BROKEN (total)" });
-    expect(row.text).toBe("4.9% worse vs best (limit 5.0% worse) · 21.1% worse vs the segment base (total limit 20.0% worse)");
+    expect(row.text).toBe("4.9% worse than best (limit 5.0% worse) · 21.1% worse than the segment base (total limit 20.0% worse)");
     const list = candidatesView(engine, store.study("toy-size")!, {});
     expect(list.find((r) => r.n === 4)!.guardrails.text).toBe("rss BROKEN (total)");
     // The strategist's digest and the report carry the cumulative position.
@@ -372,7 +372,7 @@ describe("views: guardrailStatus with the cumulative position and CI", () => {
   it("a candidate: step and total checks, the worse decides", () => {
     const ok = guardrailStatus({ ...base, regression: 0.01, ci: { lo: 0, hi: 0.02 }, cumulative: { regression: 0.03, lo: 0.02, hi: 0.04, limit: 0.1 } });
     expect(ok).toMatchObject({ state: "pass", label: "ok" });
-    expect(ok.text).toBe("1.0% worse vs best (CI 0.0% to 2.0% worse; limit 5.0% worse) · 3.0% worse vs the segment base (CI 2.0% to 4.0% worse; total limit 10.0% worse)");
+    expect(ok.text).toBe("1.0% worse than best (CI 0.0% to 2.0% worse; limit 5.0% worse) · 3.0% worse than the segment base (CI 2.0% to 4.0% worse; total limit 10.0% worse)");
     expect(ok.cumulative).toMatchObject({ state: "ok", headroom: expect.closeTo(0.07, 9) });
     const inconclusive = guardrailStatus({ ...base, regression: 0.03, ci: { lo: -0.02, hi: 0.08 }, cumulative: { regression: 0.03, lo: -0.02, hi: 0.08, limit: 0.1 } });
     expect(inconclusive).toMatchObject({ state: "inconclusive", label: "inconclusive" });

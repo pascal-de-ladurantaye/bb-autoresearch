@@ -210,6 +210,26 @@ export function relativeWords(r: number, against: string): string {
   return w === "no change" || w === "not measured" ? `${w} against ${against}` : `${w} than ${against}`;
 }
 
+/** A change against a reference, as a sentence fragment: "3.1% worse than best", "0.4% better than best", "no change from best". */
+export function changeFrom(r: number, against: string): string {
+  const w = changeWords(r);
+  if (w === "not measured") return `not measured against ${against}`;
+  return w === "no change" ? `no change from ${against}` : `${w} than ${against}`;
+}
+
+/**
+ * A guardrail check in plain words, for compact rows: "no change from best
+ * (CI 0.3% better to 0.4% worse), within the 10.0% limit", "12.1% worse than
+ * the segment base, beyond the 10.0% total limit". `limitWord` names the
+ * limit ("limit", "total limit"); `soFar` for an estimate while measuring.
+ */
+export function limitCheckWords(c: LimitCheck, against: string, limitWord = "limit", soFar = false): string {
+  const ci = rangeWords(c.lo, c.hi);
+  const limit = `${pct(c.limit)} ${limitWord}`;
+  const where = c.state === "broken" ? `beyond the ${limit}` : c.state === "inconclusive" ? `straddling the ${limit}` : `within the ${limit}`;
+  return `${changeFrom(c.regression, against)}${ci ? ` (${ci})` : ""}, ${where}${soFar ? " so far" : ""}`;
+}
+
 /** A CI of a regression in words: "CI 2.0% to 4.2% worse", "CI 1.0% better to 4.0% worse". Empty when unknown or degenerate. */
 export function rangeWords(lo: number | null | undefined, hi: number | null | undefined): string {
   if (!finite(lo) || !finite(hi) || Math.abs(hi - lo) < 1e-12) return "";

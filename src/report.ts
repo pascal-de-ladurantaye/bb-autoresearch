@@ -8,7 +8,7 @@ import { harvestAccounting, type Accounting, type Estimate } from "./harvest-mat
 import type { GuardrailCost, StackRecord } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
 import { bestGuardrailPositions, segmentGuardrailCalibration } from "./pipeline.ts";
-import { amountText, ciRangeText, ciText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
+import { amountText, ciRangeText, ciText, clipWords, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
 
@@ -104,6 +104,12 @@ function studyLink(ctx: Ctx, study: StudyRow, tab = "harvest"): string {
   return url ? `${url.replace(/\/$/u, "")}/plugins/${ctx.bb.pluginId()}/${path}` : `BB Studies page \`${path}\``;
 }
 
+/** The ablation in words, never a signed "+22.00% worse": "best with this change reverted is 22.00% worse than best". */
+export function revertedWords(contribution: number): string {
+  if (Math.abs(contribution) < 0.00005) return "best with this change reverted measures the same as best";
+  return `best with this change reverted is ${magnitudePct(contribution, 2)} ${contribution > 0 ? "worse" : "better"} than best`;
+}
+
 /** PR body for one changeset: what and why, measured contribution, standalone effect, findings, study link. */
 export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow, cs: ChangesetRow, all: ChangesetRow[]): string {
   const nums = safeJson<number[]>(cs.candidates_json) ?? [];
@@ -113,20 +119,20 @@ export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow
   const raw = bestRaw(ctx, study, spec);
   const lines = [
     `## What`,
-    clip(cs.title, 200),
+    clipWords(cs.title, 200),
     "",
-    ...cands.map((c) => `- c/${c.n}: ${clip(c.summary.split("\n")[0] ?? "", 200)} (when promoted: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it)`),
+    ...cands.map((c) => `- c/${c.n}: ${clipWords(c.summary.split("\n")[0] ?? "", 200)} (when promoted: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it)`),
     "",
     `## Why`,
-    clip(cs.rationale || "Promoted by the autoresearch study because it measurably improved the metric.", 2000),
+    clipWords(cs.rationale || "Promoted by the autoresearch study because it measurably improved the metric.", 2000),
     "",
     `## Measured effect on \`${spec.metric.name}\` (${spec.metric.direction} is better, ${spec.oracle.noise} oracle)`,
-    `- Contribution: ${cs.contribution === null ? `not measured alone (${cs.ablation_status}${cs.ablation_detail ? `: ${clip(cs.ablation_detail, 200)}` : ""})` : `${shareText({ value: cs.contribution, lo: cs.ci_lo, hi: cs.ci_hi }, h.total_effect, metric, raw)} the study found (${cs.n ?? "?"} pairs; ablation: best with this change reverted is ${pct(cs.contribution)} worse than best)`}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
+    `- Contribution: ${cs.contribution === null ? `not measured alone (${cs.ablation_status}${cs.ablation_detail ? `: ${clipWords(cs.ablation_detail, 200)}` : ""})` : `${shareText({ value: cs.contribution, lo: cs.ci_lo, hi: cs.ci_hi }, h.total_effect, metric, raw)} the study found (${cs.n ?? "?"} pairs; ablation: ${revertedWords(cs.contribution)})`}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
     `- Alone on ${cs.pr_base === "base" || !cs.pr_base ? `\`${spec.study.base}\`, the study base` : `the PR below it (${cs.pr_base})`}: ${standaloneText(cs, spec)}`,
   ];
-  if (deps.length) lines.push(`- Depends on: ${deps.map((d) => `#${d.k} ${clip(d.title, 60)}`).join(", ")}${cs.dependency_reason ? ` (${clip(cs.dependency_reason, 300)})` : ""}`);
+  if (deps.length) lines.push(`- Depends on: ${deps.map((d) => `#${d.k} ${clipWords(d.title, 60)}`).join(", ")}${cs.dependency_reason ? ` (${clipWords(cs.dependency_reason, 300)})` : ""}`);
   const dependents = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(cs.id));
-  if (dependents.length) lines.push(`- Needed by: ${dependents.map((d) => `#${d.k} ${clip(d.title, 60)}`).join(", ")}`);
+  if (dependents.length) lines.push(`- Needed by: ${dependents.map((d) => `#${d.k} ${clipWords(d.title, 60)}`).join(", ")}`);
   const f = linkedFindings(ctx, study, cs);
   if (f.length) lines.push("", "## Findings", ...f);
   lines.push(
@@ -148,7 +154,7 @@ export function standaloneText(cs: ChangesetRow, spec?: StudySpec): string {
     case "pending":
       return "not checked yet";
     default:
-      return `${cs.standalone_status}${cs.standalone_detail ? `: ${clip(cs.standalone_detail, 200)}` : ""}`;
+      return `${cs.standalone_status}${cs.standalone_detail ? `: ${clipWords(cs.standalone_detail, 200)}` : ""}`;
   }
 }
 
@@ -317,8 +323,8 @@ function harvestGuardrailLines(ctx: Ctx, study: StudyRow, spec: StudySpec, h: Ha
 }
 
 function mdCell(s: string, max: number): string {
-  return clip(s.replace(/\|/gu, "\\|").replace(/\s+/gu, " ").trim(), max);
+  return clipWords(s.replace(/\|/gu, "\\|").replace(/\s+/gu, " ").trim(), max);
 }
 function mdText(s: string, max: number): string {
-  return clip(s.replace(/\s+/gu, " ").trim(), max);
+  return clipWords(s.replace(/\s+/gu, " ").trim(), max);
 }
