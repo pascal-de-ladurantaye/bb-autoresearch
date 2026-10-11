@@ -15,7 +15,7 @@ cards: Unit of work=Study | Agents=Strategist + workers | Verdicts=Plugin-owned 
 
 ## Status
 
-All four milestones are built (BB 0.45, plugin SDK 0.6.14). Each was smoke-tested live on toy repositories on one MacBook; no milestone has run on a real workload. The exit criteria:
+All four milestones are built (BB 0.45, plugin SDK 0.6.14). Each was smoke-tested live on toy repositories on one MacBook. With v0.2.2 it also ran once on a real workload: a blind comparison against another autoresearch loop on a real-world CLI performance task, from the same starting commit (5.4× against the other loop's 3.9× on that benchmark, in about 3.6× the wall time; one run of each). The exit criteria:
 
 | Milestone | Exit criterion | Validated? |
 |---|---|---|
