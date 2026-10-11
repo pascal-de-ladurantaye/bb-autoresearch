@@ -1,7 +1,7 @@
 // Local bench provider (example) — BB server entry. Wiring only; the logic is
 // in provider.ts. Machines are directories under the OS temp dir.
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { benchProviderContract } from "../../src/bench-provider/contract.ts";
+import { benchProviderContract } from "./contract.ts";
 import { createLocalBenchProvider } from "./provider.ts";
 
 export default async function plugin(bb: BbPluginApi): Promise<void> {

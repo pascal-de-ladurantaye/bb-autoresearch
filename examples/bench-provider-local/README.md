@@ -75,7 +75,7 @@ and `sweep`.
 
 ## Writing your own provider
 
-This example imports the contract from `../../src/bench-provider/contract.ts`
-because it lives in this repository. A provider outside this repository copies
-those schemas (they are plain zod) and registers them with
-`bb.rpc.register(benchProviderContract, handlers)`.
+A BB plugin can't import files outside its own directory, so `contract.ts` here
+is a copy of the repository's `src/bench-provider/contract.ts` (a test keeps the
+two identical). Any provider does the same: copy the schemas (they are plain
+zod) and register them with `bb.rpc.register(benchProviderContract, handlers)`.

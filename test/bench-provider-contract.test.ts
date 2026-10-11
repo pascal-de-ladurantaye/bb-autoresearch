@@ -77,3 +77,11 @@ describe("bench provider contract", () => {
     await expect(gone.snapshot()).rejects.toThrow(/edit host/u);
   });
 });
+
+describe("the example provider's copy of the contract", () => {
+  it("is identical to src/bench-provider/contract.ts below its header", async () => {
+    const { readFileSync } = await import("node:fs");
+    const strip = (s: string) => s.slice(s.indexOf("// Bench provider contract v1:"));
+    expect(strip(readFileSync("examples/bench-provider-local/contract.ts", "utf8"))).toBe(strip(readFileSync("src/bench-provider/contract.ts", "utf8")));
+  });
+});

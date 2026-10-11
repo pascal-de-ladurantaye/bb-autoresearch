@@ -2,7 +2,7 @@
 // temp directories and child processes. A "machine" is a directory on this
 // machine; nothing is isolated and nothing costs anything. It exists for
 // bb-autoresearch's tests and live smoke tests, and as a worked example of the
-// contract (docs: ../../src/bench-provider/contract.ts).
+// contract (contract.ts is a copy of the repo's src/bench-provider/contract.ts).
 //
 // All logic lives here so tests can drive it without BB; server.ts only
 // registers the handlers.
@@ -25,7 +25,7 @@ import {
   type ErrorCode,
   type HostState,
   type MethodOutput,
-} from "../../src/bench-provider/contract.ts";
+} from "./contract.ts";
 
 export interface LocalBenchProviderOptions {
   /** Where machines and the registry live. Default `<tmpdir>/bb-bench-provider-local`. */
