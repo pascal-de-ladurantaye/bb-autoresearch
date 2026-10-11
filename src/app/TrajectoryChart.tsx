@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
 import { improvementText, pct, VERDICT, VERDICT_TONE, type MetricInfo } from "./format.ts";
 
 export interface TrajectoryData {
-  points: Array<{ n: number; verdict: string; effect: number; position: number; at: number }>;
+  points: Array<{ n: number; verdict: string; effect: number | null; position: number; at: number }>;
   steps: Array<{ n: number; value: number }>;
 }
 
@@ -74,7 +74,7 @@ export function TrajectoryChart({ data, metric, lastN, onSelect }: { data: Traje
   const hovered = hover !== null ? data.points.find((p) => p.n === hover) : undefined;
   return (
     <div className="relative" ref={box}>
-      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label={`Trajectory: ${data.points.length} measured candidates; best is ${improvementText(geo.cur, metric)} than base`}>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label={`Trajectory: ${data.points.filter((p) => p.effect !== null).length} measured candidates${data.points.some((p) => p.effect === null) ? `, ${data.points.filter((p) => p.effect === null).length} without a measurement` : ""}; best is ${improvementText(geo.cur, metric)} than base`}>
         <g className="text-border">
           {geo.ticks.map((t) => (
             <g key={t}>
@@ -105,7 +105,7 @@ export function TrajectoryChart({ data, metric, lastN, onSelect }: { data: Traje
             key={p.n}
             role="button"
             tabIndex={0}
-            aria-label={`c/${p.n} ${VERDICT[p.verdict]?.label ?? p.verdict}: ${improvementText(p.effect, metric, { factor: false })} than best at the time. Open it.`}
+            aria-label={`c/${p.n} ${VERDICT[p.verdict]?.label ?? p.verdict}: ${p.effect === null ? "not measured (shown on the best line at the time)" : `${improvementText(p.effect, metric, { factor: false })} than best at the time`}. Open it.`}
             className={cn("cursor-pointer outline-none focus-visible:[&>*]:stroke-[3]", VERDICT_TONE[p.verdict] ?? "text-muted-foreground", p.verdict !== "win" && "opacity-80")}
             onMouseEnter={() => setHover(p.n)}
             onMouseLeave={() => setHover(null)}
@@ -127,14 +127,14 @@ export function TrajectoryChart({ data, metric, lastN, onSelect }: { data: Traje
       <div className={cn("pointer-events-none absolute right-2 top-2 rounded-md border border-border bg-card px-2 py-1 text-xs text-foreground shadow-sm", !hovered && "invisible")} aria-hidden>
         {hovered ? (
           <>
-            c/{hovered.n} · <span className={VERDICT_TONE[hovered.verdict]}>{VERDICT[hovered.verdict]?.label ?? hovered.verdict}</span> · {improvementText(hovered.effect, metric, { factor: false })} than best then
+            c/{hovered.n} · <span className={VERDICT_TONE[hovered.verdict]}>{VERDICT[hovered.verdict]?.label ?? hovered.verdict}</span> · {hovered.effect === null ? "not measured" : `${improvementText(hovered.effect, metric, { factor: false })} than best then`}
           </>
         ) : (
           "—"
         )}
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Up is better: improvement vs base, in {metric.name} ({metric.direction} is better). Line: best. Marks: ● win · × lose · ○ other verdicts.
+        Up is better: improvement vs base, in {metric.name} ({metric.direction} is better). Line: best. Marks: ● win · × lose · ○ other verdicts (unmeasured ones on the best line).
       </p>
     </div>
   );

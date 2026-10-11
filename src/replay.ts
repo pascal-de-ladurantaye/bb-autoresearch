@@ -29,7 +29,7 @@ import {
   type Stage,
   type WorkerPhase,
 } from "./live-model.ts";
-import { improvementText, runningStatusText, verdictCause, type MetricInfo, type NoiseClass } from "./present.ts";
+import { bestHeadlineText, improvementText, runningStatusText, verdictCause, type MetricInfo, type NoiseClass } from "./present.ts";
 import { titleKey, upNext } from "./scheduler.ts";
 
 /** Everything replay needs: immutable metadata plus the timestamped event rows and the measurements' bands. */
@@ -570,6 +570,12 @@ export class ReplayModel {
     );
     const history = bestHistory(s.wins, metric.direction);
     const value = history.length ? history.at(-1)!.value : null;
+    // Segments the headline spans at t (the first one has no segment.started event).
+    let segments = 1;
+    for (const e of this.events) {
+      if (e.at > t) break;
+      if (e.kind === "segment.started" && typeof e.data.segment === "number") segments = Math.max(segments, e.data.segment);
+    }
     const bestCand = s.best !== null ? s.cands[s.best] : undefined;
     const winnerKey = s.best !== null ? this.workerKeyOf(this.candByN.get(s.best), {}) : null;
     const measuring = inFlight.filter((c) => c.stage === "measuring" || c.stage === "confirming").map((c) => `c/${c.n}`);
@@ -585,7 +591,8 @@ export class ReplayModel {
       lastEventId: s.lastEventId,
       studyThreadId: b.studyThreadId,
       best: {
-        text: value === null ? null : improvementText(value, metric),
+        text: value === null ? null : bestHeadlineText(value, metric, segments),
+        segments,
         n: s.best,
         at: bestCand?.decidedAt ?? null,
         value,
@@ -631,7 +638,7 @@ export class ReplayModel {
       else if (e.kind === "study.state" && d.to === "paused") out.push({ at: e.at, kind: "pause", label: `Paused${typeof d.reason === "string" ? `: ${clip(d.reason, 60)}` : ""}` });
       else if (e.kind === "study.state" && d.to === "running") out.push({ at: e.at, kind: "resume", label: d.from === "paused" ? "Resumed" : "Running" });
       else if (e.kind === "study.state" && d.to === "harvesting") out.push({ at: e.at, kind: "harvest", label: "Harvest started" });
-      else if (e.kind === "segment.started") out.push({ at: e.at, kind: "segment", label: `Segment ${String(d.segment)}: new oracle` });
+      else if (e.kind === "segment.started") out.push({ at: e.at, kind: "segment", label: d.auto === true ? `Segment ${String(d.segment)}: recalibrated (same oracle)` : `Segment ${String(d.segment)}: new oracle` });
     }
     return out;
   }

@@ -118,14 +118,31 @@ export function upNext<T extends Pick<IdeaRow, "id" | "title" | "theme" | "pinne
     out.push({ idea: next, blocked: null });
     run.push(next);
   }
-  const perTheme = Math.ceil(w / 2);
   const lost = opts.lostTitles ?? new Set<string>();
   const rest = pool.filter((i) => !picked.has(i.id)).sort((a, b) => b.pinned - a.pinned || b.priority - a.priority || a.id - b.id);
+  const ahead = out.map((x) => x.idea);
   for (const idea of rest) {
-    const reason = repeatsLostIdea(idea, lost) ? "repeats an idea that lost" : idea.theme ? `waits: ${perTheme} running on ${idea.theme}` : "waits";
+    const reason = repeatsLostIdea(idea, lost) ? "repeats an idea that lost" : idea.theme ? themeWait(idea.theme, running, ahead, w) : "waits";
     out.push({ idea, blocked: reason });
   }
   return out;
+}
+
+/**
+ * Why an idea waits on the theme cap, counting what really runs apart from
+ * the ideas queued ahead of it that will take the theme's slots first:
+ * "waits: 1 running on algo", "waits: #12 goes first on algo (1 at a time)",
+ * "waits: 1 running and #12 first on algo".
+ */
+export function themeWait(theme: string, running: readonly Pick<IdeaRow, "theme">[], ahead: readonly Pick<IdeaRow, "id" | "theme">[], w: number): string {
+  const perTheme = Math.ceil(w / 2);
+  const r = running.filter((x) => x.theme === theme).length;
+  const first = ahead.filter((x) => x.theme === theme).map((x) => `#${x.id}`);
+  const firstText = first.length ? `${first.slice(0, 2).join(", ")}${first.length > 2 ? ` and ${first.length - 2} more` : ""} first` : "";
+  if (r && firstText) return `waits: ${r} running and ${firstText} on ${theme}`;
+  if (r) return `waits: ${r} running on ${theme}`;
+  if (firstText) return `waits: ${firstText} on ${theme} (${perTheme} at a time)`;
+  return `waits: ${theme} is at its cap (${perTheme} at a time)`;
 }
 
 export interface BudgetState {

@@ -4,14 +4,18 @@ import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
 import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
 import type { StackRecord } from "./harvest.ts";
-import { checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
+import { changeFrom, changeWords, checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
 import { singleMachineText } from "./single-machine.ts";
 import { benchQueueOrder, queuePosition } from "./live-model.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { accountingFor, standaloneText } from "./report.ts";
 import { oracleHash, type StudySpec } from "./spec.ts";
+import { metricSnapshotOf, type MetricSnapshot } from "./snapshot.ts";
 import {
+  bestHeadlineText,
+  reasonText,
+  segmentRawText,
   ciText,
   compound,
   compoundOne,
@@ -103,7 +107,12 @@ function metricOf(spec: StudySpec | null): MetricInfo {
 function headlineText(engine: Engine, s: StudyRow, spec: StudySpec | null): string {
   const cum = engine.cumulative(s);
   if (cum === null) return s.state === "draft" ? "not started" : s.state === "calibrating" ? "calibrating" : "no win yet";
-  return improvementText(cum, metricOf(spec));
+  return bestHeadlineText(cum, metricOf(spec), segmentsSpanned(s));
+}
+
+/** How many segments best vs base spans (the headline compounds every promotion, whatever its segment). */
+export function segmentsSpanned(s: Pick<StudyRow, "segment">): number {
+  return Math.max(1, s.segment ?? 1);
 }
 
 /** Notices since the human last looked, without the audit trail of their own controls. */
@@ -241,7 +250,8 @@ export function utilization(engine: Engine, s: StudyRow): Utilization {
 export interface TrajectoryPoint {
   n: number;
   verdict: string;
-  effect: number;
+  /** Null for a verdict without a measurement (conflict, failed tests, rejected): the mark sits on the best line then. */
+  effect: number | null;
   /** Where the candidate sat relative to base: best-at-measure-time compounded with its effect. */
   position: number;
   at: number;
@@ -254,7 +264,11 @@ export function trajectory(engine: Engine, s: StudyRow): { points: TrajectoryPoi
   const points: TrajectoryPoint[] = [];
   const steps: Array<{ n: number; value: number }> = [{ n: 0, value: 0 }];
   for (const c of decided) {
-    if (c.effect === null) continue;
+    if (c.effect === null) {
+      // Never measured (a conflict, failed tests, outside the scope): an "other verdict" mark on the best line at the time.
+      points.push({ n: c.n, verdict: c.verdict ?? "?", effect: null, position: cum, at: c.decided_at ?? c.submitted_at });
+      continue;
+    }
     const position = compoundOne(cum, c.effect, direction);
     points.push({ n: c.n, verdict: c.verdict ?? "?", effect: c.effect, position, at: c.decided_at ?? c.submitted_at });
     if (c.verdict === "win") {
@@ -532,7 +546,8 @@ export async function candidateDetail(engine: Engine, s: StudyRow, n: number) {
     promotedSha: c.promoted_sha,
     againstSha: c.against_sha,
     ref: `refs/studies/${s.slug}/c/${c.n}`,
-    reasons: safeJson<string[]>(c.reasons_json) ?? [],
+    /** The verdict's reasons in the page's format (older ones' raw "(CI 13.58%..21.99%, n=6)" rewritten). */
+    reasons: (safeJson<string[]>(c.reasons_json) ?? []).map((r) => reasonText(r, spec?.oracle.noise ?? "noisy")),
     metrics: safeJson<Record<string, unknown>>(c.metrics_json),
     diag: (safeJson<string[]>(c.diag_json) ?? []).slice(0, 40),
     gateOutput: c.gate_output,
@@ -1121,29 +1136,8 @@ interface CandidateMetrics extends StoredGuardrails {
 }
 
 /** Raw metric values of the active segment's baseline and of the current best (medians as measured). */
-export function metricSnapshot(engine: Engine, s: StudyRow): { baselineSha: string | null; bestSha: string | null; baseline: Metrics | null; best: Metrics | null } {
-  const { store } = engine.ctx;
-  const seg = store.segment(s.id, s.segment);
-  const baselineSha = seg?.baseline_sha ?? s.base_sha;
-  const decided = store.candidates(s.id, { stages: ["decided"] });
-  const runOf = (sha: string | null): Metrics | null => {
-    if (!sha || s.best_run_sha !== sha) return null;
-    return safeJson<{ metrics?: Metrics }>(s.best_run_json)?.metrics ?? null;
-  };
-  const measuredAgainst = decided.find((c) => c.against_sha === baselineSha && safeJson<CandidateMetrics>(c.metrics_json)?.best);
-  const baseline = measuredAgainst ? (safeJson<CandidateMetrics>(measuredAgainst.metrics_json)!.best ?? null) : runOf(baselineSha);
-  let best: Metrics | null = null;
-  if (s.best_sha && s.best_sha === baselineSha) best = baseline;
-  else {
-    const promoted = decided.find((c) => c.promoted_sha === s.best_sha);
-    best = (promoted ? safeJson<CandidateMetrics>(promoted.metrics_json)?.candidate : null) ?? runOf(s.best_sha);
-    if (!best) {
-      // Measured against the current best (a later candidate's "best" side).
-      const later = [...decided].reverse().find((c) => c.against_sha === s.best_sha && safeJson<CandidateMetrics>(c.metrics_json)?.best);
-      best = later ? (safeJson<CandidateMetrics>(later.metrics_json)!.best ?? null) : null;
-    }
-  }
-  return { baselineSha, bestSha: s.best_sha, baseline, best };
+export function metricSnapshot(engine: Engine, s: StudyRow): MetricSnapshot {
+  return metricSnapshotOf(engine.ctx.store, s);
 }
 
 export type GuardrailState = "pass" | "warn" | "inconclusive" | "broken" | "missing";
@@ -1231,7 +1225,8 @@ function guardrailCheck(regression: number, lo: number | null | undefined, hi: n
 
 /** "no change from best (limit 5.0% worse)", "3.1% worse than the segment base (CI …; total limit 10.0% worse)". */
 function checkText(c: GuardrailCheck, against: string, limitWord: string): string {
-  const change = Math.abs(c.regression) < 0.00005 ? `no change from ${against}` : `${magnitudePct(c.regression, 1)} ${c.regression > 0 ? "worse" : "better"} than ${against}`;
+  // The Live rows' rule (guardrails.ts changeWords): under 0.05% reads "no change", never "0.0% better".
+  const change = changeFrom(c.regression, against);
   const ci = rangeWords(c.lo, c.hi);
   return `${change} (${ci ? `${ci}; ` : ""}${limitWord} ${magnitudePct(c.limit, 1)} worse)`;
 }
@@ -1417,6 +1412,8 @@ export function secondaryMetricsView(engine: Engine, s: StudyRow) {
       headroomText: headroomWords(g.name, usable ? pos : null, totalLimit),
       /** Worst regression any single promotion had against the best before it. */
       worstStep,
+      /** "worst single promotion 1.2% worse", "worst single promotion: no change" (null without promotions). */
+      worstStepText: worstStep === null ? null : changeWords(worstStep) === "no change" ? "worst single promotion: no change" : `worst single promotion ${changeWords(worstStep)}`,
       trend: trend(g.name),
     };
   });
@@ -1440,19 +1437,23 @@ export function bestView(engine: Engine, s: StudyRow) {
   const snap = metricSnapshot(engine, s);
   const base = snap.baseline?.[metric.name] ?? null;
   const best = snap.best?.[metric.name] ?? null;
+  const segments = segmentsSpanned(s);
   return {
     value,
     lo: ci?.lo ?? null,
     hi: ci?.hi ?? null,
-    /** "74.7% fewer ops (3.9×)" */
-    text: value === null ? null : improvementText(value, metric),
+    /** "74.7% fewer ops (3.9×)"; across segments "81.8% lower time (5.5×) across 3 segments" */
+    text: value === null ? null : bestHeadlineText(value, metric, segments),
     signed: signedPct(value),
     factor: value === null ? "" : factorText(value, metric.direction),
     ciText: ci ? (isPointCi(ci.lo, ci.hi) ? "single runs, no CI" : `${ciText(ci.lo, ci.hi)} (compounded from the promoted candidates)`) : "",
+    /** Raw values of the current segment's baseline and of best. */
     base,
     best,
-    /** "210,802 → 53,300 opcodes" */
-    raw: rawChange(base, best, metric.unit),
+    /** Segments the headline spans (it compounds every promotion; raw values are this segment's). */
+    segments,
+    /** "210,802 → 53,300 opcodes"; across segments "this segment 3.62 → 2.04 s" */
+    raw: segmentRawText(base, best, metric.unit, segments),
     metric,
   };
 }
@@ -1677,6 +1678,8 @@ export function noticeAction(
       return { label: "Review calibration and start", tab: "oracle", command: `bb study start ${slug}` };
     case "calibration.failed":
       return { label: "See what failed", tab: "oracle", command: `bb study show ${slug}` };
+    case "segment.recalibrated":
+      return { label: "See calibration", tab: "oracle", command: `bb study bench ${slug}` };
     case "spec.proposed":
       if (known && s.pending_spec_version === null) return { label: "See the spec", tab: "oracle", command: `bb study show ${slug}` };
       return { label: "Review the pending spec", tab: "oracle", command: `bb study show ${slug}` };

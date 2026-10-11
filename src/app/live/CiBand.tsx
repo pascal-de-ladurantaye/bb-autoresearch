@@ -29,7 +29,7 @@ const pct = (f: number, digits = 1) => signedPct(f, digits);
 export interface MeasurementProps {
   band: MeasureBand;
   /** What the band needs of the candidate (the Live view passes its card; the candidate detail its own fields). */
-  card: Pick<LiveCard, "stage" | "verdict" | "cause" | "ideaTitle"> | null;
+  card: (Pick<LiveCard, "stage" | "verdict" | "cause" | "ideaTitle"> & Partial<Pick<LiveCard, "pairs">>) | null;
   /** Without the "c/N · idea" header (the candidate detail already shows it). */
   bare?: boolean;
   hostName: string | null;
@@ -61,7 +61,7 @@ export function Measurement({ band, card, hostName, metric, compact, onOpenCandi
         </span>
       </header>
       )}
-      {band.kind === "noisy" ? <NoisyBandView band={band} compact={compact} /> : band.kind === "deterministic" ? <DeterministicView band={band} metric={metric} /> : <ExpensiveView band={band} compact={compact} />}
+      {band.kind === "noisy" ? <NoisyBandView band={band} compact={compact} confirming={card?.stage === "confirming" && card.pairs?.run === "confirm"} /> : band.kind === "deterministic" ? <DeterministicView band={band} metric={metric} /> : <ExpensiveView band={band} compact={compact} />}
       <Guardrails states={bandGuardrails(band)} compact={compact} />
       {card?.stage === "decided" && card.cause ? (
         // The band shows the primary metric's test; when something else decided the verdict (a guardrail), say so.
@@ -96,14 +96,15 @@ function domainOf(band: NoisyBand): [number, number] {
   return [lo - pad, hi + pad];
 }
 
-function NoisyBandView({ band, compact }: { band: NoisyBand; compact: boolean }) {
+function NoisyBandView({ band, compact, confirming = false }: { band: NoisyBand; compact: boolean; confirming?: boolean }) {
   const domain = useMemo(() => domainOf(band), [band]);
   const measure = band.runs.find((r) => r.run === "measure" && r.points.length);
   const confirm = band.runs.find((r) => r.run === "confirm" && r.points.length);
-  const confirmStarted = band.runs.some((r) => r.run === "confirm");
+  // The confirmation started (its progress says so) but its first pair isn't done: keep its panel's place.
+  const confirmStarted = band.runs.some((r) => r.run === "confirm") || (confirming && !band.final);
   if (!measure) return <BandPlaceholder text={noisyPlaceholder(band, "measure")} />;
   return (
-    <div className={cn("grid gap-3", confirm && !compact ? "grid-cols-2" : "grid-cols-1")}>
+    <div className={cn("grid gap-3", (confirm || confirmStarted) && !compact ? "grid-cols-2" : "grid-cols-1")}>
       {measure ? <RunPanel band={band} run={measure} domain={domain} title={confirm ? "Measurement" : null} compact={compact} /> : null}
       {confirm ? <RunPanel band={band} run={confirm} domain={domain} title="Confirmation · fresh pairs" compact={compact} /> : confirmStarted ? <BandPlaceholder text={noisyPlaceholder(band, "confirm")} /> : null}
       {!band.exact ? <p className="text-[11px] text-muted-foreground">Recomputed from the samples (this measurement predates stored bands): the CI can differ slightly from the verdict's.</p> : null}
@@ -282,6 +283,12 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
         </g>
       </svg>
       </div>
+      {labels.regions.length < 3 ? (
+        // A region name didn't fit next to its region (the threshold sits next to 0): say the regions in words.
+        <p className="text-[11px] text-muted-foreground" data-region-legend>
+          Regions: <span className="text-destructive">lose</span> below 0 · continue from 0 to {pct(band.mde)} · <span className="text-success">win</span> above {pct(band.mde)}
+        </p>
+      ) : null}
       <RunWords band={band} run={run} />
     </figure>
   );
@@ -510,7 +517,8 @@ function GuardrailRow({ g, compact }: { g: BandGuardrailState; compact: boolean 
           {g.final ? "" : " so far"}
         </span>
       </span>
-      <span className="col-span-2 truncate text-[11px] text-muted-foreground" title={text}>
+      {/* Wraps instead of truncating: two bands side by side leave little room, and the limit is the point of the sentence. */}
+      <span className="col-span-2 break-words text-[11px] leading-snug text-muted-foreground" data-guardrail-text>
         {text}
       </span>
     </li>

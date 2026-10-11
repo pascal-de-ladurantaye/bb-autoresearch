@@ -9,8 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { bandEnd, type MeasureBand } from "../../band.ts";
-import { benchHealthText, COLUMN_INFO, COLUMNS, ordinal, PHASE_INFO, PHASE_STEPS, progressText, queuePosition, REBASE_NOTICE_MS, STAGE_LABEL, workerCountText, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
-import { improvementText } from "../../present.ts";
+import { benchHealthText, COLUMN_INFO, COLUMNS, ordinal, PHASE_INFO, PHASE_STEPS, progressText, queuePosition, REBASE_NOTICE_MS, stageText, workerCountText, type Column, type LiveBenchHost, type LiveCard, type LiveFeedItem, type LiveView, type LiveWorker, type Pairs } from "../../live-model.ts";
+import { bestHeadlineText } from "../../present.ts";
 import { VERDICT } from "../format.ts";
 import { EmptyState, ErrorLine, FOCUS_RING, Skeleton, StatePill } from "../ui.tsx";
 import { Measurement } from "./CiBand.tsx";
@@ -227,7 +227,7 @@ function LiveHeader({ v, now, compact, mode, flowing, onOpenBeside, onReplay }: 
   // The "best moved" moment: within a few seconds of the promotion (by the view's own clock, so replay shows it too).
   const moved = v.best.movedAt !== null && now >= v.best.movedAt && now - v.best.movedAt < 4000;
   const shown = useCountUp(v.best.value, flowing && moved && motion());
-  const text = shown !== null && v.best.value !== null && shown !== v.best.value ? improvementText(shown, v.metric) : v.best.text;
+  const text = shown !== null && v.best.value !== null && shown !== v.best.value ? bestHeadlineText(shown, v.metric, v.best.segments ?? 1) : v.best.text;
   return (
     <div className={cn("flex flex-wrap items-start gap-x-4 gap-y-2 rounded-lg border border-border bg-card px-3 py-2", compact && "px-2.5")}>
       <div className="min-w-0 flex-1 space-y-0.5">
@@ -247,7 +247,8 @@ function LiveHeader({ v, now, compact, mode, flowing, onOpenBeside, onReplay }: 
       <div className={cn("flex items-center gap-3", compact && "w-full justify-between")}>
         {v.best.history.length ? <Trajectory history={v.best.history} now={now} moved={moved} /> : null}
         <div className={cn("text-right", compact && "text-left")}>
-          <div className={cn("rounded px-1 text-sm font-semibold tabular-nums transition-colors duration-700", moved && "bg-success/15 text-success")} aria-live={replay ? "off" : "polite"} data-best-value={v.best.value ?? ""}>
+          {/* -mx-1 keeps the text aligned with the counts below while the highlight keeps its padding. */}
+          <div className={cn("-mx-1 rounded px-1 text-sm font-semibold tabular-nums transition-colors duration-700", moved && "bg-success/15 text-success")} aria-live={replay ? "off" : "polite"} data-best-value={v.best.value ?? ""}>
             {text ? (
               <>
                 <span className="mr-1 text-xs font-normal text-muted-foreground">best vs base</span>
@@ -263,6 +264,11 @@ function LiveHeader({ v, now, compact, mode, flowing, onOpenBeside, onReplay }: 
               <span className="text-xs font-normal text-muted-foreground">no win yet</span>
             )}
           </div>
+          {text && v.best.raw ? (
+            <div className="text-xs tabular-nums text-muted-foreground" data-best-raw>
+              {v.best.raw}
+            </div>
+          ) : null}
           <div className="text-xs tabular-nums text-muted-foreground">
             {v.counts.candidates} of {v.counts.maxCandidates} candidates · {workerCountText(v.workers.map((w) => w.phase), v.counts.targetWorkers)}
           </div>
@@ -342,7 +348,7 @@ function WorkerLanes({ v, now, compact, selected, onSelect, state, transcript }:
         <ul className="space-y-1.5">
           {workers.map((w) => (
             <li key={w.key}>
-              <Lane w={w} queue={v.queue} now={now} compact={compact} selected={selected === w.key} onSelect={() => onSelect(w.key)} rebasing={rebasing?.has(w.key) ?? false} />
+              <Lane w={w} queue={v.queue} queueTests={v.queueTests} now={now} compact={compact} selected={selected === w.key} onSelect={() => onSelect(w.key)} rebasing={rebasing?.has(w.key) ?? false} />
             </li>
           ))}
         </ul>
@@ -355,7 +361,7 @@ function WorkerLanes({ v, now, compact, selected, onSelect, state, transcript }:
   );
 }
 
-function Lane({ w, queue, now, compact, selected, onSelect, rebasing }: { w: LiveWorker; queue: readonly number[]; now: number; compact: boolean; selected: boolean; onSelect: () => void; rebasing: boolean }) {
+function Lane({ w, queue, queueTests, now, compact, selected, onSelect, rebasing }: { w: LiveWorker; queue: readonly number[]; queueTests?: readonly number[]; now: number; compact: boolean; selected: boolean; onSelect: () => void; rebasing: boolean }) {
   const info = PHASE_INFO[w.phase];
   const inPhase = now - w.phaseAt;
   const total = now - w.spawnedAt;
@@ -365,7 +371,7 @@ function Lane({ w, queue, now, compact, selected, onSelect, rebasing }: { w: Liv
   const qpos = w.candidateStage === "queued" ? (queuePosition(queue, w.candidate) ?? w.queuePosition) : null;
   const waitingOn =
     w.candidate !== null && w.candidateStage && w.candidateStage !== "decided"
-      ? `c/${w.candidate} ${w.candidateStage === "queued" && qpos ? `queued, ${ordinal(qpos)} in line` : STAGE_LABEL[w.candidateStage]}`
+      ? `c/${w.candidate} ${w.candidateStage === "queued" && qpos ? `queued, ${ordinal(qpos)} in line` : stageText(w.candidateStage, queueTests, w.candidate)}`
       : w.candidate !== null
         ? `last: c/${w.candidate}`
         : null;
@@ -561,9 +567,9 @@ function CandidateCard({ c, v, now, compact, onOpen }: { c: LiveCard; v: LiveVie
           ? `${c.stage === "confirming" ? "confirming" : "measuring"}${c.pairs ? ` · ${pairsText(c.pairs)}` : ""}`
           : c.stage === "promoting"
             ? "promoting onto best"
-            : `${STAGE_LABEL[c.stage]} · ${elapsed}`;
+            : `${stageText(c.stage, v.queueTests, c.n)} · ${elapsed}`;
   const spokenDetail = (c.stage === "measuring" || c.stage === "confirming") && c.pairs ? `${c.stage}, ${pairsText(c.pairs, { spoken: true })}` : detail;
-  const label = `c/${c.n}${c.ideaTitle ? `, ${c.ideaTitle}` : ""}: ${vd ? vd.label : STAGE_LABEL[c.stage]}${spokenDetail ? `, ${spokenDetail}` : ""}. Open the candidate.`;
+  const label = `c/${c.n}${c.ideaTitle ? `, ${c.ideaTitle}` : ""}: ${vd ? vd.label : stageText(c.stage, v.queueTests, c.n)}${spokenDetail ? `, ${spokenDetail}` : ""}. Open the candidate.`;
   if (compact) {
     return (
       <button

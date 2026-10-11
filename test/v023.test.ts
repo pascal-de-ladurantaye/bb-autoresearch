@@ -380,12 +380,13 @@ describe("v0.2.3 (fake host)", () => {
       ideaTitles: new Map(),
       notices: store.notices(id, { undelivered: true, limit: 20 }).reverse(),
     });
-    // Calibration raised its own notice: that one, and the budget one, need the human; the three controls don't.
+    // Calibration raised its own notice: that one needs the human; the budget threshold is an update (v0.2.4), the three controls an audit trail.
     const needs = store.notices(id, { undelivered: true, limit: 20 }).filter((n) => !n.kind.startsWith("control.")).length;
     expect(needs).toBe(2);
-    expect(digest.summary).toMatch(/· 2 notices for you on the Studies page/u);
+    expect(digest.summary).toMatch(/· 1 notice for you on the Studies page/u);
     expect(digest.summary).not.toMatch(/5 notices/u);
-    expect(digest.detail).toMatch(/## Notices for the human \(2\)/u);
+    expect(digest.detail).toMatch(/## Notices for the human \(1\)/u);
+    expect(digest.detail).toMatch(/## Updates \(1, informational\)/u);
     expect(digest.detail).toMatch(/## The human's own controls \(3, audit trail\)/u);
     // With only controls, the summary mentions no notices at all.
     const only = strategistDigest({ study: s, spec: store.spec(s), trigger: "start", round: 1, w: 2, verdicts: [], findings: [], ideas: [], workers: [], dossier: null, bestDiag: [], cumulative: null, budgetLine: "", ideaTitles: new Map(), notices: [{ at: 1, kind: "control.idea_added", text: "x" }] });

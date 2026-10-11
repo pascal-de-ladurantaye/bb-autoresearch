@@ -8,7 +8,8 @@ import { harvestAccounting, type Accounting, type Estimate } from "./harvest-mat
 import type { GuardrailCost, StackRecord } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
 import { bestGuardrailPositions, guardrailChainBase, segmentGuardrailCalibration } from "./pipeline.ts";
-import { amountText, ciRangeText, ciText, clipWords, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
+import { metricSnapshotOf } from "./snapshot.ts";
+import { amountText, bestHeadlineText, ciRangeText, ciText, clipWords, segmentRawText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
 
@@ -170,13 +171,16 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   const cumulative = compound(wins.filter((c) => c.effect !== null).map((c) => c.effect!), metric.direction);
   const budget = store.budget(study);
   const tokens = store.studyTokens(study.id);
+  const segments = Math.max(1, study.segment);
+  const snap = metricSnapshotOf(store, study);
+  const raw = segmentRawText(snap.baseline?.[spec.metric.name], snap.best?.[spec.metric.name], spec.metric.unit, segments);
   const lines: string[] = [
     `# Study report: ${study.slug}`,
     "",
     `> ${clip(spec.study.objective, 600)}`,
     "",
     `- State: ${study.state} · metric \`${spec.metric.name}\`${spec.metric.unit ? ` (${spec.metric.unit})` : ""}, ${spec.metric.direction} is better · ${spec.oracle.noise} oracle`,
-    `- Base \`${study.base_sha?.slice(0, 10) ?? "?"}\` → best \`${study.best_sha?.slice(0, 10) ?? "?"}\` (branch \`studies/${study.slug}/best\`): ${wins.length ? `${improvementText(cumulative, metric)} (compounded from the promoted candidates)` : "no promotion"}`,
+    `- Base \`${study.base_sha?.slice(0, 10) ?? "?"}\` → best \`${study.best_sha?.slice(0, 10) ?? "?"}\` (branch \`studies/${study.slug}/best\`): ${wins.length ? `${bestHeadlineText(cumulative, metric, segments)} (compounded from the promoted candidates)${raw ? ` · ${raw}` : ""}` : "no promotion"}`,
     `- Convention: every improvement is better-is-positive in the metric's own direction; "+10%" means 10% ${spec.metric.direction === "lower" ? "lower" : "higher"} ${spec.metric.name}.`,
     `- Candidates: ${decided.length} decided (${[...counts].map(([k, v]) => `${k} ${v}`).join(", ") || "none"}) · bench time ${formatDuration(budget.bench_seconds)} of ${spec.budget.max_bench_hours} h${tokens !== null ? ` · ${tokens.toLocaleString("en-US")} tokens${wins.length ? ` (${Math.round(tokens / wins.length).toLocaleString("en-US")} per win)` : ""}` : ""}`,
     `- Guardrails: ${spec.guardrail.map((g) => `${g.name} at most ${magnitudePct(g.max_regression, 1)} worse per promotion and ${magnitudePct(g.max_total_regression ?? g.max_regression, 1)} in total against the segment base`).join(", ") || "none"}${spec.oracle.holdout ? " · holdout: configured (results private)" : ""}`,

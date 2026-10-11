@@ -78,6 +78,30 @@ export function improvementText(f: number | null | undefined, metric: MetricInfo
   return `${mag.toFixed(digits)}% ${word} ${metric.name}${fx ? ` (${fx})` : ""}${f < 0 ? " (worse)" : ""}`;
 }
 
+/**
+ * Best vs base as the headline, across segments: every promotion compounds
+ * into it, whichever segment it landed in, so it says how many segments it
+ * spans ("81.8% lower time (5.5×) across 3 segments"). Raw values are a
+ * single segment's (each segment has its own baseline measurement): see
+ * `segmentRawText`.
+ */
+export function bestHeadlineText(value: number | null | undefined, metric: MetricInfo, segments = 1): string {
+  const text = improvementText(value, metric);
+  return segments > 1 && text !== "—" ? `${text} across ${segments} segments` : text;
+}
+
+/**
+ * The raw values next to the headline: base → best of the study (one
+ * segment), or of this segment when the headline spans several
+ * ("this segment 3.62 → 2.04 s"; "this segment: 2.04 s, no promotion yet").
+ */
+export function segmentRawText(base: number | null | undefined, best: number | null | undefined, unit: string, segments = 1): string {
+  const raw = rawChange(base, best, unit);
+  if (segments <= 1) return raw;
+  if (!raw) return "";
+  return base === best ? `this segment: ${valueWithUnit(best, unit)}, no promotion yet` : `this segment ${raw}`;
+}
+
 /** Whether a CI is a single point (deterministic measurements: one run each side, no spread). */
 export function isPointCi(lo: number | null | undefined, hi: number | null | undefined): boolean {
   return finite(lo) && finite(hi) && Math.abs(hi - lo) < 1e-12;

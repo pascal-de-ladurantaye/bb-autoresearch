@@ -43,12 +43,12 @@ import { buildBand, type BandInput, type MeasureBand, type SampleLike } from "./
 import type { GuardrailJudgement } from "./guardrails.ts";
 import { feedItems } from "./live-feed.ts";
 import { bestGuardrailPositions, measurementMde, measurementNoise } from "./pipeline.ts";
-import { improvementText, verdictCause, type MetricInfo } from "./present.ts";
+import { bestHeadlineText, improvementText, verdictCause, type MetricInfo } from "./present.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { REPLAY_VIEW_KINDS, type ReplayBundle } from "./replay.ts";
 import { titleKey, upNext } from "./scheduler.ts";
 import type { StudySpec } from "./spec.ts";
-import { gatesOnBench, singleMachineView, statusLine } from "./views.ts";
+import { bestView, gatesOnBench, segmentsSpanned, singleMachineView, statusLine } from "./views.ts";
 
 export { feedItems } from "./live-feed.ts";
 
@@ -581,7 +581,9 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
     lastEventId: store.lastStudyEventId(s.id),
     studyThreadId: s.study_thread_id,
     best: {
-      text: cum === null ? null : improvementText(cum, metric),
+      text: cum === null ? null : bestHeadlineText(cum, metric, segmentsSpanned(s)),
+      segments: segmentsSpanned(s),
+      raw: cum === null ? null : bestView(engine, s).raw || null,
       n: bestRow?.n ?? null,
       at: bestRow?.decided_at ?? null,
       value: cum,
@@ -674,7 +676,7 @@ function trimForReplay(kind: string, d: Record<string, unknown>): Record<string,
     const cause = verdictCause(typeof d.verdict === "string" ? d.verdict : null, d.reasons);
     return { candidate: d.candidate, n: d.n, verdict: d.verdict, effect: d.effect, reasons, ...(cause ? { cause } : {}) };
   }
-  const keep = ["candidate", "n", "from", "to", "verdict", "worker", "thread", "idea", "candidate", "host", "of", "run", "pairs", "measure_pairs", "confirm_pairs", "stop", "confirm_skipped", "seconds", "effect", "files", "label", "w", "worker_row", "priority", "pinned", "theme", "source", "segment", "ok", "decision"];
+  const keep = ["candidate", "n", "from", "to", "verdict", "worker", "thread", "idea", "candidate", "host", "of", "run", "pairs", "measure_pairs", "confirm_pairs", "stop", "confirm_skipped", "seconds", "effect", "files", "label", "w", "worker_row", "priority", "pinned", "theme", "source", "segment", "auto", "ok", "decision"];
   const out: Record<string, unknown> = {};
   for (const k of keep) if (d[k] !== undefined) out[k] = d[k];
   for (const k of ["reason", "title"]) if (typeof d[k] === "string") out[k] = clip(d[k] as string, 120);

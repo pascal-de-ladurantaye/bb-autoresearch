@@ -275,7 +275,7 @@ export function SecondaryMetrics({ o }: { o: OverviewResult }) {
                   <LimitBar used={g.used} state={g.state} />
                   <div className="mt-1">
                     <GuardrailBadge state={g.state} text={g.label} />
-                    {g.worstStep !== null ? <span className="ml-2 text-xs text-muted-foreground">worst single promotion {frac(Math.max(0, g.worstStep), 1)} worse</span> : null}
+                    {g.worstStepText ? <span className="ml-2 text-xs text-muted-foreground">{g.worstStepText}</span> : null}
                   </div>
                   <div className="text-xs text-muted-foreground">{g.headroomText}</div>
                   {g.promotions ? (

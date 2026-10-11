@@ -9,7 +9,7 @@ import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type Plug
 import { EngineError, type Caller, type Engine } from "./engine.ts";
 import { errText, evalTimes } from "./pipeline.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
-import { ciText, magnitudePct, sharePct, signedPct, verdictCause } from "./present.ts";
+import { ciText, magnitudePct, reasonText, sharePct, signedPct, verdictCause } from "./present.ts";
 import {
   benchHostsView,
   benchView,
@@ -173,7 +173,7 @@ function candidateLine(c: { n: number; stage: string; verdict: string | null; ef
   // A win's reason restates its effect; other verdicts say why (a guardrail loss names the guardrail, not the primary win).
   const reasons = safeJson<string[]>(c.reasons_json) ?? [];
   const reason = c.verdict === "win" ? undefined : (verdictCause(c.verdict, reasons) ?? reasons[0]);
-  return `c/${c.n} ${what}${eff} · idea #${c.idea_id ?? "?"}${reason ? ` · ${clip(reason, 100)}` : ""}`;
+  return `c/${c.n} ${what}${eff} · idea #${c.idea_id ?? "?"}${reason ? ` · ${clip(reasonText(reason), 100)}` : ""}`;
 }
 
 function studyState(engine: Engine, slug: string) {

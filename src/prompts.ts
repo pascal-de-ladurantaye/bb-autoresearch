@@ -284,9 +284,27 @@ export function isControlNotice(kind: string): boolean {
   return kind.startsWith("control.");
 }
 
+/**
+ * Notices that only report progress (a new best, a budget threshold, a stall,
+ * rate limits, a published harvest, an automatic recalibration): worth
+ * knowing, nothing for the human to do. Everything else that isn't a control
+ * asks for a decision or a fix (approve, start, resume, harvest, check a host).
+ */
+const INFORMATIONAL_NOTICES = new Set(["best.new", "budget.threshold", "stall", "rate_limit", "usage.tight", "harvest.published", "segment.recalibrated"]);
+
+export function isInformationalNotice(kind: string): boolean {
+  return INFORMATIONAL_NOTICES.has(kind);
+}
+
+/** A notice the human needs to act on ("for you"). */
+export function isActionableNotice(kind: string): boolean {
+  return !isControlNotice(kind) && !isInformationalNotice(kind);
+}
+
 export function strategistDigest(d: DigestInput): AgentMessage {
-  // Only notices that need the human count as "for you"; their own controls are listed for the strategist, apart.
-  const forHuman = d.notices.filter((n) => !isControlNotice(n.kind));
+  // Only notices that need the human count as "for you"; updates and their own controls are listed for the strategist, apart.
+  const forHuman = d.notices.filter((n) => isActionableNotice(n.kind));
+  const updates = d.notices.filter((n) => isInformationalNotice(n.kind));
   const controls = d.notices.filter((n) => isControlNotice(n.kind));
   const queued = d.ideas.filter((i) => i.status === "queued");
   const running = d.ideas.filter((i) => i.status === "running");
@@ -328,6 +346,11 @@ export function strategistDigest(d: DigestInput): AgentMessage {
   if (forHuman.length) {
     lines.push(`## Notices for the human (${forHuman.length})`, "Relay these to the human in one or two lines; do not act on them yourself.");
     for (const n of forHuman.slice(0, 10)) lines.push(`- ${new Date(n.at).toISOString().slice(0, 16).replace("T", " ")} [${n.kind}] ${quoted(n.text, 500)}`);
+    lines.push("");
+  }
+  if (updates.length) {
+    lines.push(`## Updates (${updates.length}, informational)`, "Progress the human can see on the Studies page; nothing for them to do. Don't count them as notices for the human.");
+    for (const n of updates.slice(0, 10)) lines.push(`- ${new Date(n.at).toISOString().slice(0, 16).replace("T", " ")} [${n.kind}] ${quoted(n.text, 300)}`);
     lines.push("");
   }
   if (controls.length) {

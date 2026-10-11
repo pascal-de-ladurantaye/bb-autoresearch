@@ -217,6 +217,20 @@ export const STAGE_LABEL: Record<Stage, string> = {
   decided: "decided",
 };
 
+/**
+ * A candidate in the Tests stage in words: its tests are running, or (in
+ * single-machine mode) it waits for the bench lock to run them. The card,
+ * the lane and the bench queue say the same thing.
+ */
+export function gatingText(queueTests: readonly number[] | undefined, n: number): string {
+  return queueTests?.includes(n) ? "waiting for the bench to run tests" : "tests running";
+}
+
+/** A stage in words for one candidate (the Tests stage depends on whether it holds the bench yet). */
+export function stageText(stage: Stage, queueTests: readonly number[] | undefined, n: number): string {
+  return stage === "gating" ? gatingText(queueTests, n) : STAGE_LABEL[stage];
+}
+
 // --------------------------------------------------------------- the view
 
 export interface LiveWorker {
@@ -338,6 +352,10 @@ export interface LiveView {
     history: Array<{ at: number; n: number; value: number }>;
     /** Lanes that rebase on their next submission because best moved (live workers other than the winner's). */
     rebases: number[];
+    /** Segments the headline spans (every promotion compounds into it); absent: 1. */
+    segments?: number;
+    /** Raw values base → best: the study's, or this segment's when the headline spans several ("this segment 3.62 → 2.04 s"). */
+    raw?: string | null;
   };
   /** `workers` counts live workers, finishing ones included (`finishing` of them); `targetWorkers` is W. */
   counts: { candidates: number; maxCandidates: number; workers: number; finishing?: number; targetWorkers: number; queue: number };
