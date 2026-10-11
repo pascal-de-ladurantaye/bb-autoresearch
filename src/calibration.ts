@@ -362,6 +362,8 @@ export async function runAutoRecalibration(ctx: Ctx, pipeline: Pipeline, studyId
   }
   const ok = results.filter((r): r is { h: BenchHostRow; outcome: CalibrationOutcome; problem: null } => r.outcome !== null);
   const first = ok[0]!.outcome;
+  // A run of best for the new baseline (raw values on the page, single-run classes' cache).
+  if (first.bestRun) store.updateStudy(study.id, { best_run_json: JSON.stringify(first.bestRun), best_run_sha: baseSha });
   const guardrails = worstGuardrailCalibration(ok.map((r) => r.outcome.guardrails ?? []));
   const report: CalibrationReport = {
     ok: true,

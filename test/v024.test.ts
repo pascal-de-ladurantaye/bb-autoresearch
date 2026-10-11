@@ -9,6 +9,10 @@ import { autoSideRuns, combineRuns, repeatBench, type Bench } from "../src/noise
 import { parseSpec, oracleHash, normalizeSpec, type StudySpec } from "../src/spec.ts";
 import { seededRng } from "../src/stats.ts";
 import { FakeHost, makeCtx, type FakePort } from "./helpers.ts";
+import { bestView, secondaryMetricsView, trajectory, candidateDetail } from "../src/views.ts";
+import { liveView } from "../src/live.ts";
+import { showStudy } from "../src/cli.ts";
+import { studyReport } from "../src/report.ts";
 
 const SLUG = "toy-v024";
 
@@ -262,5 +266,35 @@ describe("v0.2.4 engine (fake hosts)", () => {
     await engine.settle();
     expect(store.candidateByN(id, 3)!.verdict).toBe("win");
     expect(store.benchHost(id, "host_a")!.drift_status).not.toBe("drift");
+  });
+
+  it("best vs base across segments: the headline compounds every segment and says so; raw values are this segment's (Overview, CLI, Live, report)", async () => {
+    const id = await running({ drift: "every = 0\nrecalibrate_below = 0.6" });
+    await submit("thr_w1", "TA", 500, 1000); // 50% lower, 5× shorter runs: segment 2 starts
+    await engine.settle();
+    expect(store.study(id)!.segment).toBe(2);
+    let b = bestView(engine, store.study(id)!);
+    expect(b.text).toBe("50.0% lower size (2.0×) across 2 segments");
+    expect(b.raw).toBe("this segment: 500 ms, no promotion yet");
+    await submit("thr_w2", "TB", 250, 1000); // another 50% in segment 2
+    await engine.settle();
+    expect(store.candidateByN(id, 2)!.verdict).toBe("win");
+    b = bestView(engine, store.study(id)!);
+    expect(b.text).toBe("75.0% lower size (4.0×) across 2 segments");
+    expect(b.raw).toBe("this segment 500 → 250 ms");
+    const s = store.study(id)!;
+    expect(showStudy(engine, SLUG, 0)).toContain("75.0% lower size (4.0×) across 2 segments · this segment 500 → 250 ms");
+    const live = liveView(engine, s);
+    expect(live.best).toMatchObject({ text: "75.0% lower size (4.0×) across 2 segments", segments: 2, raw: "this segment 500 → 250 ms" });
+    expect(studyReport(engine.ctx, s, store.spec(s), null)).toContain("75.0% lower size (4.0×) across 2 segments (compounded from the promoted candidates) · this segment 500 → 250 ms");
+  });
+
+  it("a candidate's verdict reasons read like the rest of the page (CI +x% to +y%, n pairs)", async () => {
+    const id = await running();
+    await submit("thr_w1", "TA", 800);
+    await engine.settle();
+    const d = await candidateDetail(engine, store.study(id)!, 1);
+    expect(d!.reasons[0]).toMatch(/^primary metric improved 20\.0% \((CI \+[\d.]+% to \+[\d.]+%, )?\d+ pairs?\)$/u);
+    expect(d!.reasons.join(" ")).not.toMatch(/n=\d|\.\./u);
   });
 });
