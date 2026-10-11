@@ -12,6 +12,9 @@ import { benchProviderContract, type BenchProviderMethod } from "../src/bench-pr
 import type { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";
 import { gatesSerialized } from "../src/pipeline.ts";
+import { liveView } from "../src/live.ts";
+import { remoteLines } from "../src/remote/view.ts";
+import { benchView } from "../src/views.ts";
 import { Clock, localRunner, makeCtx, waitFor, type FakePort } from "./helpers.ts";
 
 const SLUG = "toy-remote";
@@ -219,6 +222,16 @@ describe("remote bench hosts (example provider, real git)", () => {
       expect(m.cores).toBe(1);
     }
     expect(new Set(alive().map((m) => m.labels.slot))).toEqual(new Set(["0.1", "0.2"]));
+    // The views: the Bench tab's remote section, the Live strip, `bb study bench` lines.
+    const bv = benchView(engine, s);
+    expect(bv.remote.live).toBe(2);
+    expect(bv.remote.entries[0]).toMatchObject({ provider: "bench-provider-local", hosts: 2, cores: 1, setup: true, seed: { state: "ok" } });
+    expect(bv.remote.machines.every((m) => m.state === "ready" && m.calibration?.noiseFloor !== null && m.rotation?.startsWith("replacement starts in"))).toBe(true);
+    expect(bv.remote.baseBundle?.bytes).toBeGreaterThan(0);
+    expect(bv.hosts.filter((h) => h.mode === "remote").every((h) => h.remote?.provider === "bench-provider-local")).toBe(true);
+    const lv = liveView(engine, s);
+    expect(lv.bench.filter((b) => b.remote?.state === "ready")).toHaveLength(2);
+    expect(remoteLines(bv.remote, clock.now()).join("\n")).toMatch(/bench-provider-local #\d+ \(slot 0\.1, 1 cores.*ready, idle · ends in 30 min · noise/u);
     // A candidate is measured on a remote machine; its commit travelled as a small delta bundle.
     const id = queue(50);
     const c = await decided(id);

@@ -5,6 +5,7 @@
 // from the same view models the study page uses (src/views.ts). Text output
 // uses the same numbers and wording as the page (src/present.ts: an
 // improvement is positive when it is better, in the metric's own terms).
+import { remoteLines, remoteView } from "./remote/view.ts";
 import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type PluginCliRegistration } from "@get-bb/plugin-sdk";
 import { EngineError, type Caller, type Engine } from "./engine.ts";
 import { errText, evalTimes } from "./pipeline.ts";
@@ -539,15 +540,16 @@ function segmentLine(engine: Engine, s: StudyRow): string {
 
 function benchLines(engine: Engine, s: StudyRow): string[] {
   const hosts = benchHostsView(engine, s);
-  if (!hosts.length) return ["  none yet (set at calibration)"];
-  return hosts.map(
+  const remote = remoteLines(remoteView(engine, s, (() => { try { return engine.ctx.store.spec(s); } catch { return null; } })()), engine.ctx.now());
+  if (!hosts.length) return remote.length ? remote : ["  none yet (set at calibration)"];
+  return [...hosts.map(
     (h) =>
-      `  ${h.name} [${h.mode === "clone" ? "own clone via git bundles" : "local checkouts"}] ${h.status}` +
+      `  ${h.name} [${h.mode === "clone" ? "own clone via git bundles" : h.mode === "remote" ? `remote machine (${h.remote?.provider ?? "provider"})` : "local checkouts"}] ${h.status}` +
       ` · health ${h.healthOk === null ? "not checked" : h.healthOk ? "ok" : `FAILING (${h.problems.join("; ")})`}${h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toISOString().slice(11, 19)}` : ""}` +
       ` · ${h.measuring !== null ? `measuring c/${h.measuring}` : h.gating !== null ? `testing c/${h.gating} (gates hold the bench)` : "idle"} · drift ${h.driftStatus ?? "not run"} (${h.evalsSinceDrift}/${h.driftEvery} evals)` +
       `${h.sideRuns && h.sideRuns > 1 ? ` · ${h.sideRuns} runs a side` : ""}${h.runSeconds ? ` · one run ≈ ${h.runSeconds < 10 ? h.runSeconds.toFixed(2) : h.runSeconds.toFixed(1)} s at calibration` : ""}` +
       ` · cached best build ${h.bestBuildSha ? h.bestBuildSha.slice(0, 10) : "none"}${h.lastTransfer ? ` · last bundle ${h.lastTransfer}` : ""}${h.healthSummary ? `\n      ${h.healthSummary}` : ""}`,
-  );
+  ), ...remote];
 }
 
 function benchText(engine: Engine, slug: string): string {

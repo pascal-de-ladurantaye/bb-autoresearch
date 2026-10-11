@@ -303,6 +303,8 @@ export interface LiveBenchHost {
   /** Share of the recent window the bench lock was held (all studies on this lock), or null before any running time. */
   utilization: number | null;
   windowSeconds: number;
+  /** A remote machine lent by a bench provider: provider, shape, lifecycle state, expiry, rotation (live view only). */
+  remote?: { provider: string; slot: string; cores: number; state: string; stateText: string; expiresAt: number | null; rotation: string | null; noiseFloor: number | null; mde: number | null } | null;
 }
 
 export interface LiveIdea {

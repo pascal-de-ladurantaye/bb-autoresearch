@@ -63,7 +63,11 @@ export function feedItems(
       }
       case "gate.started":
         if (typeof d.candidate === "number") gatingAt.set(d.candidate, e.at);
-        push(`c/${n} tests started on ${typeof d.host === "string" ? ctx.hostName(d.host) : "the bench"}, holding the bench (single-machine mode)`);
+        push(
+          typeof d.host === "string" && d.host.startsWith("remote-")
+            ? `c/${n} tests started on ${ctx.hostName(d.host)} (gates on the remote machines)`
+            : `c/${n} tests started on ${typeof d.host === "string" ? ctx.hostName(d.host) : "the bench"}, holding the bench (single-machine mode)`,
+        );
         break;
       case "gate.flaky":
         push(`c/${n} a test was flaky (passed on the retry)`, "warn");
@@ -135,6 +139,18 @@ export function feedItems(
         break;
       case "worker.abandoned":
         push(`The worker on ${idea(d.idea)} stopped${d.reason ? `: ${clip(String(d.reason), 60)}` : ""}`, "warn", null);
+        break;
+      case "remote.requested":
+        push(`A remote machine (${String(d.provider ?? "provider")}, ${String(d.cores ?? "?")} cores) is joining${typeof d.replaces === "number" ? ` to replace #${d.replaces}` : ""}`, "info", null);
+        break;
+      case "remote.ready":
+        push(`${typeof d.host === "string" ? ctx.hostName(d.host) : "A remote machine"} ${d.recalibrated ? "recalibrated" : "joined"}: noise ${typeof d.noise_floor === "number" ? `${(d.noise_floor * 100).toFixed(2)}%` : "?"} per pair, measuring from now on`, "info", null);
+        break;
+      case "remote.retiring":
+        push(`${typeof d.host === "string" ? ctx.hostName(d.host) : "A remote machine"} retires (${clip(String(d.reason ?? ""), 60)}): it takes no new work`, "info", null);
+        break;
+      case "remote.left":
+        push(`${typeof d.host === "string" ? ctx.hostName(d.host) : "A remote machine"} left: ${clip(String(d.reason ?? ""), 80)}`, d.expected ? "info" : "warn", null);
         break;
       case "drift.checked":
         push(`Drift check on ${typeof d.host === "string" ? ctx.hostName(d.host) : "the bench"}: ${d.ok ? "noise as calibrated" : "noise drifted"}`, d.ok ? "info" : "warn", null);

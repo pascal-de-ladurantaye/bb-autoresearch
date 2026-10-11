@@ -290,7 +290,7 @@ export function isControlNotice(kind: string): boolean {
  * knowing, nothing for the human to do. Everything else that isn't a control
  * asks for a decision or a fix (approve, start, resume, harvest, check a host).
  */
-const INFORMATIONAL_NOTICES = new Set(["best.new", "budget.threshold", "stall", "rate_limit", "usage.tight", "harvest.published", "segment.recalibrated"]);
+const INFORMATIONAL_NOTICES = new Set(["best.new", "budget.threshold", "stall", "rate_limit", "usage.tight", "harvest.published", "segment.recalibrated", "remote.lost"]);
 
 export function isInformationalNotice(kind: string): boolean {
   return INFORMATIONAL_NOTICES.has(kind);

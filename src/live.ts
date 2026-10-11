@@ -5,6 +5,7 @@
 //
 // See live-model.ts for the shared model, and docs/design.md "Implementation
 // notes: live view (part 1)".
+import { remoteView, type RemoteMachineView } from "./remote/view.ts";
 import type { Ctx } from "./context.ts";
 import type { AppendedEvent, CandidateRow, EventRow, Store, StudyRow, ThreadRow } from "./db/store.ts";
 import type { Engine } from "./engine.ts";
@@ -412,6 +413,10 @@ export const LIVE_VIEW_KINDS = [
   "measure.finished",
   "measure.restarted",
   "measure.deferred",
+  "remote.requested",
+  "remote.ready",
+  "remote.retiring",
+  "remote.left",
   "best.promoted",
   "worker.spawned",
   "worker.finished",
@@ -538,6 +543,7 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
   const windowStart = now - UTILIZATION_WINDOW_S * 1000;
   const intervals = store.benchIntervals(s.id, { since: windowStart });
   const runningFrom = runningStart(store, s);
+  const remote = remoteView(engine, s, spec ?? null);
   const bench: LiveBenchHost[] = store.benchHosts(s.id).map((h) => {
     const m = measuringRows.find((c) => c.bench_host_id === h.host_id);
     const started = m ? lastAt(events, "measure.started", m.id) : null;
@@ -557,8 +563,14 @@ export function liveView(engine: Engine, s: StudyRow): LiveView {
             ? { kind: "drift" as const, startedAt: lastHostAt(events, "drift.started", h.host_id) }
             : null,
       ...utilization(intervals.filter((i) => i.host_id === h.host_id).map((i) => ({ start: i.started_at, end: i.ended_at })), now, runningFrom),
+      ...(h.mode === "remote" ? { remote: remoteLive(remote.machines.find((m) => m.benchHostId === h.host_id)) } : {}),
     };
   });
+  // Remote machines that don't measure yet (joining, calibrating) or anymore (retiring) show in the strip too.
+  for (const m of remote.machines) {
+    if (m.state === "gone" || bench.some((b) => b.hostId === m.benchHostId)) continue;
+    bench.push({ hostId: m.benchHostId, name: m.name, status: "unknown", healthOk: null, healthRecord: null, deferredUntil: null, current: null, utilization: null, windowSeconds: UTILIZATION_WINDOW_S, remote: remoteLive(m) });
+  }
 
   // Up next: the queue in the scheduler's own pick order (theme cap and no-repeat rule included).
   const w = s.target_workers ?? engine.maxWorkers(s);
@@ -737,4 +749,9 @@ export function replayBundle(engine: Engine, s: StudyRow): ReplayBundle {
     events,
     bands,
   };
+}
+
+function remoteLive(m: RemoteMachineView | undefined): LiveBenchHost["remote"] {
+  if (!m) return null;
+  return { provider: m.provider, slot: m.slot, cores: m.cores, state: m.state, stateText: m.stateText, expiresAt: m.expiresAt, rotation: m.rotation, noiseFloor: m.calibration?.noiseFloor ?? null, mde: m.calibration?.mde ?? null };
 }

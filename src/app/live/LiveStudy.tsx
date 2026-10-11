@@ -680,8 +680,16 @@ function BenchHost({ h, now, compact, noise, band, onOpenCandidate }: { h: LiveB
     <div className={cn("rounded-lg border border-border bg-card px-3 py-2", compact && "px-2.5")}>
       <div className="flex items-center gap-2 text-sm">
         <span className="min-w-0 flex-1 truncate font-medium">{h.name}</span>
-        <span className={cn("text-xs", h.status === "offline" || h.healthOk === false ? "text-warning-text" : "text-muted-foreground")}>{health}</span>
+        <span className={cn("text-xs", h.status === "offline" || h.healthOk === false ? "text-warning-text" : "text-muted-foreground")}>{h.remote && h.remote.state !== "ready" ? h.remote.state : health}</span>
       </div>
+      {h.remote ? (
+        <div className="text-[11px] text-muted-foreground">
+          remote · {h.remote.provider} · {h.remote.cores} cores
+          {h.remote.expiresAt !== null ? ` · ${h.remote.expiresAt >= now ? `ends in ${clock(h.remote.expiresAt - now)}` : "ended"}` : ""}
+          {h.remote.noiseFloor !== null ? ` · noise ${(h.remote.noiseFloor * 100).toFixed(2)}%` : ""}
+          {h.remote.rotation ? ` · ${h.remote.rotation}` : ""}
+        </div>
+      ) : null}
       {cur?.kind === "measure" ? (
         <div className="mt-1 space-y-1">
           <div className="flex items-center gap-2 text-xs">
@@ -699,11 +707,13 @@ function BenchHost({ h, now, compact, noise, band, onOpenCandidate }: { h: LiveB
           <button type="button" className={cn("rounded font-mono font-medium underline-offset-2 hover:underline", FOCUS_RING)} onClick={() => onOpenCandidate(cur.n)}>
             c/{cur.n}
           </button>
-          <span className="text-muted-foreground">testing (single-machine mode: tests hold the bench)</span>
+          <span className="text-muted-foreground">{h.remote ? "testing (gates on this machine)" : "testing (single-machine mode: tests hold the bench)"}</span>
           <span className="ml-auto tabular-nums text-muted-foreground">{clock(now - cur.startedAt)}</span>
         </div>
       ) : cur?.kind === "drift" ? (
         <div className="mt-1 text-xs text-muted-foreground">Drift check (A/A on best){cur.startedAt ? ` · ${clock(now - cur.startedAt)}` : ""}</div>
+      ) : h.remote && h.remote.state !== "ready" ? (
+        <div className="mt-1 text-xs text-muted-foreground">{h.remote.stateText}</div>
       ) : (
         <div className="mt-1 text-xs text-muted-foreground">Idle</div>
       )}

@@ -8,6 +8,7 @@ import { dependencyReasons, prOrder, stackOrderText } from "./harvest-math.ts";
 import { changeFrom, changeWords, checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
 import { singleMachineText } from "./single-machine.ts";
+import { remoteView } from "./remote/view.ts";
 import { benchQueueOrder, queuePosition } from "./live-model.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { accountingFor, standaloneText } from "./report.ts";
@@ -411,6 +412,8 @@ export function benchHostsView(engine: Engine, s: StudyRow) {
       sideRuns: h.side_runs,
       runSeconds: h.run_seconds,
       repoPath: h.mode === "clone" ? h.repo_path : null,
+      /** Remote machines: provider, slot, state, expiry and rotation (null for BB machines). */
+      remote: h.mode === "remote" ? remoteSummary(engine, s, h.host_id) : null,
       lastTransfer: t ? `${t.bytes} B (${t.purpose}, ${t.chunks} chunk${t.chunks === 1 ? "" : "s"})` : null,
       bundles: sent.length,
       bundleBytes: sent.reduce((a, x) => a + x.bytes, 0),
@@ -859,6 +862,12 @@ export function oracleView(engine: Engine, s: StudyRow) {
   };
 }
 
+/** A remote bench host's lifecycle in a few fields (bench host lists, the Live strip). */
+export function remoteSummary(engine: Engine, s: StudyRow, benchHostId: string): { provider: string; slot: string; state: string; stateText: string; cores: number; expiresAt: number | null; rotation: string | null } | null {
+  const m = remoteView(engine, s, specOf(engine, s)).machines.find((x) => x.benchHostId === benchHostId);
+  return m ? { provider: m.provider, slot: m.slot, state: m.state, stateText: m.stateText, cores: m.cores, expiresAt: m.expiresAt, rotation: m.rotation } : null;
+}
+
 /** Bench tab: machines, queue, health history, drift checks, bundle transfers, recent bench intervals. */
 export function benchView(engine: Engine, s: StudyRow) {
   const { store } = engine.ctx;
@@ -874,6 +883,8 @@ export function benchView(engine: Engine, s: StudyRow) {
   const seenHealth = new Set<string>();
   return {
     hosts: benchHostsView(engine, s),
+    /** Remote bench hosts: entries (provider, shape, seed) and machines (state, expiry, rotation, calibration). */
+    remote: remoteView(engine, s, specOf(engine, s)),
     queue,
     utilization: utilization(engine, s),
     singleMachine: singleMachineView(engine, s),
@@ -1519,6 +1530,7 @@ export interface NeedsYouItem {
     | "paused"
     | "bench_unhealthy"
     | "bench_offline"
+    | "remote_bench"
     | "harvest_ready"
     | "harvest_failed"
     | "publish_failed";
@@ -1642,6 +1654,25 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
       }
     }
   }
+  // Remote bench entries that can't add machines: a refused seed, or joins that keep failing.
+  if (["running", "harvesting", "calibrating"].includes(s.state)) {
+    for (const e of remoteView(engine, s, specOf(engine, s)).entries) {
+      if (!e.blocked && e.seed?.state !== "refused") continue;
+      const refused = e.seed?.state === "refused";
+      items.push({
+        id: `remote_bench:${e.index}`,
+        kind: "remote_bench",
+        tone: "alert",
+        title: refused ? `Remote bench ${e.index + 1} (${e.provider}): the seed was refused` : `Remote bench ${e.index + 1} (${e.provider}) can't add machines`,
+        short: refused ? "seed refused" : "remote bench failing",
+        detail: refused ? `${e.seed?.detail ?? "the credential scan matched files"}. Remove them from the seed, or list known test fixtures in seed_allow with a spec change.` : `${e.blocked}. Check the provider plugin and the entry's setup.`,
+        tab: "bench",
+        action: { kind: "open_bench" },
+        command: `bb study bench ${slug}`,
+        at: engine.ctx.now(),
+      });
+    }
+  }
   const h = store.latestHarvest(s.id);
   if (h && s.state === "harvesting") {
     if (h.state === "ready" && h.publish_state !== "published") {
@@ -1750,6 +1781,9 @@ export function noticeAction(
     case "drift":
     case "bench.unhealthy":
     case "bench.offline":
+    case "remote.lost":
+    case "remote.failed":
+    case "remote.seed_refused":
       return { label: "Open Bench", tab: "bench", command: `bb study bench ${slug}` };
     case "stall":
       return { label: "Steer the ideas", tab: "ideas", command: `bb study ideas add ${slug} "<idea>"` };

@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { BenchHostList } from "./BenchHosts.tsx";
+import { RemoteBench } from "./RemoteBench.tsx";
 import { useLive } from "./data.ts";
 import { ago, bytes, duration, frac, ratio, shortSha } from "./format.ts";
 import { EmptyState, Mono, Section, Stat, TabState } from "./ui.tsx";
@@ -31,6 +32,12 @@ export function BenchTab({ slug, onOpenCandidate }: { slug: string; onOpenCandid
       </div>
 
       {v.singleMachine && (v.singleMachine.on || v.singleMachine.quietBench) ? <p className="text-xs text-muted-foreground">{v.singleMachine.text}</p> : null}
+
+      {v.remote.entries.length || v.remote.machines.length ? (
+        <Section title={`Remote bench hosts (${v.remote.live} running)`}>
+          <RemoteBench v={v.remote} onOpenCandidate={onOpenCandidate} />
+        </Section>
+      ) : null}
 
       <Section title={`Bench hosts (${v.hosts.length})`}>{v.hosts.length ? <BenchHostList hosts={v.hosts} queueDepth={v.queue.length} /> : <EmptyState>Bench hosts are set when the study is calibrated.</EmptyState>}</Section>
 
