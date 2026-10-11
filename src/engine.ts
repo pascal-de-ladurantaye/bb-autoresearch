@@ -16,7 +16,7 @@ import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
 import { studyReport } from "./report.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
 import { ciText, compound, improvementText, type MetricInfo } from "./present.ts";
-import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief } from "./prompts.ts";
+import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief, type CodeInfo } from "./prompts.ts";
 import { actionLabel, itemLabel } from "./action.ts";
 import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
@@ -653,7 +653,7 @@ export class Engine {
     if (!strategist || strategist.role !== "strategist" || strategist.state !== "active") return false;
     const spec = this.store.spec(fresh);
     const candidates = new Map(promotions.filter((p) => p.n !== null).map((p) => [p.n!, this.store.candidateByN(study.id, p.n!)] as const));
-    const text = harvestRoundPrompt({ study: fresh, spec, harvest, promotions, candidates, dossier: this.store.dossier(study.id) });
+    const text = harvestRoundPrompt({ study: fresh, spec, harvest, promotions, candidates, dossier: this.store.dossier(study.id), code: this.codeInfo(fresh, spec) });
     this.store.tx(() => {
       this.store.updateStudy(study.id, { round_in_flight: 1, rounds: fresh.rounds + 1, last_round_at: this.ctx.now(), last_round_event_id: this.store.lastEventId() });
       this.store.event(study.id, "strategist.round", "plugin", { round: fresh.rounds + 1, trigger: "harvest", harvest: harvest.id, promotions: promotions.length });
@@ -1584,6 +1584,12 @@ export class Engine {
     }
   }
 
+  /** Where best's code is, for strategist rounds (prompts.ts codeLines). */
+  codeInfo(study: StudyRow, spec: StudySpec): CodeInfo {
+    const promotions = this.store.candidates(study.id, { stages: ["decided"] }).filter((c) => c.verdict === "win" && c.promoted_sha !== null).length;
+    return { base: spec.study.base, baseSha: study.base_sha, best: bestBranch(study.slug), bestSha: study.best_sha, promotions, repoPath: study.repo_path };
+  }
+
   private async sendRound(study: StudyRow, trigger: RoundTrigger): Promise<void> {
     if (!study.study_thread_id) return;
     const spec = this.store.spec(study);
@@ -1616,6 +1622,7 @@ export class Engine {
       ideaTitles: titles,
       notices,
       guardrailPositions: bestGuardrailPositions(this.store, study, spec),
+      code: this.codeInfo(study, spec),
     });
     this.store.tx(() => {
       this.store.updateStudy(study.id, {

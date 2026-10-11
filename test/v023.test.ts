@@ -5,6 +5,7 @@
 // on word and code-span boundaries, signs, dependency wording, health
 // checks recorded as events and read by replay, and the candidate detail's
 // band and sample rows.
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { layoutLabels, niceTicks, pctTickDigits, trendDomain } from "../src/chart.ts";
 import type { Store } from "../src/db/store.ts";
@@ -13,7 +14,7 @@ import { limitCheckWords } from "../src/guardrails.ts";
 import { liveView, replayBundle } from "../src/live.ts";
 import { benchHealthText, benchQueueOrder, progressText, queuePosition, workerCountText } from "../src/live-model.ts";
 import { clipWords, effectStatisticText, runningStatusText, workersDoingText } from "../src/present.ts";
-import { strategistDigest } from "../src/prompts.ts";
+import { codeLines, strategistDigest } from "../src/prompts.ts";
 import { revertedWords } from "../src/report.ts";
 import { ReplayModel } from "../src/replay.ts";
 import { sampleTableRows } from "../src/sample-rows.ts";
@@ -442,5 +443,68 @@ describe("v0.2.3 (fake host)", () => {
     const rows = sampleTableRows(d.samples, { name: "size", direction: "lower" }, d.noise);
     expect(rows[0]!.label).toBe("pair 1");
     void clock;
+  });
+});
+
+describe("strategist rounds say where best's code is", () => {
+  let host: FakeHost;
+  let engine: Engine;
+  let store: Store;
+  let port: FakePort;
+
+  beforeEach(() => {
+    host = new FakeHost();
+    const made = makeCtx(host);
+    ({ store, port } = made);
+    engine = new Engine(made.ctx);
+    host.refs.set("main", host.commit("T0", null, "base"));
+    host.metric.set("T0", 1000);
+    port.addThread("thr_study");
+  });
+  afterEach(() => engine.live.dispose());
+
+  it("the Code block names the base and best with their commits, before and after a promotion, and the -C form", async () => {
+    await engine.proposeStudy("thr_study", "proj_1", spec({ maxWorkers: 1 }));
+    await engine.calibrate(SLUG, "human");
+    await engine.waitForCalibration(SLUG, 5_000);
+    engine.addIdea(SLUG, { title: "Idea A", theme: "a", pinned: false }, "human");
+    await engine.start(SLUG, "human");
+    await engine.settle();
+    const s0 = store.study(SLUG)!;
+    const round = port.sent.find((m) => m.threadId === "thr_study" && m.summary.startsWith("[autoresearch] Strategist round"))!;
+    expect(round.agentOnly).toContain("## Code");
+    expect(round.agentOnly).toContain(`- Study base: \`main\` at \`${s0.base_sha!.slice(0, 12)}\`.`);
+    expect(round.agentOnly).toContain(`- Best: \`studies/${SLUG}/best\` at \`${s0.best_sha!.slice(0, 12)}\`, 0 promotions so far (best is still the base).`);
+    expect(round.agentOnly).toContain("Your own checkout may be on another commit; read code at best this way. Don't check out or commit in your own checkout.");
+    expect(round.agentOnly).toContain(`\`git show studies/${SLUG}/best:<path>\``);
+    expect(round.agentOnly).toContain(`\`git grep -n <pattern> studies/${SLUG}/best\``);
+    expect(round.agentOnly).toContain(`\`git diff --stat ${s0.base_sha!.slice(0, 12)}..studies/${SLUG}/best\``);
+    expect(round.agentOnly).toContain(`\`git log --oneline ${s0.base_sha!.slice(0, 12)}..studies/${SLUG}/best\``);
+    expect(s0.repo_path).toBeTruthy();
+    expect(round.agentOnly).toContain(`\`git -C ${s0.repo_path} show studies/${SLUG}/best:<path>\``);
+    // After a promotion: best's new commit and the count.
+    host.nextSnapshotFor.set("/wt/thr_w1", { tree: "TA" });
+    host.metric.set("TA", 600);
+    await engine.submit("thr_w1", "change TA");
+    await engine.settle();
+    const s1 = store.study(SLUG)!;
+    expect(s1.best_sha).not.toBe(s0.best_sha);
+    const block = codeLines(engine.codeInfo(s1, store.spec(s1))).join("\n");
+    expect(block).toContain(`- Best: \`studies/${SLUG}/best\` at \`${s1.best_sha!.slice(0, 12)}\`, 1 promotion so far. Workers start from it.`);
+    expect(block).toContain(`at \`${s0.base_sha!.slice(0, 12)}\``);
+  });
+
+  it("quotes a repository path with spaces in the -C form", () => {
+    const block = codeLines({ base: "main", baseSha: "a".repeat(40), best: "studies/x/best", bestSha: "b".repeat(40), promotions: 2, repoPath: "/tmp/my repo" }).join("\n");
+    expect(block).toContain("`git -C '/tmp/my repo' show studies/x/best:<path>`");
+  });
+
+  it("the skills tell the strategist to read best through git, and that its environment can be any checkout", () => {
+    const auto = readFileSync(new URL("../skills/autoresearch/SKILL.md", import.meta.url), "utf8");
+    expect(auto).toMatch(/git show studies\/<slug>\/best:<path>/u);
+    expect(auto).toMatch(/Don't check out or commit in your own checkout/u);
+    expect(auto).toMatch(/-C <study repo path>/u);
+    const create = readFileSync(new URL("../skills/study-create/SKILL.md", import.meta.url), "utf8");
+    expect(create).toMatch(/study thread may run in any environment of the project/u);
   });
 });

@@ -49,6 +49,7 @@ Draft (spec proposed with `study_propose`) → Calibrating (`bb study calibrate`
 
 Messages starting with `[autoresearch] Strategist round` carry a digest: recent verdicts, findings, the idea board, best's diagnostics, the dossier, budget. Each round:
 
+- read code at best, not in your own checkout: your environment is whatever was picked when the study was created (often a worktree of the project's default branch), so it may be on another commit. Each round's "Code" block names the study base and `studies/<slug>/best` with their commits. Read best without switching branches, from any checkout of the same repository (refs are shared across its worktrees): `git show studies/<slug>/best:<path>`, `git grep -n <pattern> studies/<slug>/best`, `git diff --stat <base>..studies/<slug>/best`, `git log --oneline <base>..studies/<slug>/best`. If your checkout isn't a worktree of the study's repository, add `-C <study repo path>` (the block gives that form). Don't check out or commit in your own checkout.
 - keep the idea queue full and diverse: `study_queue_ideas` (title, rationale, theme, priority, optional `start_ref` like `c/12`, optional `variation_of`). At most ceil(W/2) workers run one theme at once.
 - lost ideas are never assigned again; an idea that repeats a lost one's title is skipped unless you set `variation_of` to the lost idea's id and say what is different
 - retire dead directions: `study_retire_idea`

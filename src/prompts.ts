@@ -208,6 +208,47 @@ export function nudgeMessage(minutes: number): string {
   return `[autoresearch] You have been idle for ${minutes.toFixed(0)} minutes with no submission pending. Either study_submit_candidate, or study_record_finding and study_finish. If you stay idle you will be stopped and the idea marked abandoned.`;
 }
 
+/** Where the study's code is: the base, best's branch and commit, and the repository the refs live in. */
+export interface CodeInfo {
+  /** The study base as configured ([study] base). */
+  base: string;
+  baseSha: string | null;
+  /** `studies/<slug>/best`. */
+  best: string;
+  bestSha: string | null;
+  /** Promotions onto best so far. */
+  promotions: number;
+  /** The study's repository on the edit host (the -C form works from any directory). */
+  repoPath: string | null;
+}
+
+const shellArg = (s: string) => (/^[\w./@:+-]+$/u.test(s) ? s : `'${s.replace(/'/gu, "'\\''")}'`);
+
+/**
+ * The "Code" block of strategist rounds: the strategist's own environment
+ * can be any checkout of the project (often on the default branch), so as
+ * promotions land it would keep reading base. It reads best through git
+ * instead, without switching branches: refs are shared by every worktree of
+ * the repository, and `git -C <repo>` works from anywhere.
+ */
+export function codeLines(c: CodeInfo): string[] {
+  const base = c.baseSha ? c.baseSha.slice(0, 12) : c.base;
+  const g = (cmd: string) => `\`git ${cmd}\``;
+  const gc = (cmd: string) => `\`git -C ${shellArg(c.repoPath ?? ".")} ${cmd}\``;
+  const cmds = [`show ${c.best}:<path>`, `grep -n <pattern> ${c.best}`, `diff --stat ${base}..${c.best}`, `log --oneline ${base}..${c.best}`];
+  return [
+    "## Code",
+    `- Study base: \`${c.base}\`${c.baseSha ? ` at \`${c.baseSha.slice(0, 12)}\`` : ""}.`,
+    `- Best: \`${c.best}\`${c.bestSha ? ` at \`${c.bestSha.slice(0, 12)}\`` : ""}, ${c.promotions} promotion${c.promotions === 1 ? "" : "s"} so far${c.promotions === 0 ? " (best is still the base)" : ""}. Workers start from it.`,
+    "- Your own checkout may be on another commit; read code at best this way. Don't check out or commit in your own checkout.",
+    `- From any checkout of this repository (refs are shared across its worktrees): ${cmds.map(g).join(", ")}.`,
+    ...(c.repoPath
+      ? [`- If your checkout is not a worktree of the study's repository (\`git rev-parse --git-common-dir\` differs, or there is no repository), run git against it with -C: ${cmds.map(gc).join(", ")}.`]
+      : []),
+    "",
+  ];
+}
+
 export interface DigestInput {
   study: StudyRow;
   spec: StudySpec;
@@ -226,6 +267,8 @@ export interface DigestInput {
   notices: Array<{ at: number; kind: string; text: string }>;
   /** Best's position per guardrail against the segment base. */
   guardrailPositions?: Record<string, Position>;
+  /** Where best's code is and how to read it (the "Code" block). */
+  code?: CodeInfo;
 }
 
 const TRIGGER_TEXT: Record<RoundTrigger, string> = {
@@ -280,6 +323,7 @@ export function strategistDigest(d: DigestInput): AgentMessage {
         ]
       : []),
     "",
+    ...(d.code ? codeLines(d.code) : []),
   ];
   if (forHuman.length) {
     lines.push(`## Notices for the human (${forHuman.length})`, "Relay these to the human in one or two lines; do not act on them yourself.");
@@ -350,6 +394,8 @@ export interface HarvestRoundInput {
   promotions: Array<{ sha: string; n: number | null; title: string; paths: string[] }>;
   candidates: Map<number, CandidateRow | undefined>;
   dossier: { version: number; text: string } | null;
+  /** Where best's code is and how to read it (the "Code" block). */
+  code?: CodeInfo;
 }
 
 /** The harvest grouping round: one turn asking the strategist for study_propose_harvest. */
@@ -360,6 +406,7 @@ export function harvestRoundPrompt(d: HarvestRoundInput): AgentMessage {
     "",
     `Best is final for this harvest: ${d.promotions.length} promotion(s) on \`studies/${d.study.slug}/best\`, oldest first. Each changeset becomes one PR; the plugin then measures each one's contribution by reverting it from best (ablation), checks it alone on the base, and drafts the PRs. You don't run anything.`,
     "",
+    ...(d.code ? codeLines(d.code) : []),
     "## Promotions",
   ];
   for (const p of d.promotions) {

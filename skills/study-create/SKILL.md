@@ -132,7 +132,7 @@ Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries m
 
 ## 4. Submit
 
-Call `study_propose` with the full TOML. If it returns errors, fix them and call it again (same slug). This thread becomes the study thread: later you receive `[autoresearch]` strategist rounds here.
+Call `study_propose` with the full TOML. If it returns errors, fix them and call it again (same slug). This thread becomes the study thread: later you receive `[autoresearch]` strategist rounds here. The study thread may run in any environment of the project (a managed worktree, the project checkout on any branch): it only reads code, and it reads best through git without switching branches (`git show studies/<slug>/best:<path>`; each round's "Code" block gives the commands), so don't move this thread's checkout to follow best.
 
 Then tell the human, in two or three lines, that the study waits for them on the **Studies** page (sidebar → Studies → `<slug>`; the header badge of this thread links there):
 
