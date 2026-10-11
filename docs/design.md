@@ -30,7 +30,7 @@ The last pass before release closed two guardrail gaps and three usability issue
 
 After the release, a **Live** view was added (part 1 of 2): while a study runs, the study page opens on a Live tab, and the same view can sit beside the study thread in its split pane. Every change it shows is recorded as an event, so a later replay can rebuild it at any time (see "Implementation notes: live view (part 1)"). Part 2 added a CI band per measurement that narrows pair by pair to the sequential test's decision (computed from the samples with the decision's own seeded bootstrap, so it shows exactly the CI the verdict saw), a "last action" line per worker, a visible "best moved" moment, and a replay of any study with a timeline scrubber (see "Implementation notes: live view (part 2)").
 
-Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes"); v0.2.2 adds single-machine mode (gates take turns with measurements on a machine that is both edit and bench host, and an optional quiet bench that holds new worker turns while it measures) and commits in the studied repository as the repository's own git identity (see "Implementation notes: single-machine mode"); v0.2.3 fixes the UI issues found while capturing the marketplace screenshots, tells the strategist where best's code is, and stops archiving from spawning replacement workers (see "Implementation notes: v0.2.3").
+Released as `bb-autoresearch` (plugin id `bb-autoresearch`, shown as **Autoresearch**), MIT licensed, at https://github.com/pascal-de-ladurantaye/bb-autoresearch. v0.1.0 shipped M0–M3, the human interface pass and the guardrail fixes; v0.2.0 adds the read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay (see "Implementation notes: live view", parts 1 and 2); v0.2.1 fixes wording and one link: the Oracle tab's noise sentence per noise class (and "not measured" without a noise floor), guardrail losses that say why instead of showing a gain next to "lose", single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, and worker lanes linked to their candidates through the plugin's own worker row (see "Implementation notes: v0.2.1 fixes"); v0.2.2 adds single-machine mode (gates take turns with measurements on a machine that is both edit and bench host, and an optional quiet bench that holds new worker turns while it measures) and commits in the studied repository as the repository's own git identity (see "Implementation notes: single-machine mode"); v0.2.3 fixes the UI issues found while capturing the marketplace screenshots, tells the strategist where best's code is, and stops archiving from spawning replacement workers (see "Implementation notes: v0.2.3"); v0.2.4 fixes what a 5.6-hour blind study on a large repository showed (bench time spent on candidates that could no longer win, on clear losses and on confirming big wins; drift pauses that were really shorter runs; measurements and promotions after a drift pause; harvest stacks whose layers didn't apply) and the UI issues found while capturing the store screenshots (see "Implementation notes: v0.2.4").
 
 What has not been exercised live at all: GitHub publishing (only against a mock `gh`), provider usage windows (this machine's providers report none), rate-limit retries (no rate limit occurred), remote edit hosts (not built).
 
@@ -277,13 +277,15 @@ identity = "repo"               # repo | plugin: who the plugin's commits in the
 - Each side gets `w` warmup runs.
 - **Paired, interleaved runs.** Each pair runs `best` and the candidate back to back, in random order. Machine drift hits both sides of a pair equally and cancels out.
 - **Statistic.** The plugin takes the paired relative difference for each pair and computes a bootstrap confidence interval of the median.
+- **Side runs.** Each side of a pair can be several runs of `measure`, keeping each metric's best value (`side_runs`, chosen at calibration so a side lasts at least `min_side_seconds`).
 - **Sequential decision.** After `n_min` pairs, it stops early when the result is clear:
   - clearly worse (the CI is entirely on the regression side): `lose`
   - clearly better (the lower bound clears the minimum detectable effect): `win`
+  - it can no longer win (the upper bound is below the minimum detectable effect): `inconclusive` (futility)
   - still ambiguous at `n_max` pairs: `inconclusive`
 
-  Most candidates are clear losses, so stopping early saves most of the bench time.
-- **Confirmation.** A `win` is measured again with fresh pairs before promotion. Many candidates against a noisy benchmark produce false wins by chance, and a false promotion compounds.
+  Before `n_min`, a clear loss can stop it from 3 pairs, when a stricter interval is entirely below zero. Most candidates are clear losses, so stopping early saves most of the bench time.
+- **Confirmation.** A `win` is measured again with fresh pairs before promotion. Many candidates against a noisy benchmark produce false wins by chance, and a false promotion compounds. A win whose CI's lower bound is several times the threshold skips it: no chance fluctuation gets that far.
 
 ### Calibration and drift
 
@@ -293,7 +295,9 @@ Calibration runs the full protocol with base against itself (A/A), several times
 
 If the minimum detectable effect is larger than any plausible win, the study goes back to Draft. That costs minutes instead of a week of tokens.
 
-During Running, a schedule repeats an A/A run on `best` every N evaluations. If noise grows past 2× the calibrated level, the study pauses and notifies the human. A disturbed bench machine would otherwise hand out random verdicts.
+During Running, a schedule repeats an A/A run on `best` every N evaluations. If noise grows past 2× the calibrated level, the study pauses and notifies the human. A disturbed bench machine would otherwise hand out random verdicts. While it is paused for drift, nothing more is measured on that machine.
+
+Relative noise also grows when runs get shorter: a benchmark that got 5× faster is noisier relative to itself on the same, quiet machine. When best's runs drop well below their calibrated length, the plugin recalibrates on best by itself (a new segment with the same oracle) instead of pausing.
 
 ### Guardrails and holdout
 
@@ -1653,6 +1657,82 @@ Replay showed every bench host as "not checked yet": only unhealthy streaks were
 ### Data model
 
 No migrations. New events: `bench.health` (every health check), `worker.spawn_discarded`. The replay bundle's `spec` gains `healthChecks`; `LiveBenchHost` gains `healthRecord`; `LiveView.counts` gains `finishing`; the candidate detail gains `band`, `noise`, `effectStatistic` and `hostName`.
+
+## Implementation notes: v0.2.4
+
+Fixes from a real study and from capturing the store screenshots. Same platform pins (BB 0.45.x, SDK 0.6.14).
+
+The study: 5.6 hours, blind, on a large repository, bench-bound (35 candidates, a median of 426 s of bench per candidate). A median candidate used 7 pairs; 15 of 35 stopped at `n_min` = 6 and 9 ran the full 20 pairs, mostly to an inconclusive. Every win also ran a confirmation (183 pairs over 23 candidates) and a 3-run holdout, and gates took 30 s under the bench lock. Two drift pauses came from the code getting about 5× faster: with single runs, per-pair relative noise rose from 2.0% to 8.8% on the same quiet machine, and a human switched the oracle to 3 rounds per side (noise 0.49%).
+
+### Sequential test: futility and early losses
+
+- **Futility (`[oracle.protocol] futility = true`).** After `n_min`, a measurement whose CI upper bound is below the win threshold stops as `inconclusive`: more pairs could narrow the CI but not move it above the threshold with any confidence. It is checked after the lose rule (a CI entirely below 0 is still a `lose`) and before the cap. The verdict says "effect +0.4% (CI −1.0% to +1.5%, 8 pairs) can no longer clear the 2.0% win threshold: stopped early (futility: the CI's high end is below it)". The confirmation run uses the same rule.
+- **Early losses (`early_lose_from = 3`, `early_lose_confidence = 0.99`).** From 3 pairs until `n_min`, a candidate whose 99% interval is entirely below 0 is a `lose` ("… stopped early, the whole CI is below 0 before pair 6"). Before `n_min` nothing else can stop it (no early win: false wins compound). `0` turns it off.
+- **Which interval (decision).** The early check uses a Student-t interval of the mean of the per-pair improvements, with an exact t quantile (`tQuantileExact`, the finite series of the t CDF for integer degrees of freedom, inverted by bisection; the Cornish-Fisher `tQuantile` is 12% low at 2 degrees of freedom). The bootstrap percentile CI of the median the test uses after `n_min` is badly miscalibrated at 3-5 pairs: a "99%" bootstrap CI of 3 pairs is [min, max], which covers the true median only 75% of the time, so "all three pairs worse" would have been an early loss. The first version did exactly that and called 5.0% of true +MDE effects a loss in simulation (v0.2.3: 1.3%). The t interval is deterministic (no resampling), valid at small n for roughly normal pair noise, and conservative with outliers, which inflate the SD. It catches large regressions only: with 2.8% per-pair noise, 98% of −8×MDE candidates stop at 3-4 pairs, 13% of −2×MDE ones.
+- **The band follows (`band.ts`).** Points from `early_lose_from` to `n_min` carry the early interval (`early`), computed exactly as the decision does; `pointStop` returns why a point stops the test (`win`, `lose`, `early`, `futility`, `cap`) with the same rule as `sequentialDecision`, and `runDecision` carries the reason. The decision marker is tagged ("6 of 20 · can't win", "3 of 20 · early"), an early stop draws the interval it was decided on, and the words say why: "Decided after 6 of 20 pairs: inconclusive. Estimate +0.2%, CI −1.5% to +1.4%: the CI's high end is below the +2.0% threshold, so more pairs can't make it a win (stopped early)." Bands stored before v0.2.4 have no `futility` field and are read with the old rule, as they were decided.
+
+### Confirmation skipped far beyond the threshold
+
+- **The rule (`skip_confirm_factor = 3`, `confirmationSkip` in pipeline.ts).** A noisy win whose CI lower bound is at least 3× the win threshold skips the confirmation; `0` always confirms. The verdict records it ("confirmation skipped: the CI's lower bound +13.6% is 6.8× the 2.0% win threshold (skip_confirm_factor 3)"), as does a `confirm.skipped` event and the `measure.finished` payload (the feed: "c/4 measured: 6 pairs in 2 min (confirmation skipped: far beyond the win threshold)"). Guardrails are then judged on the measurement's pairs alone, and the holdout still runs.
+- **Why it's safe.** A false win this far out needs the whole CI to be wrong by several half-widths at once; in simulation no candidate below 2× the threshold skipped, and at 10× the threshold all of them did (half the pairs of v0.2.3).
+
+### Simulation
+
+`test/v024-sim.test.ts` runs both rule sets on the same noise (common random numbers: the same noise stream and pair order per trial, and the pipeline's seeded bootstrap per pair), per-run noise 2% (2.8% per pair), threshold calibrated from 400 A/A pairs (MDE 1.35%), `n_min` 6, `n_max` 20, confirmation on; effects in units of the threshold. 1,000 candidates per cell (`SIM_TRIALS=1000`):
+
+| True effect (×MDE) | Wins v0.2.3 → v0.2.4 | Losses v0.2.3 → v0.2.4 | Pairs per candidate v0.2.3 → v0.2.4 | Futility stops | Early losses | Confirmations skipped |
+|---|---|---|---|---|---|---|
+| −8 | 0.0% → 0.0% | 100.0% → 100.0% | 6.0 → 3.9 | 0.0% | 97.8% | |
+| −4 | 0.0% → 0.0% | 100.0% → 96.1% | 6.1 → 5.1 | 3.9% | 51.4% | |
+| −2 | 0.0% → 0.0% | 96.9% → 56.9% | 8.3 → 6.2 | 43.0% | 13.3% | |
+| −1 | 0.0% → 0.0% | 63.1% → 22.0% | 13.6 → 8.0 | 74.8% | 4.3% | |
+| 0 | 0.0% → 0.0% | 14.4% → 6.8% | 18.4 → 13.4 | 60.6% | 1.1% | |
+| +1 | 1.7% → 1.7% | 1.1% → 0.8% | 21.0 → 19.4 | 15.0% | 0.3% | 0.0% |
+| +1.5 | 13.3% → 13.4% | 0.2% → 0.4% | 22.3 → 21.7 | 5.0% | 0.2% | 0.1% |
+| +2 | 44.4% → 44.5% | 0.0% → 0.1% | 21.8 → 21.6 | 1.4% | 0.1% | 0.3% |
+| +4 | 100.0% → 100.0% | 0.0% → 0.0% | 12.8 → 11.5 | 0.0% | 0.0% | 20.2% |
+| +10 | 100.0% → 100.0% | 0.0% → 0.0% | 12.0 → 6.0 | 0.0% | 0.0% | 100.0% |
+
+- **False wins** (no true effect): 0.0% under both rules (the confirmation already made them rare; skipping never fires near zero).
+- **False losses on true +MDE effects**: 0.8% (v0.2.3: 1.1%). Early losses alone: 0.3%.
+- **Missed wins**: none measurable; win rates are the same within a trial or two at every effect (futility stops 1.4% of +2×MDE candidates, which v0.2.3 would mostly not have promoted either).
+- **Bench pairs saved**: 18% over these ten cells (142 → 117 pairs per candidate summed); 27% on a null effect, 35-41% on modest regressions, 50% on 10× wins. A bench-bound study whose candidates are mostly no-effect ideas, clear losses and large wins saves more than the average.
+- **The price**: a modest regression (−1 to −2× the threshold) more often ends `inconclusive` (futility: its CI still reaches above 0) than `lose`; the worker still gets the estimate and CI, and the reason says it could no longer win. The test asserts these bounds at 150 candidates per cell on every run.
+
+### Side runs and automatic recalibration
+
+- **Side runs (`side_runs = "auto" | N`, `min_side_seconds = 5`).** Noisy oracles only: each side of a pair is N runs of `measure`, combined by `combineRuns` into each metric's best value in its own direction (the minimum for the primary metric and guardrails when lower is better, the maximum when higher is better, the minimum for informational metrics; the usual best-of-N for timings). "auto" times one warm run of each side at calibration, after the warmup, and picks N = ⌈min_side_seconds / run⌉, at most 30 (`AUTO_SIDE_RUNS_MAX`; a faster benchmark should loop itself). The count and one run's median seconds are stored per bench host (`bench_hosts.side_runs`, `run_seconds`), in the calibration report ("Each side of a pair is 5 runs of the measure command (best of 5 per metric; one run takes about 1.0 s, so 5 make a side of at least 5.0 s)"), on the Oracle tab's segments and in `bb study bench`. Measurements, drift checks and harvest measurements use the host's count (`BenchSite.bench`); a segment calibrated before v0.2.4 has none, so it keeps single runs until it recalibrates. Expensive and deterministic oracles always run once.
+- **When best's runs get much shorter (`[oracle.drift] recalibrate_below = 0.6`).** Three triggers compare one run's median time with the host's calibration, and schedule an automatic recalibration below 60% (`recalibrationTrigger`): a promotion (the winner's candidate-side runs are the new best's), any measurement (its best side), and a drift check over its limit (its best runs). The drift check's case is the one the study hit: noise up because runs got shorter is recorded as `drift.explained` and recalibrates instead of pausing; noise up at the same run time still pauses. `0` turns it off. It is a bench setting, not part of the oracle hash.
+- **The recalibration (`runAutoRecalibration`, calibration.ts).** `studies.recalibrate_due` holds why. While it is due, the study starts no measurement or drift check; once none of its measurements is on the bench (in-flight ones finish), the pipeline's `recal:<study>` job calibrates best on every bench host, each under its own lock (side runs chosen again when "auto"), and opens segment k+1 with the same oracle hash and spec version, `details_json.auto = true`, without gates (best passed them), approval or a state change. An A/A median that excludes zero is a warning here (both checkouts are best), not a failure. If the new win threshold exceeds `max_mde`, the hosts keep their old calibration and the study pauses ("automatic recalibration failed (…): …"; a needs-you item "recalibrating on best's shorter runs failed"). A `segment.recalibrated` notice (informational) gives per host the side runs, one run's time, the noise floor and the win threshold before and after. Replay labels the milestone "Segment 2: recalibrated (same oracle)".
+- **Guardrails across automatic segments (decision).** A new segment used to restart the guardrails' total limit at its baseline. An automatic one doesn't change the oracle, so `guardrailChainBase` counts from the first segment of the current run of segments with the same oracle hash; otherwise every recalibration would give the total limit its full room back. An oracle change still resets it.
+- **Stale measurements.** A measurement whose candidate reconciliation restarted elsewhere (`measure_restarts` moved on) now stops writing (`StaleMeasurementError`): a test simulating a restart without disposing the old engine showed the old job's futility stop deciding the candidate first.
+
+### Measurements wait while paused for drift
+
+A drift pause left the study `paused`, and the pipeline still measured paused studies' queued candidates, so candidates already in flight were measured on the disturbed host and promoted. Now a host whose `drift_status` is `drift` starts no measurement (of that study's), and an in-flight one on that host is cancelled and restarts from scratch later. Resume clears the host's drift status; a recalibration does too.
+
+### Best vs base across segments
+
+The headline compounds every promotion, whatever its segment, but the raw values shown were the current segment's baseline ("3.619 → 2.039 s" next to "81.8% lower"). With more than one segment the headline now says "81.8% lower time (5.5×) across 3 segments" and the raw values "this segment 3.62 → 2.04 s" ("this segment: 2.04 s, no promotion yet" right after a recalibration): `bestHeadlineText` and `segmentRawText` (present.ts), used by the Overview, the Studies list, `bb study show`, the Live header (which now shows the raw line too) and the report. Replay counts segments from `segment.started` events. The raw values come from `metricSnapshotOf` (new `src/snapshot.ts`, shared by the views and the report).
+
+### Live view and pages
+
+- **Tests waiting for the bench (single-machine mode).** A gating candidate that waits for the bench lock read "tests running · 1:19" on its card while its lane said "waiting for the bench" and the queue "c/2 tests". `gatingText`/`stageText` (live-model.ts) word the Tests stage from the view's `queueTests`: "waiting for the bench to run tests" until its gates hold the bench, then "tests running", on the card, the lane and their accessible names.
+- **Up next.** "waits: 1 running on algorithms" counted the idea queued ahead as running. `themeWait` (scheduler.ts) counts what really runs apart from the ideas that go first: "waits: 1 running on algo", "waits: #12 first on algo (1 at a time)", "waits: 1 running and #12 first on algo".
+- **Notices "for you".** Four `best.new` notices made "4 notices for you" while nothing needed the human. Strategist digests count only actionable notices (`isActionableNotice`, prompts.ts); informational ones (`best.new`, `budget.threshold`, `stall`, `rate_limit`, `usage.tight`, `harvest.published`, `segment.recalibrated`) are listed apart under "Updates (n, informational)", and controls stay an audit trail.
+- **The confirmation's placeholder.** The band's confirmation panel appeared only after its first pair. The confirmation now starts with a `measure.progress` event at 0 pairs (`run: "confirm"`), so the card says "confirmation: first pair of ≤20 running" and the band keeps the confirmation's place with its placeholder; replay sees the same event.
+- **"No change".** The Overview's guardrail column said "0.0% better than the segment base" and "worst single promotion 0.0% worse"; both use the Live rows' rule now (`changeWords`: under 0.05% is "no change"), "worst single promotion: no change".
+- **Trajectory.** A conflict, a failed gate or a rejection had no mark although the legend lists "○ other verdicts": unmeasured verdicts are ○ marks on the best line at the time, and say "not measured".
+- **Verdict reasons.** Reasons read "primary metric improved 17.8% (CI +13.6% to +22.0%, 6 pairs)" (`measuredCiText`: "single run" for deterministic, "4 runs" for expensive, "at 99%" for an early loss) instead of "(CI 13.58%..21.99%, n=6)"; the candidate detail and the CLI rewrite older reasons the same way (`reasonText`).
+- **Smaller.** Guardrail sentences under a band wrap instead of being cut ("within the 1…" with two bands side by side); when the "continue" label can't fit (the threshold next to 0), a legend under the band names the regions; the panel header's "no win yet" lines up with the counts under it; the Oracle tab marks automatic segments and shows side runs per host; the status line says when a recalibration is due.
+
+HARVEST_SECTION_PLACEHOLDER
+
+### Data model
+
+Append-only migrations: `bench_hosts.side_runs`, `bench_hosts.run_seconds`, `studies.recalibrate_due`. New events: `recalibration.due`, `recalibration.started`, `recalibration.failed`, `drift.explained`, `confirm.skipped`; `segment.started` and `calibration.ready` gain `auto`; `measure.finished` gains `stop` and `confirm_skipped`; `measure.progress` is also recorded at 0 pairs when a confirmation starts. A measured candidate's `metrics_json` gains `stop`, `confirmSkipped`, `runSeconds` (median seconds of one run per side) and `sideRuns`; calibration reports and segment details gain `sideRuns` and `runSeconds` per host. New notice kind `segment.recalibrated`. New spec keys: `[oracle.protocol] futility`, `early_lose_from`, `early_lose_confidence`, `skip_confirm_factor`, `side_runs`, `min_side_seconds` (part of the oracle hash, left out of it at their defaults so stored segments keep their hash), `[oracle.drift] recalibrate_below` (not hashed). Stored specs are read with the defaults filled in (`normalizeSpec`).
+
+SMOKE_SECTION_PLACEHOLDER
 
 ## Credits
 
