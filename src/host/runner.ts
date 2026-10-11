@@ -6,6 +6,7 @@
 //   host RPC is unavailable on a machine).
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type {
+  BaseBundle,
   BundleInfo,
   CommitInfo,
   ComposeInput,
@@ -21,9 +22,12 @@ import type {
   PrepareInput,
   PrepareResult,
   SnapshotInput,
+  SeedPack,
   SnapshotResult,
   hostSignals,
 } from "./contract.ts";
+import { baseBundle } from "./base.ts";
+import { packSeed } from "./seed.ts";
 import * as bundle from "./bundle.ts";
 import { health } from "./health.ts";
 import { JobRegistry } from "./jobs.ts";
@@ -145,6 +149,10 @@ export interface HostRunner {
   composeCommits(input: ComposeInput): Promise<ComposeResult>;
   gitRemotes(repoPath: string): Promise<Array<{ name: string; url: string }>>;
   writeExport(key: string, files: Array<{ path: string; content: string }>): Promise<string>;
+  /** Remote bench: a shallow bundle of `sha` alone, as a file on this host (the BB server's machine). */
+  baseBundle(repoPath: string, sha: string): Promise<BaseBundle>;
+  /** Remote bench: scan a seed for credentials and pack it (host/seed.ts). */
+  seedPack(input: { source: string; cwd: string; allow: string[] }): Promise<SeedPack>;
 }
 
 const GIT_TIMEOUT = 5 * 60_000;
@@ -245,6 +253,12 @@ export class BbHostRunner implements HostRunner {
   }
   async writeExport(key: string, files: Array<{ path: string; content: string }>) {
     return (await this.client.call("writeExport", { key, files }, this.opts(60_000))).dir;
+  }
+  async baseBundle(repoPath: string, sha: string) {
+    return await this.client.call("baseBundle", { repoPath, sha }, this.opts(30 * 60_000 - 60_000));
+  }
+  async seedPack(input: { source: string; cwd: string; allow: string[] }) {
+    return await this.client.call("seedPack", input, this.opts(30 * 60_000 - 60_000));
   }
 }
 
@@ -354,5 +368,11 @@ export class LocalHostRunner implements HostRunner {
   }
   async writeExport(key: string, files: Array<{ path: string; content: string }>) {
     return ops.writeExport(this.dataDir, key, files).dir;
+  }
+  baseBundle(repoPath: string, sha: string) {
+    return baseBundle(this.dataDir, repoPath, sha);
+  }
+  seedPack(input: { source: string; cwd: string; allow: string[] }) {
+    return packSeed({ dataDir: this.dataDir, ...input });
   }
 }

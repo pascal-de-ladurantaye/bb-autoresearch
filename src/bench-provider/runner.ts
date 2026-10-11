@@ -14,7 +14,8 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { BundleInfo, CommitInfo, ComposeResult, DiffSummary, ExecInput, ExecResult, GitIdentity, HealthReport, JobInput, PrepareResult, SnapshotResult } from "../host/contract.ts";
+import type { BaseBundle, BundleInfo, CommitInfo, SeedPack, ComposeResult, DiffSummary, ExecInput, ExecResult, GitIdentity, HealthReport, JobInput, PrepareResult, SnapshotResult } from "../host/contract.ts";
+import { BASE_REF } from "../host/base.ts";
 import { RunAbortedError, type HostRunner, type RunOptions } from "../host/runner.ts";
 import type { BenchProviderClient } from "./client.ts";
 import { BenchProviderError, EXEC_POLL_MAX_BYTES, type InfoOutput } from "./contract.ts";
@@ -31,8 +32,6 @@ export class RemoteHostLostError extends Error {
 export const REMOTE_ROOT = "bb-autoresearch";
 /** The ref a bundle's tip travels under (host/bundle.ts BUNDLE_REF). */
 const BUNDLE_REF = "refs/autoresearch/bundle";
-/** The ref the base bundle's tip travels under (host/base.ts). */
-export const BASE_REF = "refs/autoresearch/base";
 
 export interface RemoteRunnerOptions {
   /** The remote user's home (absolute); null until the machine is initialized. */
@@ -450,6 +449,12 @@ export class RemoteBenchRunner implements HostRunner {
   }
   async writeExport(): Promise<string> {
     return this.unsupported("writeExport");
+  }
+  async baseBundle(): Promise<BaseBundle> {
+    return this.unsupported("baseBundle");
+  }
+  async seedPack(): Promise<SeedPack> {
+    return this.unsupported("seedPack");
   }
 }
 

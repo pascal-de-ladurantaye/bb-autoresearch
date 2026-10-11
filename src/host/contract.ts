@@ -220,6 +220,17 @@ export const composeOutput = z.discriminatedUnion("status", [
 export type ComposeInput = z.infer<typeof composeInput>;
 export type ComposeResult = z.infer<typeof composeOutput>;
 
+export const baseBundleOutput = z.object({ path: absPath, sha256: z.string(), bytes: z.number().int(), cached: z.boolean() }).strict();
+export type BaseBundle = z.infer<typeof baseBundleOutput>;
+const seedFinding = z.object({ path: z.string(), rule: z.string(), line: z.number().int().nullable() }).strict();
+export const seedPackOutput = z.discriminatedUnion("ok", [
+  z
+    .object({ ok: z.literal(true), path: absPath, sha256: z.string(), fileSha256: z.string(), bytes: z.number().int(), files: z.number().int(), kind: z.enum(["dir", "tarball"]), cached: z.boolean(), allowed: z.array(seedFinding).max(5000) })
+    .strict(),
+  z.object({ ok: z.literal(false), findings: z.array(seedFinding).max(5000), allowed: z.array(seedFinding).max(5000), files: z.number().int(), error: z.string().optional() }).strict(),
+]);
+export type SeedPack = z.infer<typeof seedPackOutput>;
+
 export const hostContract = defineRpcContract({
   ping: {
     input: z.null(),
@@ -343,6 +354,16 @@ export const hostContract = defineRpcContract({
       })
       .strict(),
     output: z.object({ dir: absPath }).strict(),
+  },
+  /** A shallow git bundle of `sha` alone (remote bench machines start from it), cached under the data dir; the path is on this host. */
+  baseBundle: {
+    input: z.object({ repoPath: absPath, sha: z.string().regex(/^[0-9a-f]{40,64}$/u) }).strict(),
+    output: baseBundleOutput,
+  },
+  /** Scan a seed (directory or tarball) for credentials and, when clean, pack it as a tarball cached by content hash (host/seed.ts). */
+  seedPack: {
+    input: z.object({ source: z.string().min(1).max(4096), cwd: absPath, allow: z.array(z.string().min(1).max(400)).max(256) }).strict(),
+    output: seedPackOutput,
   },
   /** Remove plugin-owned checkouts whose key starts with `keyPrefix`. */
   removeCheckouts: {

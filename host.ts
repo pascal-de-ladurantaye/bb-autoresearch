@@ -4,7 +4,9 @@
 // background jobs, and reports machine health.
 import { experimental_defineHostEntry, type ExperimentalHostWorkerLease } from "@get-bb/plugin-sdk/host";
 import { hostContract, hostSignals } from "./src/host/contract.ts";
+import { baseBundle } from "./src/host/base.ts";
 import * as bundle from "./src/host/bundle.ts";
+import { packSeed } from "./src/host/seed.ts";
 import { health } from "./src/host/health.ts";
 import { JobRegistry } from "./src/host/jobs.ts";
 import * as ops from "./src/host/ops.ts";
@@ -30,6 +32,8 @@ export default experimental_defineHostEntry({
     diffSummary: async ({ repoPath, from, to, maxPatchBytes }) => await ops.diffSummary(repoPath, from, to, maxPatchBytes),
     removeCheckouts: async ({ repoPath, keyPrefix }, ctx) =>
       await ops.removeCheckouts(ctx.experimental_paths.dataDir, repoPath, keyPrefix),
+    baseBundle: async ({ repoPath, sha }, ctx) => await baseBundle(ctx.experimental_paths.dataDir, repoPath, sha),
+    seedPack: async ({ source, cwd, allow }, ctx) => await packSeed({ dataDir: ctx.experimental_paths.dataDir, source, cwd, allow }),
     jobStart: (input, ctx) => {
       // A running job keeps the worker alive past the 5-minute idle stop.
       const lease = ctx.experimental_retainWorker();

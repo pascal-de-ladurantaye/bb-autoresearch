@@ -412,6 +412,17 @@ export class FakeHost implements HostRunner {
     this.exports.set(key, files);
     return `/exports/${key}`;
   }
+  /** Remote bench: base bundles and seeds the edit host built (fake files). */
+  baseBundles: string[] = [];
+  async baseBundle(_repo: string, sha: string) {
+    this.baseBundles.push(sha);
+    return { path: `/fake/bundles/base-${sha}.bundle`, sha256: "0".repeat(64), bytes: 1000, cached: this.baseBundles.filter((x) => x === sha).length > 1 };
+  }
+  seedPacks: Array<{ source: string; cwd: string; allow: string[] }> = [];
+  async seedPack(input: { source: string; cwd: string; allow: string[] }) {
+    this.seedPacks.push(input);
+    return { ok: true as const, path: "/fake/seeds/seed.tar.gz", sha256: "1".repeat(64), fileSha256: "1".repeat(64), bytes: 2000, files: 3, kind: "dir" as const, cached: false, allowed: [] };
+  }
   async removeCheckouts(_repo: string, prefix: string) {
     let n = 0;
     for (const k of [...this.checkouts.keys()]) if (k.startsWith(this.coPath(prefix))) {

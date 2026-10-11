@@ -24,7 +24,7 @@ export interface SeedFinding {
 }
 
 export type SeedPackResult =
-  | { ok: true; path: string; sha256: string; bytes: number; files: number; kind: "dir" | "tarball"; cached: boolean; allowed: SeedFinding[] }
+  | { ok: true; path: string; sha256: string; fileSha256: string; bytes: number; files: number; kind: "dir" | "tarball"; cached: boolean; allowed: SeedFinding[] }
   | { ok: false; findings: SeedFinding[]; allowed: SeedFinding[]; files: number; error?: string };
 
 export interface SeedScanOptions {
@@ -316,7 +316,8 @@ export async function packSeed(opts: { dataDir: string; source: string; cwd: str
         return fail(`packing the seed failed: ${(e as Error).message}`, scan.files);
       }
     }
-    return { ok: true, path: dest, sha256, bytes: (await stat(dest)).size, files: scan.files, kind: "dir", cached, allowed: split.allowed };
+    // The upload is checked against the archive's own bytes (the cache key above is a content hash).
+    return { ok: true, path: dest, sha256, fileSha256: await fileSha256(dest), bytes: (await stat(dest)).size, files: scan.files, kind: "dir", cached, allowed: split.allowed };
   }
 
   if (!st.isFile() || !isTarName(basename(source))) {
@@ -352,7 +353,7 @@ export async function packSeed(opts: { dataDir: string; source: string; cwd: str
       return fail(`copying the seed failed: ${(e as Error).message}`, scan.files);
     }
   }
-  return { ok: true, path: dest, sha256, bytes: st.size, files: scan.files, kind: "tarball", cached, allowed: split.allowed };
+  return { ok: true, path: dest, sha256, fileSha256: sha256, bytes: st.size, files: scan.files, kind: "tarball", cached, allowed: split.allowed };
 }
 
 // ---------------------------------------------------------------- helpers
