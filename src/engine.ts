@@ -682,6 +682,13 @@ export class Engine {
       }
       return `${slug} is already archived.`;
     }
+    // The state changes first, atomically: the scheduler only spawns for a Running study, so stopping
+    // workers below (each end kicks a tick) can't make it start replacements while cleanup runs.
+    this.store.tx(() => {
+      for (const t of this.store.threads(study.id, { role: "strategist", states: ["active"] })) this.store.updateThread(t.id, { state: "finished", ended_at: this.ctx.now(), end_reason: "study archived" });
+      this.store.setStudyState(study.id, "archived", actor);
+    });
+    this.publish(study.id);
     const harvest = this.store.latestHarvest(study.id);
     if (harvest) this.harvester.cancel(harvest.id);
     let stopped = 0;
@@ -710,10 +717,6 @@ export class Engine {
     if (s.host_id && s.repo_path) {
       await this.ctx.bb.hostRunner(s.host_id).removeCheckouts(s.repo_path, `${s.slug}-`).catch((e) => this.ctx.bb.log("warn", `checkout cleanup: ${errText(e)}`));
     }
-    this.store.tx(() => {
-      for (const t of this.store.threads(study.id, { role: "strategist", states: ["active"] })) this.store.updateThread(t.id, { state: "finished", ended_at: this.ctx.now(), end_reason: "study archived" });
-      this.store.setStudyState(study.id, "archived", actor);
-    });
     const threadArchived = opts.archiveThread ? await this.archiveStudyThread(s) : false;
     this.publish(study.id);
     return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed${clones ? `, ${clones} bench clone(s) deleted` : ""}${threadArchived ? ", study thread archived" : ""}. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
@@ -1365,7 +1368,8 @@ export class Engine {
       await this.budgetNotices(this.store.study(study.id)!, spec);
     }
     const { w, hold } = this.workerTarget(this.store.study(study.id)!);
-    if (study.state === "running") {
+    // Re-read after the awaits above: the study may have been paused, harvested or archived meanwhile.
+    if (this.store.study(study.id)?.state === "running") {
       const exhausted = budgetExhausted({
         candidates: this.store.candidateCount(study.id),
         maxCandidates: spec.budget.max_candidates,
@@ -1447,6 +1451,14 @@ export class Engine {
       sectionId = await this.ctx.bb.ensureSection(`Study: ${study.slug}`).catch(() => null);
       if (sectionId) this.store.updateStudy(study.id, { section_id: sectionId });
     }
+    if (this.store.study(study.id)?.state !== "running") {
+      // The study left Running while this spawn was being prepared: don't start the thread.
+      this.store.tx(() => {
+        this.store.updateThread(row.id, { state: "failed", ended_at: this.ctx.now(), end_reason: "study left Running before the spawn" });
+        if (this.store.idea(idea.id)?.status === "running") this.store.setIdeaStatus(idea.id, "queued", "plugin", "study left Running before the spawn");
+      });
+      return false;
+    }
     const related = this.store.searchFindings(study.id, { theme: idea.theme || undefined, limit: 6 });
     const bestRun = safeJson<{ diag?: string[] }>(study.best_run_json);
     const prompt = workerBrief({
@@ -1479,8 +1491,23 @@ export class Engine {
         state: current.state === "spawning" ? "active" : current.state,
         last_active_at: this.ctx.now(),
       });
+      if (current.state !== "spawning") {
+        // The worker was ended while its spawn was in flight (the study was archived, say): stop and archive the new thread.
+        this.store.event(study.id, "worker.spawn_discarded", "plugin", { thread: spawned.threadId, idea: idea.id, reason: current.end_reason });
+        await this.endWorker(this.store.threadRow(row.id)!, "abandoned", current.end_reason ?? "ended while spawning", { alreadyEnded: true });
+        return false;
+      }
       const info = await this.ctx.bb.getThread(spawned.threadId).catch(() => null);
       if (info?.providerId) this.store.updateThread(row.id, { provider_id: info.providerId });
+      const now = this.store.study(study.id);
+      if (now?.state !== "running") {
+        // The spawn resolved after the study left Running (paused, harvesting, archived): stop and archive
+        // the new thread right away; its idea goes back to the queue unless the study is archived.
+        this.store.event(study.id, "worker.spawn_discarded", "plugin", { thread: spawned.threadId, idea: idea.id, reason: `study ${now?.state ?? "gone"}` });
+        await this.endWorker(this.store.threadRow(row.id)!, "abandoned", `study ${now?.state ?? "gone"} while the worker spawned`);
+        if (now && now.state !== "archived" && this.store.idea(idea.id)?.status === "abandoned") this.store.setIdeaStatus(idea.id, "queued", "plugin", "study left Running while the worker spawned");
+        return false;
+      }
       this.store.event(study.id, "worker.spawned", "plugin", { thread: spawned.threadId, idea: idea.id, base: baseBranch, theme: idea.theme });
       this.publish(study.id);
       return true;
@@ -1506,10 +1533,12 @@ export class Engine {
   }
 
   /** Archive + stop the worker thread, release its worktree, and close the idea. */
-  private async endWorker(w: ThreadRow, state: "finished" | "abandoned", reason: string): Promise<void> {
+  private async endWorker(w: ThreadRow, state: "finished" | "abandoned", reason: string, opts: { alreadyEnded?: boolean } = {}): Promise<void> {
     const fresh = this.store.threadRow(w.id)!;
-    if (fresh.state === "finished" || fresh.state === "abandoned" || fresh.state === "failed") return;
-    this.store.tx(() => {
+    const ended = fresh.state === "finished" || fresh.state === "abandoned" || fresh.state === "failed";
+    // `alreadyEnded`: the row was ended while its spawn was in flight; only its new thread needs stopping.
+    if (ended && !opts.alreadyEnded) return;
+    if (!ended) this.store.tx(() => {
       this.store.updateThread(w.id, { state, ended_at: this.ctx.now(), end_reason: reason });
       if (state === "abandoned" && fresh.idea_id !== null) {
         const idea = this.store.idea(fresh.idea_id);
@@ -1827,6 +1856,11 @@ export class Engine {
               if (w.idea_id !== null) this.store.setIdeaStatus(w.idea_id, "queued", "plugin", "spawn interrupted");
             });
           }
+          continue;
+        }
+        if (study.state === "archived") {
+          // An archive interrupted mid-cleanup (the state changes first): finish stopping its workers.
+          await this.endWorker(w, "abandoned", "study archived (reconcile)");
           continue;
         }
         const t = await this.ctx.bb.getThread(w.thread_id).catch(() => null);

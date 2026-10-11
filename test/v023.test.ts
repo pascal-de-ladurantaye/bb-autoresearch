@@ -508,3 +508,108 @@ describe("strategist rounds say where best's code is", () => {
     expect(create).toMatch(/study thread may run in any environment of the project/u);
   });
 });
+
+describe("archiving a running study spawns no replacement workers", () => {
+  let host: FakeHost;
+  let engine: Engine;
+  let store: Store;
+  let port: FakePort;
+
+  beforeEach(() => {
+    host = new FakeHost();
+    const made = makeCtx(host);
+    ({ store, port } = made);
+    engine = new Engine(made.ctx);
+    host.refs.set("main", host.commit("T0", null, "base"));
+    host.metric.set("T0", 1000);
+    port.addThread("thr_study");
+  });
+  afterEach(() => engine.live.dispose());
+
+  async function runningWith(ideas: string[], maxWorkers: number): Promise<string> {
+    await engine.proposeStudy("thr_study", "proj_1", spec({ maxWorkers }));
+    await engine.calibrate(SLUG, "human");
+    await engine.waitForCalibration(SLUG, 5_000);
+    ideas.forEach((title, i) => engine.addIdea(SLUG, { title, theme: `t${i}`, pinned: false }, "human"));
+    await engine.start(SLUG, "human");
+    await engine.settle();
+    return store.study(SLUG)!.id;
+  }
+
+  it("with free slots and queued ideas: no worker.spawned after the archive starts, and the state changes first", async () => {
+    const id = await runningWith(["Idea A", "Idea B", "Idea C", "Idea D", "Idea E"], 2);
+    expect(store.threads(id, { role: "worker", states: ["spawning", "active", "finishing"] })).toHaveLength(2);
+    const before = store.lastEventId();
+    await engine.archiveStudy(SLUG, "human");
+    await engine.settle();
+    await new Promise((r) => setTimeout(r, 20));
+    await engine.settle();
+    const after = store.eventsAsc(id, {}).filter((e) => e.id > before);
+    expect(after.filter((e) => e.kind === "worker.spawned")).toEqual([]);
+    expect(port.spawned).toHaveLength(2);
+    // The state change is the first thing the archive records: before any worker is stopped.
+    const firstState = after.findIndex((e) => e.kind === "study.state");
+    const firstStop = after.findIndex((e) => e.kind === "worker.abandoned");
+    expect(firstState).toBeGreaterThanOrEqual(0);
+    expect(firstState).toBeLessThan(firstStop);
+    expect(store.threads(id, { role: "worker", states: ["spawning", "active", "finishing"] })).toHaveLength(0);
+  });
+
+  it("a spawn that resolves after the archive is stopped and its thread archived", async () => {
+    const id = await runningWith(["Idea A"], 2);
+    expect(port.spawned).toHaveLength(1);
+    // Hold the next spawn until the archive has happened.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let waiting = false;
+    const orig = port.spawnWorker.bind(port);
+    port.spawnWorker = async (args) => {
+      waiting = true;
+      await gate;
+      return await orig(args);
+    };
+    engine.addIdea(SLUG, { title: "Idea B", theme: "b", pinned: false }, "human");
+    for (let i = 0; i < 100 && !waiting; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(waiting).toBe(true);
+    await engine.archiveStudy(SLUG, "human");
+    release();
+    for (let i = 0; i < 100 && port.spawned.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    await engine.settle();
+    expect(port.spawned).toHaveLength(2);
+    // The archive ended the spawning row; the thread that arrived later was stopped and archived, not recorded as a new worker.
+    const late = store.threadById("thr_w2")!;
+    expect(late.state).toBe("abandoned");
+    expect(late.end_reason).toBe("study archived");
+    expect(store.eventsAsc(id, { kinds: ["worker.spawned"] })).toHaveLength(1);
+    expect(store.eventsAsc(id, { kinds: ["worker.spawn_discarded"] })).toHaveLength(1);
+    expect(port.stopped).toContain("thr_w2");
+    expect((await port.getThread("thr_w2"))!.archivedAt).not.toBeNull();
+    expect(store.threads(id, { role: "worker", states: ["spawning", "active", "finishing"] })).toHaveLength(0);
+  });
+
+  it("a spawn that resolves after a pause is stopped and its idea goes back to the queue", async () => {
+    const id = await runningWith(["Idea A"], 2);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let waiting = false;
+    const orig = port.spawnWorker.bind(port);
+    port.spawnWorker = async (args) => {
+      waiting = true;
+      await gate;
+      return await orig(args);
+    };
+    const idea = engine.addIdea(SLUG, { title: "Idea B", theme: "b", pinned: false }, "human");
+    for (let i = 0; i < 100 && !waiting; i++) await new Promise((r) => setTimeout(r, 5));
+    engine.pause(SLUG, "human");
+    release();
+    for (let i = 0; i < 100 && port.spawned.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    await engine.settle();
+    expect(store.threadById("thr_w2")!.state).toBe("abandoned");
+    expect(port.stopped).toContain("thr_w2");
+    expect(store.idea(idea.id)!.status).toBe("queued");
+    expect(store.eventsAsc(store.study(SLUG)!.id, { kinds: ["worker.spawned"] })).toHaveLength(1);
+    // The worker that was already running keeps finishing its idea, as a pause promises.
+    expect(store.threadById("thr_w1")!.state).toBe("active");
+    void id;
+  });
+});
