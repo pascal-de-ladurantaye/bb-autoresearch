@@ -90,7 +90,7 @@ wait.
    promotions:
    - The strategist groups the promotions into changesets (or one per promotion, if you tick that in the dialog or pass `--one-per-promotion`).
    - Each changeset is ablated: best with it reverted is measured against best. Its contribution is shown as a share of the base→best gain, in points and metric units, with the CI. A revert conflict or a gate failure becomes a dependency, explained in words, and dependent changesets form a stack.
-   - Each changeset is gated (and measured) alone on its PR base, then drafted as a local branch `studies/<slug>/harvest/h<N>/*` with a PR body you can preview. The bodies and `report.md` are exported under the plugin's data dir.
+   - Dependent changesets form a stack in dependency order (from the detected edges and the files their commits share). Each layer is gated (and measured) on its PR base; one that doesn't apply or pass its gates there is folded into the layer it needs, and the page and PR body say why. Only layers that apply and pass are drafted, as local branches `studies/<slug>/harvest/h<N>/*` (N counts this study's harvests) with a PR body you can preview. The bodies and `report.md` are exported under the plugin's data dir.
 
    Then: **Publish draft PRs…** shows exactly which branches go to which
    remote and which draft PRs open (and refuses without a GitHub remote), and
@@ -114,6 +114,20 @@ oracle hash, so changing them never needs a recalibration:
 The Oracle tab, the calibration report and `bb study show` say whether
 single-machine mode is on and why; the Overview, Bench and Live views show
 "testing c/N" on the bench host while a gate holds it.
+
+### Measurement protocol (noisy oracles)
+
+`[oracle.protocol]` keys that decide how much bench time a candidate takes. They are part of the oracle hash (changing one recalibrates), except where noted:
+
+| Key | Default | What it does |
+|---|---|---|
+| `n_min`, `n_max` | 6, 20 | Pairs before a win can be declared, and the cap. |
+| `futility` | `true` | After `n_min`, stop as inconclusive once the CI's upper bound is below the win threshold: more pairs couldn't make it a win. |
+| `early_lose_from`, `early_lose_confidence` | 3, 0.99 | From 3 pairs, a clear loss (a t interval at 99% entirely below 0) stops before `n_min`. `0` turns it off. |
+| `confirm`, `skip_confirm_factor` | `true`, 3 | Wins are re-measured with fresh pairs, unless the CI's lower bound is at least 3× the win threshold (the verdict says it skipped). `0` always confirms. |
+| `side_runs`, `min_side_seconds` | `"auto"`, 5 | Runs of `measure` per side of a pair, keeping each metric's best value. `"auto"` picks the count at calibration so a side lasts at least 5 s. |
+
+`[oracle.drift] recalibrate_below = 0.6` (not hashed): when best's runs take less than 60% of their calibrated time (code that got several times faster is noisier relative to itself), the plugin recalibrates on best at the next free bench slot, in a new segment with the same oracle, instead of letting a drift check pause the study. Noise that grows at the same run time still pauses it, and nothing more is measured on that machine until you resume. Best vs base compounds every segment ("81.8% lower time (5.5×) across 3 segments · this segment 3.62 → 2.04 s"). Simulated error rates and bench savings are in the design notes ("Implementation notes: v0.2.4").
 
 ### Commit identity
 
@@ -168,7 +182,7 @@ the threat model in the design).
 - **Budgets.** Max workers, candidates, bench hours, deadline, and tokens (per-thread usage as BB reports it) are enforced. Dollar cost isn't available to plugins.
 - **Provider limits.** Rate-limited turns are retried at the window reset, and spawns hold until then. A tight usage window halves W. Neither path has been seen live yet.
 - **Snapshots.** Workers' worktrees are committed with `git add -A`: give the repo a `.gitignore` for build outputs.
-- **Harvest.** Dependencies are detected only through revert conflicts and gate failures. Contributions are measured relative to best and shown as shares of the gain.
+- **Harvest.** Dependencies are detected only through revert conflicts, gate failures and changed files. Stacks are ordered by dependency; a layer that doesn't apply or pass its gates on its PR base is folded into the layer it needs, so a stack can have fewer PRs than changesets. Contributions are measured relative to best and shown as shares of the gain.
 
 ## Layout
 
