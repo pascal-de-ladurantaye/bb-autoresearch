@@ -12,6 +12,9 @@ function isNotFound(e: unknown): boolean {
 export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<HostContract, typeof hostSignals>, progress?: ProgressBus): BbPort {
   const runners = new Map<string, HostRunner>();
   return {
+    async callPlugin(pluginId, method, input, outputSchema) {
+      return await bb.sdk.plugins.callRpc({ pluginId, method, input: input as never, outputSchema });
+    },
     async primaryHostId() {
       return (await bb.sdk.system.config()).primaryHostId ?? null;
     },

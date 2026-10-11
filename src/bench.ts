@@ -20,10 +20,12 @@ import type { HostInfo } from "./ports.ts";
 import type { StudySpec } from "./spec.ts";
 import { ensureCommit, TransferError } from "./transfer.ts";
 
-export type CheckoutRole = "best" | "cand" | "drift" | "profile" | "hbase" | "harvest";
+export type CheckoutRole = "best" | "cand" | "drift" | "profile" | "hbase" | "harvest" | "gate";
 
 /** Resolve the spec's bench_hosts against BB machines. Empty means ["local"]. */
-export function resolveBenchHosts(entries: string[], hosts: HostInfo[], editHostId: string): { ok: true; hosts: ResolvedBenchHost[] } | { ok: false; errors: string[] } {
+export function resolveBenchHosts(entries: string[], hosts: HostInfo[], editHostId: string, opts: { remote?: boolean } = {}): { ok: true; hosts: ResolvedBenchHost[] } | { ok: false; errors: string[] } {
+  // With remote machines and no bench_hosts, only the remote machines measure.
+  if (!entries.length && opts.remote) return { ok: true, hosts: [] };
   const list = entries.length ? entries : ["local"];
   const out: ResolvedBenchHost[] = [];
   const errors: string[] = [];
@@ -52,6 +54,15 @@ export function resolveBenchHosts(entries: string[], hosts: HostInfo[], editHost
   return errors.length ? { ok: false, errors } : { ok: true, hosts: out };
 }
 
+/** The runner that measures on a bench host: its BB machine, or a lent remote machine (fleet). */
+export function benchRunner(ctx: Ctx, host: BenchHostRow): HostRunner {
+  if (host.mode === "remote") {
+    if (!ctx.remoteRunner) throw new Error(`remote bench host ${host.name}: no remote fleet`);
+    return ctx.remoteRunner(host);
+  }
+  return ctx.bb.hostRunner(host.host_id);
+}
+
 export interface BuildResult {
   ok: boolean;
   output: string;
@@ -78,13 +89,14 @@ export class BenchSite {
   ) {}
 
   get runner(): HostRunner {
-    return this.ctx.bb.hostRunner(this.host.host_id);
+    return benchRunner(this.ctx, this.host);
   }
   get edit(): HostRunner {
     return this.ctx.bb.hostRunner(this.study.host_id!);
   }
+  /** The host keeps its own clone and receives commits as bundles (a BB machine in clone mode, or a lent remote machine). */
   get remote(): boolean {
-    return this.host.mode === "clone";
+    return this.host.mode === "clone" || this.host.mode === "remote";
   }
   /** Checkout key prefix on this host. */
   get prefix(): string {

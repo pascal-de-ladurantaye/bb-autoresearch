@@ -1,4 +1,5 @@
 // The engine's view of BB. server.ts adapts bb.sdk to this; tests fake it.
+import type { ZodType } from "zod";
 import type { HostRunner } from "./host/runner.ts";
 
 export interface ThreadInfo {
@@ -62,6 +63,8 @@ export interface PortMessage {
 }
 
 export interface BbPort {
+  /** Call another plugin's bb.rpc method (bench providers); the output is parsed with `outputSchema`. */
+  callPlugin(pluginId: string, method: string, input: unknown, outputSchema: ZodType): Promise<unknown>;
   primaryHostId(): Promise<string | null>;
   /** Enrolled BB machines (bench host names and ids are resolved against these). */
   listHosts(): Promise<HostInfo[]>;

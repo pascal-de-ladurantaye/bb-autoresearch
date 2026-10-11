@@ -47,5 +47,6 @@ export function toProviderError(e: unknown, method: string, pluginId: string): B
   const code = errorCode(e);
   // A provider plugin that isn't installed, enabled or loaded: the call never reached a handler.
   const missing = code === null && /not (installed|enabled|loaded|found)|unknown plugin|no such plugin|plugin .* (is )?(disabled|unavailable)|\b404\b/iu.test(msg);
-  return new BenchProviderError(`${pluginId} ${method}: ${msg}`, code ?? (missing ? "not_found" : null), method);
+  // BB prefixes what a provider throws ("HTTP 500: [invalid] …"): the bracketed code is found anywhere. No code: internal.
+  return new BenchProviderError(`${pluginId} ${method}: ${msg}`, code ?? (missing ? "not_found" : "internal"), method);
 }

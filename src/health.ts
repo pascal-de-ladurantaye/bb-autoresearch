@@ -3,6 +3,7 @@
 // A failing check defers the measurement (the candidate stays queued, the
 // host waits `retry_seconds`); a host unhealthy longer than
 // `notify_after_minutes` raises a notice.
+import { benchRunner } from "./bench.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, StudyRow } from "./db/store.ts";
 import type { HealthReport } from "./host/contract.ts";
@@ -61,7 +62,7 @@ export async function checkHealth(
   const policy = spec.oracle.health;
   if (!policy.enabled) return { ok: true, problems: [], summary: "health checks disabled", skipped: true };
   const { store } = ctx;
-  const report = await ctx.bb.hostRunner(host.host_id).health();
+  const report = await benchRunner(ctx, host).health();
   const a = assessHealth(report, policy);
   const now = ctx.now();
   store.addHealthCheck({ study_id: study.id, host_id: host.host_id, context, ok: a.ok ? 1 : 0, problems_json: JSON.stringify(a.problems), report_json: JSON.stringify(report) });

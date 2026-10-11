@@ -27,6 +27,8 @@ import { poolPaired, positionsFromChain, promotionChain, type GuardrailCalibrati
 import { checkHealth } from "./health.ts";
 import { HOLDOUT_FAIL, runHoldout } from "./holdout.ts";
 import { HostJobLostError, RunAbortedError, type HostRunner } from "./host/runner.ts";
+import { RemoteHostLostError } from "./bench-provider/runner.ts";
+import type { RemoteFleet } from "./remote/fleet.ts";
 import { BenchError, strategyFor, type Bench, type MeasureOutcome, type RunResult, type Side } from "./noise.ts";
 import { clip, formatDuration, messageText, safeJson, verdictMessage, type AgentMessage } from "./prompts.ts";
 import { checkScope } from "./scope.ts";
@@ -253,6 +255,9 @@ export class Pipeline {
   /** Latest progress per bench lock key, for the study page. */
   private progressByKey = new Map<string, { studyId: string; hostId: string; text: string; at: number }>();
 
+  /** Remote bench hosts (set by the engine): machines lent by bench provider plugins. */
+  remote: RemoteFleet | null = null;
+
   constructor(
     private readonly ctx: Ctx,
     private readonly hooks: PipelineHooks,
@@ -299,6 +304,9 @@ export class Pipeline {
   benchHosts(study: StudyRow): BenchHostRow[] {
     const rows = this.ctx.store.benchHosts(study.id);
     if (rows.length || !study.host_id) return rows;
+    // Remote-only studies measure on their lent machines alone; joining ones have inactive rows.
+    if (this.ctx.store.benchHosts(study.id, { all: true }).some((h) => h.mode === "remote")) return rows;
+    if (this.ctx.store.hasResolvedBench(study.id, study.spec_version) && !this.ctx.store.resolvedBench(study.id, study.spec_version).length) return rows;
     this.ctx.store.syncBenchHosts(study.id, [{ entry: "local", hostId: study.host_id, name: "local", mode: "shared" }]);
     return this.ctx.store.benchHosts(study.id);
   }
@@ -417,6 +425,11 @@ export class Pipeline {
   /** A bench lock key is taken by a launched measurement, drift check, or serialized gate. */
   private keyBusy(lockKey: string): boolean {
     return this.measuring.has(lockKey) || this.drifting.has(lockKey) || this.gating.has(lockKey);
+  }
+
+  /** Something runs or waits on this bench lock key (a remote machine retires only when nothing does). */
+  lockKeyBusy(lockKey: string): boolean {
+    return this.keyBusy(lockKey) || this.ctx.benchLock.busy(lockKey);
   }
 
   /** Start jobs for whatever has work. Cheap and synchronous; safe to call often. */
@@ -786,6 +799,10 @@ export class Pipeline {
           this.restartMeasurement(fresh, entry.reason, entry.regate);
           return;
         }
+        if (e instanceof RemoteHostLostError || (host.mode === "remote" && this.ctx.store.remoteHostByBench(study.id, host.host_id)?.state === "gone")) {
+          this.restartMeasurement(fresh, `remote bench host ${host.name} left`);
+          return;
+        }
         if (e instanceof HostJobLostError || (this.exitEpoch.get(host.host_id) ?? 0) !== epoch) {
           this.restartMeasurement(fresh, `host worker restarted on ${host.name}`);
           return;
@@ -1041,6 +1058,8 @@ export class Pipeline {
 
   /** Ask BB whether a bench host is connected (cached); record transitions. */
   async hostOffline(study: StudyRow, host: BenchHostRow): Promise<boolean> {
+    // Remote machines aren't BB machines: the fleet knows whether they are still there.
+    if (host.mode === "remote") return this.remote?.status(host) !== "connected";
     const status = await this.ctx.bb.hostStatus(host.host_id).catch(() => "unknown" as const);
     this.noteHostStatus(study, host, status);
     return status === "disconnected";

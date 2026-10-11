@@ -7,6 +7,7 @@ import { recordCalibration, runAutoRecalibration, runCalibration, type AutoRecal
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
 import { applyProposal, harvestBranch, harvestExportKey, prOrder, type Promotion } from "./harvest-math.ts";
+import { RemoteFleet } from "./remote/fleet.ts";
 import { Harvester, harvestReadyText } from "./harvest.ts";
 import { checkHealth } from "./health.ts";
 import type { DispatchDecision, DispatchQuery } from "./ports.ts";
@@ -85,7 +86,17 @@ export class Engine {
       publish: (studyId) => this.publish(studyId),
     });
     this.live = new LiveRecorder(ctx);
+    this.fleet = new RemoteFleet(ctx, this.pipeline, {
+      notify: (study, kind, text, opts) => this.notify(study.id, kind, text, opts),
+      publish: (studyId) => this.publish(studyId),
+      kick: () => this.kick(),
+    });
+    this.pipeline.remote = this.fleet;
+    ctx.remoteRunner = (h) => this.fleet.runnerForBench(h);
   }
+
+  /** Remote bench hosts lent by bench provider plugins. */
+  readonly fleet: RemoteFleet;
 
   private get store() {
     return this.ctx.store;
@@ -98,13 +109,17 @@ export class Engine {
    * first, so nothing touches the closed handle and nothing is logged; the
    * next instance reconciles (a measurement in progress restarts).
    */
-  dispose(): void {
-    if (this.ctx.disposed) return;
+  dispose(): Promise<void> {
+    if (this.ctx.disposed) return Promise.resolve();
+    // Remote machines: nothing uses them after this instance. Their rows are ended now (the store
+    // closes below); the provider calls that destroy them finish on their own (bounded wait).
+    const remote = this.fleet.dispose();
     this.ctx.disposed = true;
     this.pipeline.cancelMeasurements(() => true, "plugin disposed");
     this.harvester.abortAll();
     this.live.dispose();
     this.ctx.store.close();
+    return remote;
   }
 
   study(slug: string): StudyRow {
@@ -186,7 +201,7 @@ export class Engine {
       if (!primary) throw new EngineError("The BB server has no local machine identity; studies edit on the server's own machine.");
       hostId = primary;
     }
-    const resolved = resolveBenchHosts(spec.oracle.bench_hosts, await this.ctx.bb.listHosts().catch(() => []), hostId);
+    const resolved = resolveBenchHosts(spec.oracle.bench_hosts, await this.ctx.bb.listHosts().catch(() => []), hostId, { remote: (spec.oracle.remote_bench ?? []).length > 0 });
     if (!resolved.ok) throw new EngineError(`Spec is invalid:\n${resolved.errors.map((e) => `- ${e}`).join("\n")}`);
     if (!study) {
       const repo = await this.ctx.bb.projectCheckout(projectId, hostId);
@@ -200,7 +215,10 @@ export class Engine {
       study = this.store.study(id)!;
       await this.ctx.bb.setMetadata(threadId, { study: spec.study.slug, role: "strategist" }).catch((e) => this.ctx.bb.log("warn", `metadata: ${errText(e)}`));
     }
-    const benchText = resolved.hosts.map((h) => `${h.name} (${h.mode === "clone" ? "own clone, git bundles" : "local checkouts"})`).join(", ");
+    const benchText = [
+      ...resolved.hosts.map((h) => `${h.name} (${h.mode === "clone" ? "own clone, git bundles" : "local checkouts"})`),
+      ...(spec.oracle.remote_bench ?? []).map((r) => `${r.hosts} remote machine(s) from ${r.provider} (${r.cores} cores, ${r.lifetime_minutes} min each${r.gates ? ", gates there too" : ""})`),
+    ].join(", ");
     const hasRun = this.store.hasRun(study.id);
     if (hasRun) {
       // Mid-run: the study keeps its active spec until the human approves this one.
@@ -233,6 +251,8 @@ export class Engine {
   /** Bench hosts of a spec version (pre-M2 versions: the edit host, shared). */
   private benchOf(study: StudyRow, version: number): ResolvedBenchHost[] {
     const r = this.store.resolvedBench(study.id, version);
+    // An empty list stored with the version is deliberate: only remote machines measure.
+    if (!r.length && this.store.hasResolvedBench(study.id, version)) return [];
     return r.length ? r : [{ entry: "local", hostId: study.host_id!, name: "local", mode: "shared" }];
   }
 
@@ -328,6 +348,8 @@ export class Engine {
         });
       } finally {
         this.calibrations.delete(studyId);
+        const s = this.store.study(studyId);
+        if (s && !this.ctx.disposed) this.fleet.endCalibration(s);
         this.publish(studyId);
       }
     })();
@@ -729,12 +751,16 @@ export class Engine {
         this.ctx.bb.log("warn", `bench clone cleanup on ${h.host_id}: ${errText(e)}`);
       }
     }
+    const machines = await this.fleet.releaseStudy(s, "study archived").catch((e) => {
+      this.ctx.bb.log("warn", `remote bench cleanup: ${errText(e)}`);
+      return 0;
+    });
     if (s.host_id && s.repo_path) {
       await this.ctx.bb.hostRunner(s.host_id).removeCheckouts(s.repo_path, `${s.slug}-`).catch((e) => this.ctx.bb.log("warn", `checkout cleanup: ${errText(e)}`));
     }
     const threadArchived = opts.archiveThread ? await this.archiveStudyThread(s) : false;
     this.publish(study.id);
-    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed${clones ? `, ${clones} bench clone(s) deleted` : ""}${threadArchived ? ", study thread archived" : ""}. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
+    return `${slug} archived: ${stopped} worker(s) stopped, bench checkouts removed${clones ? `, ${clones} bench clone(s) deleted` : ""}${machines ? `, ${machines} remote machine(s) destroyed` : ""}${threadArchived ? ", study thread archived" : ""}. Refs under refs/studies/${slug}/ and the branch ${bestBranch(slug)} are kept.`;
   }
 
   /** Archive (and stop) the study thread of an archived study; false when there is none or BB refused. */
@@ -1199,6 +1225,14 @@ export class Engine {
             }
           }
         } while (this.tickAgain && !this.ctx.disposed);
+        // Remote machines: fill and rotate slots, retire and destroy what isn't needed (never blocks).
+        if (!this.ctx.disposed) {
+          try {
+            this.fleet.tick();
+          } catch (e) {
+            this.ctx.bb.log("warn", `remote bench: ${errText(e)}`);
+          }
+        }
       } finally {
         this.currentTick = null;
       }
@@ -1715,6 +1749,7 @@ export class Engine {
   private async refreshBenchHosts(study: StudyRow): Promise<void> {
     const now = this.ctx.now();
     for (const h of this.pipeline.benchHosts(study)) {
+      if (h.mode === "remote") continue; // the fleet polls the provider
       if (h.status_at !== null && now - h.status_at < this.ctx.config.hostStatusTtlMs && h.status !== "offline") continue;
       const status = await this.ctx.bb.hostStatus(h.host_id).catch(() => "unknown" as const);
       this.pipeline.noteHostStatus(study, h, status);
@@ -1870,6 +1905,8 @@ export class Engine {
   /** Run once on load, after every handler is registered. Safe to repeat. */
   async reconcile(): Promise<{ requeued: number; workers: number; calibrations: number }> {
     const { requeued } = this.pipeline.reconcile();
+    // Remote machines of a previous instance are ended, and whatever a provider still lists is destroyed.
+    await this.fleet.reconcile().catch((e) => this.ctx.bb.log("warn", `remote bench reconcile: ${errText(e)}`));
     // Worker turns held by a previous instance (quiet bench) are re-decided: no measurement runs now.
     this.ctx.bb.recheckDispatch().catch(() => undefined);
     let calibrations = 0;

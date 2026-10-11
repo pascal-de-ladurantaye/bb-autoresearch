@@ -465,6 +465,13 @@ export class FakePort implements BbPort {
     this.hosts.set(runner.hostId, runner);
     this.hostNames.set(runner.hostId, name);
   }
+  /** Other plugins' rpc handlers by plugin id (bench providers), called like bb.sdk.plugins.callRpc. */
+  plugins = new Map<string, (method: string, input: unknown) => Promise<unknown>>();
+  async callPlugin(pluginId: string, method: string, input: unknown, outputSchema: import("zod").ZodType) {
+    const p = this.plugins.get(pluginId);
+    if (!p) throw new Error(`plugin ${pluginId} is not installed`);
+    return outputSchema.parse(await p(method, input));
+  }
   async primaryHostId() {
     return this.hostId;
   }

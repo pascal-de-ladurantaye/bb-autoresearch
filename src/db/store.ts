@@ -654,6 +654,11 @@ export class Store {
     if (!row) throw new Error(`spec v${version} not found`);
     return normalizeSpec(JSON.parse(row.spec_json) as StudySpec);
   }
+  /** The spec version's bench hosts were resolved (M2 and later); an empty list is then deliberate (remote machines only). */
+  hasResolvedBench(studyId: string, version: number): boolean {
+    const row = this.db.prepare(`SELECT bench_json FROM spec_versions WHERE study_id = ? AND version = ?`).get(studyId, version) as { bench_json: string | null } | undefined;
+    return Boolean(row?.bench_json);
+  }
   resolvedBench(studyId: string, version: number): ResolvedBenchHost[] {
     const row = this.specVersion(studyId, version);
     return row?.bench_json ? (JSON.parse(row.bench_json) as ResolvedBenchHost[]) : [];

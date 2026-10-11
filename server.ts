@@ -58,7 +58,7 @@ export function createAutoresearchPlugin(deps: PluginDeps = {}) {
     const engine = new Engine(ctx);
     deps.onEngine?.(engine);
     // Stop the old instance before BB closes its database (see Engine.dispose).
-    bb.onDispose(() => engine.dispose());
+    bb.onDispose(async () => await engine.dispose());
 
     registerTools(bb, engine);
     registerRpc(bb, engine);

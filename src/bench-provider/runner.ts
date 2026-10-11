@@ -185,6 +185,8 @@ export class RemoteBenchRunner implements HostRunner {
         }
       }
       if (p.done && !more) {
+        // The process died without an exit record (the machine was suspended, say): not a result, a lost host.
+        if (p.signal === "LOST") throw new RemoteHostLostError(`remote machine ${this.remoteId} lost a running process (signal LOST)`);
         return {
           exitCode: p.exitCode,
           timedOut: p.signal === "TIMEOUT",
