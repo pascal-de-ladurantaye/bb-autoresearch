@@ -298,7 +298,8 @@ export class Engine {
         this.store.setStudyState(study.id, "calibrating", actor, { spec_version: study.spec_version });
       });
       this.startCalibrationJob(study.id);
-      return `Spec v${study.spec_version} approved. Calibrating ${slug}: gates on the base commit, then A/A measurement on ${this.store.benchHosts(study.id).length} bench host(s). Check progress with \`bb study show ${slug}\`.`;
+      const remote = (this.store.spec(study).oracle.remote_bench ?? []).reduce((a, e) => a + e.hosts, 0);
+      return `Spec v${study.spec_version} approved. Calibrating ${slug}: gates on the base commit, then A/A measurement on ${this.store.benchHosts(study.id).filter((h) => h.mode !== "remote").length} bench host(s)${remote ? ` and ${remote} remote machine(s), once they have joined` : ""}. Check progress with \`bb study show ${slug}\`.`;
     }
     if (study.state === "archived") throw new EngineError(`${slug} is archived`);
     const version = study.pending_spec_version ?? study.spec_version;

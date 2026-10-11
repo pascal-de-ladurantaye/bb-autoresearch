@@ -139,7 +139,11 @@ describe("remote bench hosts (example provider, real git)", () => {
 
   afterEach(async () => {
     await engine.fleet.settle().catch(() => undefined);
+    await engine.pipeline.pump().catch(() => undefined);
+    await engine.dispose();
     provider.dispose();
+    // Background work of the disposed instance stops quietly; give it a moment before removing its files.
+    await new Promise((r) => setTimeout(r, 50));
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -187,7 +191,7 @@ describe("remote bench hosts (example provider, real git)", () => {
 
   async function decided(id: number, timeoutMs = 60_000) {
     const ok = await waitFor(() => {
-      void engine.tick();
+      void engine.tick().catch(() => undefined);
       return store.candidate(id)!.stage === "decided";
     }, timeoutMs, 20);
     expect(ok, `c ${id} stage ${store.candidate(id)!.stage}`).toBe(true);
@@ -255,7 +259,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     store.updateBenchHost(sid, other.bench_host_id, { active: 0 });
     const id = queue(60);
     expect(await waitFor(() => {
-      void engine.tick();
+      void engine.tick().catch(() => undefined);
       return store.candidate(id)!.stage === "measuring";
     }, 30_000, 10)).toBe(true);
     store.updateBenchHost(sid, other.bench_host_id, { active: 1 });
@@ -266,7 +270,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(await waitFor(() => slotA().some((r) => r.replaces === a!.id), 10_000)).toBe(true);
     // The replacement joins and calibrates on best (arrival calibration); a only then retires.
     expect(await waitFor(() => {
-      void tick();
+      void tick().catch(() => undefined);
       return slotA().some((r) => r.replaces === a!.id && r.state === "ready");
     }, 60_000, 20)).toBe(true);
     const repl = slotA().find((r) => r.replaces === a!.id)!;
@@ -277,7 +281,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(c.measure_restarts).toBe(0);
     expect(c.bench_host_id).toBe(a!.bench_host_id);
     expect(await waitFor(() => {
-      void tick();
+      void tick().catch(() => undefined);
       return store.remoteHost(a!.id)!.state === "gone";
     }, 20_000, 20)).toBe(true);
     expect(store.remoteHost(a!.id)!.left_reason).toMatch(/rotated out/u);
@@ -297,7 +301,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     for (const m of alive()) writeFileSync(join(m.home, "slow"), "");
     const id = queue(70);
     expect(await waitFor(() => {
-      void engine.tick();
+      void engine.tick().catch(() => undefined);
       return store.candidate(id)!.stage === "measuring" && store.samples(id).length > 0;
     }, 30_000, 10)).toBe(true);
     const on = store.candidate(id)!.bench_host_id!;
@@ -310,7 +314,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(store.events(sid, { kinds: ["measure.restarted"] }).length).toBe(1);
     expect(store.notices(sid).some((x) => x.kind === "remote.lost")).toBe(true);
     expect(await waitFor(() => {
-      void tick();
+      void tick().catch(() => undefined);
       return ready().length === 2;
     }, 60_000, 20)).toBe(true);
   });
@@ -350,7 +354,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(alive()).toHaveLength(0);
     engine.resume(SLUG, "human");
     expect(await waitFor(() => {
-      void tick();
+      void tick().catch(() => undefined);
       return ready().length === 2;
     }, 60_000, 20)).toBe(true);
     expect(alive()).toHaveLength(2);

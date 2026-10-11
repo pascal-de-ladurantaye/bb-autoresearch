@@ -1139,6 +1139,10 @@ export class Store {
   liveRemoteHosts(): RemoteHostRow[] {
     return this.db.prepare(`SELECT * FROM remote_hosts WHERE state != 'gone' ORDER BY id`).all() as RemoteHostRow[];
   }
+  /** Machine ids this plugin has recorded for a provider (any state). */
+  knownRemoteIds(provider: string): string[] {
+    return (this.db.prepare(`SELECT remote_id FROM remote_hosts WHERE provider = ? AND remote_id IS NOT NULL`).all(provider) as Array<{ remote_id: string }>).map((r) => r.remote_id);
+  }
   /** Providers any study's machines ever came from (orphan cleanup asks each one). */
   remoteProviders(): string[] {
     return (this.db.prepare(`SELECT DISTINCT provider FROM remote_hosts ORDER BY provider`).all() as Array<{ provider: string }>).map((r) => r.provider);

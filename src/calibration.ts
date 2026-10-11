@@ -178,7 +178,9 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   const evalSeconds = Math.max(...ok.map((r) => r.outcome.evalSeconds));
   const serialized = single.on && spec.oracle.gate.length > 0;
   const gateLine = spec.oracle.gate.length
-    ? serialized
+    ? gatesRemote
+      ? ` Gates take ${gateSeconds.toFixed(1)} s on a remote machine (gates = true): candidates' gates run there too, under that machine's bench lock.`
+      : serialized
       ? ` Gates take ${gateSeconds.toFixed(1)} s on the edit host, holding the bench, so each candidate occupies the bench about ${(evalSeconds + gateSeconds).toFixed(1)} s.`
       : ` Gates take ${gateSeconds.toFixed(1)} s on the edit host.`
     : "";

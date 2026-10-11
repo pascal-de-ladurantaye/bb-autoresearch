@@ -339,7 +339,7 @@ export class RemoteFleet {
   private mayCreate(study: StudyRow, entry: number, now: number): boolean {
     const f = this.failures.get(this.failureKey(study.id, entry));
     if (!f) return true;
-    if (f.seedKey !== undefined) return f.seedKey !== this.seedKey(study, this.targetSha(study));
+    if (f.seedKey !== undefined) return f.seedKey !== this.seedKey(study, this.seedBaseline(study));
     return now >= f.until;
   }
 
@@ -473,6 +473,10 @@ export class RemoteFleet {
   private baseSha(study: StudyRow): string {
     return study.base_sha ?? this.targetSha(study);
   }
+  /** The commit an entry's seed is built on: the calibration's baseline, else the current segment's. */
+  private seedBaseline(study: StudyRow): string {
+    return this.calibrating.get(study.id) ?? this.store.segment(study.id, study.segment)?.baseline_sha ?? this.targetSha(study);
+  }
   private seedKey(study: StudyRow, baseline: string): string {
     return `${baseline}:v${study.spec_version}`;
   }
@@ -519,8 +523,9 @@ export class RemoteFleet {
     const target = this.targetSha(study);
     if (!target) throw new Error("the study has no baseline or best commit yet");
     const baseSha = this.baseSha(study);
-    // Edit-host artifacts first: a refused seed costs no machine.
-    const seed = entry.seed ? await this.seedFor(study, row0.entry, entry, target) : null;
+    // Edit-host artifacts first: a refused seed costs no machine. The seed is built once per segment
+    // (on its baseline), so replacements reuse it; during a calibration, the baseline being calibrated.
+    const seed = entry.seed ? await this.seedFor(study, row0.entry, entry, this.seedBaseline(study)) : null;
     const base = await this.baseFor(study, baseSha);
     if (signal.aborted) return;
     const client = this.client(row0.provider);
@@ -647,7 +652,7 @@ export class RemoteFleet {
     f.n += 1;
     f.last = msg;
     const now = this.ctx.now();
-    if (e instanceof SeedError && e.refused && study) f.seedKey = this.seedKey(study, this.targetSha(study));
+    if (e instanceof SeedError && e.refused && study) f.seedKey = this.seedKey(study, this.seedBaseline(study));
     f.until = now + (f.n >= this.config.maxFailures ? this.config.blockedMs : this.config.retryMs * f.n);
     this.failures.set(key, f);
     this.store.updateRemoteHost(rowId, { error: clip(msg, 1000) });
@@ -761,7 +766,7 @@ export class RemoteFleet {
             const mine = live.filter((r) => r.slot === slot);
             if (mine.some((r) => r.state === "ready" || this.joined.has(r.id))) continue;
             const f = this.failures.get(this.failureKey(study.id, i));
-            const seedBlocked = f?.seedKey !== undefined && f.seedKey === this.seedKey(study, baseline);
+            const seedBlocked = f?.seedKey !== undefined && f.seedKey === this.seedKey(study, this.seedBaseline(study));
             if (f && (seedBlocked || (f.seedKey === undefined && f.n >= this.config.maxFailures))) problems.push(`remote bench ${i + 1} (${e.provider}) slot ${k}: ${clip(f.last, 400)}`);
             else waiting = true;
           }
@@ -811,12 +816,15 @@ export class RemoteFleet {
       }
       const live = this.store.liveRemoteHosts().filter((r) => r.provider === provider);
       const inUse = new Set(live.map((r) => r.remote_id).filter((x): x is string => x !== null));
+      // Machines of rows that already left are ours (their destroy may still be in flight): destroyed, not orphans.
+      const known = new Set(this.store.knownRemoteIds(provider));
       // A create still in flight: its machine may be listed before its row knows the id.
       const creating = new Set(live.filter((r) => r.remote_id === null).map((r) => `${r.study_id}/${r.slot}`));
       for (const h of hosts) {
         if (h.state === "gone" || inUse.has(h.hostId)) continue;
         if (creating.has(`${h.labels.study ?? ""}/${h.labels.slot ?? ""}`)) continue;
         await this.destroy(provider, h.hostId);
+        if (known.has(h.hostId)) continue;
         destroyed += 1;
         const studyId = h.labels.study;
         if (studyId && this.store.study(studyId)) this.store.event(studyId, "remote.orphan_destroyed", "plugin", { provider, machine: h.hostId, slot: h.labels.slot ?? null });

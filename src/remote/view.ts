@@ -190,7 +190,7 @@ export function remoteLines(v: RemoteView, now: number): string[] {
   const out: string[] = [];
   for (const e of v.entries) {
     out.push(
-      `Remote bench ${e.index + 1}: ${e.provider} · ${e.hosts} machine(s) × ${e.cores} cores${e.memoryGb ? `, ${e.memoryGb} GB` : ""} · ${e.lifetimeMinutes} min each, replaced ${e.rotateLeadMinutes} min before the end${e.gates ? " · gates run there" : ""}${e.seed ? ` · seed ${e.seed.state}${e.seed.bytes ? ` (${Math.round(e.seed.bytes / 1024)} KiB)` : ""}` : ""}`,
+      `Remote bench ${e.index + 1}: ${e.provider} · ${e.hosts} machine(s) × ${e.cores} cores${e.memoryGb ? `, ${e.memoryGb} GB` : ""} · ${e.lifetimeMinutes} min each, replaced ${e.rotateLeadMinutes} min before the end${e.gates ? " · gates run there" : ""}${e.seed ? ` · seed ${e.seed.state}${e.seed.bytes !== null ? ` (${e.seed.bytes < 10_240 ? `${e.seed.bytes} B` : `${Math.round(e.seed.bytes / 1024)} KiB`})` : ""}` : ""}`,
     );
     if (e.seed?.detail) out.push(`  seed: ${e.seed.detail}`);
     if (e.blocked) out.push(`  no new machine: ${e.blocked}`);

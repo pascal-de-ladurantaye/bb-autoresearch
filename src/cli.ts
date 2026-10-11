@@ -5,6 +5,7 @@
 // from the same view models the study page uses (src/views.ts). Text output
 // uses the same numbers and wording as the page (src/present.ts: an
 // improvement is positive when it is better, in the metric's own terms).
+import { remoteGates } from "./single-machine.ts";
 import { remoteLines, remoteView } from "./remote/view.ts";
 import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type PluginCliRegistration } from "@get-bb/plugin-sdk";
 import { EngineError, type Caller, type Engine } from "./engine.ts";
@@ -518,7 +519,7 @@ function schedulerLine(engine: Engine, s: StudyRow): string {
 function utilizationLine(engine: Engine, s: StudyRow): string {
   const u = utilization(engine, s);
   const pct = (x: number | null) => (x === null ? "n/a" : `${(x * 100).toFixed(1)}%`);
-  return `busy ${formatDuration(u.busySeconds)} of ${formatDuration(u.runningSeconds)} running (${pct(u.ratio)}; ${pct(u.steadyRatio)} since the first submission)${u.gateSeconds > 0 ? ` · ${formatDuration(u.gateSeconds)} of it gates (single-machine mode)` : ""} · overlapping bench intervals ${u.overlaps}`;
+  return `busy ${formatDuration(u.busySeconds)} of ${formatDuration(u.runningSeconds)} running (${pct(u.ratio)}; ${pct(u.steadyRatio)} since the first submission)${u.gateSeconds > 0 ? ` · ${formatDuration(u.gateSeconds)} of it gates (${remoteGates(engine.ctx.store.spec(s)) ? "on remote machines" : "single-machine mode"})` : ""} · overlapping bench intervals ${u.overlaps}`;
 }
 
 function usageLine(engine: Engine, s: StudyRow): string {
