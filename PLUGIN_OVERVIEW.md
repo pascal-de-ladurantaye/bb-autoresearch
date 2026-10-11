@@ -22,7 +22,7 @@ Every candidate is kept as a git ref, wins and losses alike, so nothing an agent
 - BB 0.45 or newer, and git 2.38 or newer on every machine a study uses.
 - The build, test and benchmark commands are your repository's own and run with full trust on the bench machine. Timing-sensitive studies want a quiet, dedicated machine; another BB machine can serve as the bench host. On a laptop, single-machine mode keeps tests out of the way of measurements.
 - The GitHub CLI (`gh`) only if you publish harvested PRs.
-- Early release (0.2): exercised end to end on toy repositories so far.
+- Early release (0.2). Beyond toy repositories, it was evaluated blindly against another autoresearch loop on a real-world CLI performance task, from the same starting commit: it reached a 5.4× speedup on that benchmark against the other loop's 3.9×, in about 3.6× the wall time. That is one run of each, so the gap is likely as much the probabilistic nature of LLMs as the loop itself.
 
 ## Credits
 
