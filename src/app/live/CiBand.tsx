@@ -316,8 +316,8 @@ export function runWords(band: NoisyBand, run: BandRun): string {
     return `Decided after ${stop.n} of ${band.nMax} pairs: ${DECISION_WORD[stop.decision].label}. Estimate ${pct(last.m)}, ${ci}: ${what}.`;
   }
   if (last.n < band.nMin) {
-    const early = band.earlyLoseFrom ? `; only a CI entirely below 0 at ${Math.round((band.earlyLoseConfidence ?? 0.99) * 1000) / 10}% stops it before then` : "";
-    return `Pair ${last.n} of up to ${band.nMax}: no win before pair ${band.nMin}${early}. Estimate ${pct(last.m)}${last.lo !== null ? `, CI ${pct(last.lo)} to ${pct(last.hi ?? last.lo)} (for orientation)` : ""}.`;
+    const head = band.earlyLoseFrom ? `no win before pair ${band.nMin}; only a clear loss (a CI entirely below 0 at ${Math.round((band.earlyLoseConfidence ?? 0.99) * 1000) / 10}%) stops it sooner` : `no decision before pair ${band.nMin}`;
+    return `Pair ${last.n} of up to ${band.nMax}: ${head}. Estimate ${pct(last.m)}${last.lo !== null ? `, CI ${pct(last.lo)} to ${pct(last.hi ?? last.lo)} (for orientation)` : ""}.`;
   }
   return `Pair ${last.n} of up to ${band.nMax}: estimate ${pct(last.m)}, ${ci}. A win needs the CI's low end above ${pct(band.mde)}, a loss its high end below 0${band.futility ? `; a high end below ${pct(band.mde)} stops it as inconclusive` : ""}.`;
 }
