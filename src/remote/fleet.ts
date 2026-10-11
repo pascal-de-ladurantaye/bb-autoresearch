@@ -70,6 +70,9 @@ interface Failure {
 /** How long calibrated machines wait for the human to approve a finished calibration. */
 const KEEP_AFTER_CALIBRATION_MS = 30 * 60_000;
 
+/** How often the fleet lists each provider's machines for orphans. */
+const ORPHAN_SWEEP_MS = 10 * 60_000;
+
 /** Machine states that are joining (not measuring yet). */
 const JOINING = ["creating", "joining", "calibrating"] as const;
 
@@ -87,6 +90,9 @@ export class RemoteFleet {
   /** Machines that joined and wait for the study's calibration to calibrate them. */
   private joined = new Set<number>();
   private polledAt = new Map<number, number>();
+  private sweptAt = 0;
+  /** When each row learned its machine's id (real time): a list started before that can't judge it. */
+  private assignedAt = new Map<number, number>();
 
   constructor(
     private readonly ctx: Ctx,
@@ -240,6 +246,11 @@ export class RemoteFleet {
   tick(): void {
     if (this.ctx.disposed) return;
     const now = this.ctx.now();
+    // A periodic sweep catches orphans a provider couldn't list at load (not loaded yet, unavailable).
+    if (now - this.sweptAt >= ORPHAN_SWEEP_MS && this.allProviders().length) {
+      this.sweptAt = now;
+      this.startJob("orphans", () => this.cleanupOrphans().then(() => undefined));
+    }
     const studies = new Map<string, StudyRow>();
     for (const s of this.store.studies()) {
       if (s.state === "archived") {
@@ -517,6 +528,7 @@ export class RemoteFleet {
     const created = await client.call("benchProvider.create", { key: row0.create_key, cores: row0.cores, ...(row0.memory_gb !== null ? { memoryGb: row0.memory_gb } : {}), lifetimeSeconds: row0.lifetime_seconds, labels: { ...OWNER_LABEL, study: study.id, slot: row0.slot } }, { retries: 3, signal });
     const providerExp = created.expiresAt ? Date.parse(created.expiresAt) : NaN;
     const ownExp = this.ctx.now() + row0.lifetime_seconds * 1000;
+    this.assignedAt.set(rowId, Date.now());
     this.store.updateRemoteHost(rowId, { remote_id: created.hostId, expires_at: Number.isFinite(providerExp) ? Math.min(providerExp, ownExp) : ownExp });
     // Left while create was in flight (pause, archive, unload): the new machine has no use.
     if (signal.aborted || this.store.remoteHost(rowId)?.state === "gone") {
@@ -789,6 +801,7 @@ export class RemoteFleet {
     const list = providers ?? this.allProviders();
     let destroyed = 0;
     for (const provider of list) {
+      const listedFrom = Date.now();
       let hosts;
       try {
         hosts = (await this.client(provider).call("benchProvider.list", { labels: { ...OWNER_LABEL } }, { retries: 1 })).hosts;
@@ -798,15 +811,19 @@ export class RemoteFleet {
       }
       const live = this.store.liveRemoteHosts().filter((r) => r.provider === provider);
       const inUse = new Set(live.map((r) => r.remote_id).filter((x): x is string => x !== null));
+      // A create still in flight: its machine may be listed before its row knows the id.
+      const creating = new Set(live.filter((r) => r.remote_id === null).map((r) => `${r.study_id}/${r.slot}`));
       for (const h of hosts) {
         if (h.state === "gone" || inUse.has(h.hostId)) continue;
+        if (creating.has(`${h.labels.study ?? ""}/${h.labels.slot ?? ""}`)) continue;
         await this.destroy(provider, h.hostId);
         destroyed += 1;
         const studyId = h.labels.study;
         if (studyId && this.store.study(studyId)) this.store.event(studyId, "remote.orphan_destroyed", "plugin", { provider, machine: h.hostId, slot: h.labels.slot ?? null });
       }
       const listed = new Set(hosts.filter((h) => h.state !== "gone").map((h) => h.hostId));
-      for (const r of live) if (r.remote_id && !listed.has(r.remote_id) && r.state !== "creating") this.leave(r, "the provider no longer lists the machine", { notify: true });
+      // Rows whose create answered while the list was in flight aren't judged by that list.
+      for (const r of live) if (r.remote_id && !listed.has(r.remote_id) && (this.assignedAt.get(r.id) ?? 0) < listedFrom) this.leave(r, "the provider no longer lists the machine", { notify: true });
     }
     return destroyed;
   }

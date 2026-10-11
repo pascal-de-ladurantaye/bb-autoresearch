@@ -285,6 +285,9 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(provider.machines().find((m) => m.hostId === a!.remote_id)!.state).toBe("gone");
     expect(maxPerSlot).toBeLessThanOrEqual(2);
     expect(alive()).toHaveLength(2);
+    // The seed was built once for the segment and reused for the replacement (cached, same content hash).
+    expect(store.events(sid, { kinds: ["remote.seed_building"] })).toHaveLength(1);
+    expect(new Set(store.remoteHosts(sid).filter((r) => r.seed_sha).map((r) => r.seed_sha)).size).toBe(1);
   });
 
   it("a machine lost mid-measurement: the measurement restarts from scratch elsewhere and the slot fills again", async () => {
