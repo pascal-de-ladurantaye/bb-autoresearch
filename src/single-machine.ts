@@ -32,7 +32,7 @@ export function singleMachineMode(spec: Pick<StudySpec, "oracle">, editHostId: s
   const shared =
     benchHostIds !== null
       ? editHostId !== null && benchHostIds.includes(editHostId)
-      : spec.oracle.bench_hosts.length === 0 || spec.oracle.bench_hosts.some((h) => h.toLowerCase() === "local");
+      : (spec.oracle.bench_hosts.length === 0 && !(spec.oracle.remote_bench ?? []).length) || spec.oracle.bench_hosts.some((h) => h.toLowerCase() === "local");
   const hostId = editHostId;
   if (setting === "off") return { on: false, setting, reason: 'off (single_machine = "off"): gates run in parallel, outside the bench lock', hostId: null, shared };
   if (setting === "on") {
@@ -45,6 +45,8 @@ export function singleMachineMode(spec: Pick<StudySpec, "oracle">, editHostId: s
     };
   }
   if (spec.oracle.noise === "deterministic") return { on: false, setting, reason: "off (auto: deterministic measurements don't need a quiet machine)", hostId: null, shared };
+  // Gates on remote bench hosts don't run on the edit machine, so there is nothing to serialize there.
+  if (remoteGates(spec)) return { on: false, setting, reason: "off (auto: gates run on remote bench hosts)", hostId: null, shared };
   if (shared) return { on: true, setting, reason: "on (auto: a bench host is the edit machine)", hostId, shared };
   return { on: false, setting, reason: "off (auto: no bench host is the edit machine)", hostId: null, shared };
 }
@@ -60,4 +62,9 @@ export function singleMachineText(mode: SingleMachineMode, spec: Pick<StudySpec,
     `Single-machine mode is ${mode.reason}: gates take the bench lock of ${hostName ?? "the edit machine"}, in one queue with measurements (oldest first), so tests never run while a candidate is timed. ` +
     `Gate time counts as bench time: utilization includes it, and the worker target W uses gate + measure time per candidate.${quiet}`
   );
+}
+
+/** Some `[[oracle.remote_bench]]` entry runs the gates (`gates = true`). */
+export function remoteGates(spec: Pick<StudySpec, "oracle">): boolean {
+  return (spec.oracle.remote_bench ?? []).some((r) => r.gates);
 }

@@ -451,4 +451,64 @@ export const MIGRATIONS: string[] = [
   `ALTER TABLE changesets ADD COLUMN folded_into INTEGER`,
   `ALTER TABLE changesets ADD COLUMN fold_reason TEXT`,
   `ALTER TABLE changesets ADD COLUMN layer INTEGER`,
+  // ---- v0.3.0: remote bench hosts ----
+  /**
+   * Machines lent by bench provider plugins, one row per machine (a slot's
+   * replacement is a new row). The machine's bench host row (bench_hosts,
+   * mode 'remote', host_id = bench_host_id) holds its calibration; this row
+   * holds its lifecycle: created → joining → calibrating → ready →
+   * retiring → gone. Kept after it leaves (history, orphan cleanup).
+   */
+  `CREATE TABLE remote_hosts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    entry INTEGER NOT NULL,
+    slot TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    create_key TEXT NOT NULL,
+    remote_id TEXT,
+    bench_host_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    phase TEXT,
+    replaces INTEGER,
+    cores INTEGER NOT NULL,
+    memory_gb REAL,
+    lifetime_seconds INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    ready_at INTEGER,
+    expires_at INTEGER,
+    retiring_at INTEGER,
+    left_at INTEGER,
+    left_reason TEXT,
+    home TEXT,
+    info_json TEXT,
+    seed_sha TEXT,
+    base_sha TEXT,
+    join_seconds REAL,
+    calibration_json TEXT,
+    error TEXT,
+    status_at INTEGER,
+    measured INTEGER NOT NULL DEFAULT 0
+  )`,
+  `CREATE INDEX remote_hosts_study ON remote_hosts (study_id, state)`,
+  /**
+   * What the edit host builds once and ships to every machine: the shallow
+   * repo bundle of the study base, and each entry's seed per segment
+   * baseline. Cached by content hash (the files live in the host data dir).
+   */
+  `CREATE TABLE remote_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    entry INTEGER NOT NULL DEFAULT -1,
+    key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    path TEXT,
+    sha256 TEXT,
+    bytes INTEGER,
+    files INTEGER,
+    detail_json TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (study_id, kind, entry, key)
+  )`,
 ];

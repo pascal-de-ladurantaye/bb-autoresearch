@@ -63,6 +63,36 @@ const glob = z
   .max(400)
   .refine((g) => !g.startsWith("/") && !g.split("/").includes(".."), "globs are repo-relative and may not contain ..");
 
+const envName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u, "environment variable names: letters, digits and _");
+
+/** One `[[oracle.remote_bench]]` entry: machines from a bench provider plugin. */
+export const remoteBench = z
+  .object({
+    /** The provider plugin's id (e.g. "bench-provider-local"). */
+    provider: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u, "provider: a plugin id (lowercase letters, digits and dashes)"),
+    /** Machines measuring at a time (each slot gets one replacement while it rotates). */
+    hosts: z.number().int().min(1).max(16).default(1),
+    /** CPU cores per machine; match the machine the code runs on in production. */
+    cores: z.number().int().min(1).max(1024),
+    memory_gb: z.number().positive().max(16_384).optional(),
+    /** How long a machine lives before it is replaced (capped by the provider's maximum). */
+    lifetime_minutes: z.number().min(2).max(7 * 24 * 60).default(120),
+    /** Start a replacement this long before a machine's lifetime ends (default: a fifth of the lifetime, at least 1.5× the last join). */
+    rotate_before_minutes: z.number().min(0).max(24 * 60).optional(),
+    /** Run on the edit host in a checkout of best; prints the path of a directory or tarball to ship to every machine. */
+    seed: command.optional(),
+    /** Seed-relative globs the credential scan ignores (known test fixtures). */
+    seed_allow: z.array(glob).max(256).default([]),
+    /** Run on each machine after the seed is unpacked and the repo checked out (in a checkout of best). */
+    setup: command.optional(),
+    /** Environment for every command on these machines (setup, build, gates, measure). */
+    env: z.record(envName, z.string().max(4000)).default({}),
+    /** Run the gates on these machines too (not on the edit host). */
+    gates: z.boolean().default(false),
+  })
+  .strict();
+export type RemoteBenchSpec = z.output<typeof remoteBench>;
+
 const agentSpec = z
   .object({
     provider: z.string().min(1).optional(),
@@ -132,6 +162,13 @@ export const specSchema = z
          * receives commits only as git bundles (the remote path).
          */
         bench_hosts: z.array(z.string().trim().min(1).max(200)).max(16).default([]),
+        /**
+         * Remote bench hosts lent by a bench provider plugin (docs/bench-providers.md):
+         * short-lived machines bb-autoresearch drives over the provider's RPC. Each entry
+         * keeps `hosts` machines measuring at a time, each its own bench host with its own
+         * calibration. With remote hosts and an empty `bench_hosts`, no local host measures.
+         */
+        remote_bench: z.array(remoteBench).max(4).default([]),
         /** Per command (build, gate, one measure run). Long commands run as host jobs, so this may exceed the 30-minute host call cap. */
         timeout_minutes: z.number().min(0.1).max(24 * 60).default(20),
         /** A git bundle larger than this fails the transfer to a bench host. */
@@ -357,6 +394,14 @@ export function validateSemantics(spec: StudySpec): SpecResult {
     if (seen.has(k)) errors.push(`oracle.bench_hosts: ${h} is listed twice`);
     seen.add(k);
   }
+  const remote = spec.oracle.remote_bench ?? [];
+  remote.forEach((r, i) => {
+    const where = `oracle.remote_bench[${i}] (${r.provider})`;
+    if (r.rotate_before_minutes !== undefined && r.rotate_before_minutes >= r.lifetime_minutes) errors.push(`${where}: rotate_before_minutes must be below lifetime_minutes`);
+    if (Object.keys(r.env).some((k) => k === "HOME" || k === "PATH")) warnings.push(`${where}: env overrides ${Object.keys(r.env).filter((k) => k === "HOME" || k === "PATH").join(" and ")} on the remote machine`);
+    if (r.gates && !spec.oracle.gate.length) warnings.push(`${where}: gates = true, but oracle.gate is empty`);
+  });
+  if (remote.length && spec.oracle.bench_hosts.length === 0) warnings.push("oracle.bench_hosts is empty and oracle.remote_bench is set: only remote machines measure (add \"local\" to bench_hosts to measure here too)");
   if (spec.oracle.holdout && spec.oracle.noise === "deterministic") {
     warnings.push("oracle.holdout with a deterministic oracle compares one run per side");
   }
@@ -387,6 +432,7 @@ export function normalizeSpec(spec: StudySpec): StudySpec {
     ...spec.oracle,
     single_machine: spec.oracle.single_machine ?? "auto",
     quiet_bench: spec.oracle.quiet_bench ?? false,
+    remote_bench: spec.oracle.remote_bench ?? [],
     protocol: { ...PROTOCOL_V024_DEFAULTS, ...spec.oracle.protocol } as StudySpec["oracle"]["protocol"],
     drift: { ...spec.oracle.drift, recalibrate_below: spec.oracle.drift?.recalibrate_below ?? 0.6 },
   };
@@ -427,10 +473,14 @@ export function oracleHash(spec: StudySpec, protectedContentHash = ""): string {
   // Bench operations (health thresholds, drift schedule, transfer cap, offline
   // grace) and scheduling (single-machine mode, quiet bench) don't change how a
   // commit is judged, so tuning them is not a new segment.
-  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, ...rest } = spec.oracle;
+  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, remote_bench: remoteRaw, ...rest } = spec.oracle;
   const protocol: Record<string, unknown> = { ...rest.protocol };
   for (const [k, v] of Object.entries(PROTOCOL_V024_DEFAULTS)) if (protocol[k] === undefined || protocol[k] === v) delete protocol[k];
-  const oracle = { ...rest, protocol };
+  // Remote machines: what they are and how they are prepared judges a commit (provider, shape,
+  // seed and setup commands, environment); how many, how long they live, the seed allowlist and
+  // where gates run are operations. Left out when empty, so specs without them keep their hash.
+  const remote = (remoteRaw ?? []).map(({ hosts: _h, lifetime_minutes: _l, rotate_before_minutes: _r, seed_allow: _a, gates: _g, ...judged }) => judged);
+  const oracle = { ...rest, protocol, ...(remote.length ? { remote_bench: remote } : {}) };
   const judged = {
     metric: spec.metric,
     guardrail: spec.guardrail,

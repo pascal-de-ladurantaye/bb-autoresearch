@@ -221,7 +221,8 @@ export interface NoticeRow {
   delivered_round: number | null;
 }
 
-export type BenchMode = "shared" | "clone";
+/** shared: plugin checkouts on the edit host; clone: a BB machine with its own clone; remote: a machine lent by a bench provider plugin. */
+export type BenchMode = "shared" | "clone" | "remote";
 
 export interface BenchHostRow {
   study_id: string;
@@ -297,6 +298,64 @@ export interface TransferRow {
   ok: number;
   error: string | null;
   at: number;
+}
+
+/** A remote machine's lifecycle (remote_hosts.state). */
+export const REMOTE_LIVE_STATES = ["creating", "joining", "calibrating", "ready", "retiring"] as const;
+export type RemoteHostState = (typeof REMOTE_LIVE_STATES)[number] | "gone";
+
+export interface RemoteHostRow {
+  id: number;
+  study_id: string;
+  /** Index of its `[[oracle.remote_bench]]` entry. */
+  entry: number;
+  /** "<entry>.<k>": the slot it fills (k = 1..hosts). */
+  slot: string;
+  provider: string;
+  create_key: string;
+  /** The provider's host id (null until create answered). */
+  remote_id: string | null;
+  /** Its bench_hosts.host_id ("remote-<id>"). */
+  bench_host_id: string;
+  state: RemoteHostState;
+  /** What the join is doing ("uploading the seed", …), or why it waits. */
+  phase: string | null;
+  /** The machine it replaces (rotation). */
+  replaces: number | null;
+  cores: number;
+  memory_gb: number | null;
+  lifetime_seconds: number;
+  created_at: number;
+  ready_at: number | null;
+  expires_at: number | null;
+  retiring_at: number | null;
+  left_at: number | null;
+  left_reason: string | null;
+  home: string | null;
+  info_json: string | null;
+  seed_sha: string | null;
+  base_sha: string | null;
+  join_seconds: number | null;
+  calibration_json: string | null;
+  error: string | null;
+  status_at: number | null;
+  /** Measurements it finished. */
+  measured: number;
+}
+
+export interface RemoteArtifactRow {
+  id: number;
+  study_id: string;
+  kind: "base" | "seed";
+  entry: number;
+  key: string;
+  state: "ok" | "refused" | "failed";
+  path: string | null;
+  sha256: string | null;
+  bytes: number | null;
+  files: number | null;
+  detail_json: string | null;
+  created_at: number;
 }
 
 export interface ResolvedBenchHost {
@@ -1007,7 +1066,8 @@ export class Store {
   /** Make the study's bench host rows match `hosts` (the active spec); removed hosts become inactive. */
   syncBenchHosts(studyId: string, hosts: ResolvedBenchHost[]): void {
     this.tx(() => {
-      this.db.prepare(`UPDATE bench_hosts SET active = 0 WHERE study_id = ?`).run(studyId);
+      // Remote machines come and go with their own lifecycle (remote_hosts); the spec's hosts don't touch them.
+      this.db.prepare(`UPDATE bench_hosts SET active = 0 WHERE study_id = ? AND mode != 'remote'`).run(studyId);
       hosts.forEach((h, i) => {
         this.db
           .prepare(
@@ -1033,6 +1093,71 @@ export class Store {
   /** Every study's bench hosts on `hostId` (a host worker exit affects all of them). */
   benchHostsOn(hostId: string): BenchHostRow[] {
     return this.db.prepare(`SELECT * FROM bench_hosts WHERE host_id = ? AND active = 1`).all(hostId) as BenchHostRow[];
+  }
+
+  // ---- remote bench hosts (v0.3.0) ----
+  insertRemoteHost(row: Pick<RemoteHostRow, "study_id" | "entry" | "slot" | "provider" | "create_key" | "cores" | "memory_gb" | "lifetime_seconds" | "replaces"> & { name: string }): RemoteHostRow {
+    return this.tx(() => {
+      const r = this.db
+        .prepare(
+          `INSERT INTO remote_hosts (study_id, entry, slot, provider, create_key, bench_host_id, state, replaces, cores, memory_gb, lifetime_seconds, created_at)
+           VALUES (?, ?, ?, ?, ?, '', 'creating', ?, ?, ?, ?, ?)`,
+        )
+        .run(row.study_id, row.entry, row.slot, row.provider, row.create_key, row.replaces, row.cores, row.memory_gb, row.lifetime_seconds, this.now());
+      const id = Number(r.lastInsertRowid);
+      const benchId = `remote-${id}`;
+      this.db.prepare(`UPDATE remote_hosts SET bench_host_id = ? WHERE id = ?`).run(benchId, id);
+      // Its bench host row: inactive (no measurements) until it has joined and calibrated.
+      const pos = 100 + id;
+      this.db
+        .prepare(
+          `INSERT INTO bench_hosts (study_id, host_id, name, entry, mode, position, active) VALUES (?, ?, ?, ?, 'remote', ?, 0)
+           ON CONFLICT (study_id, host_id) DO UPDATE SET name = excluded.name, mode = 'remote', active = 0`,
+        )
+        .run(row.study_id, benchId, row.name, `remote:${row.provider}:${row.slot}`, pos);
+      return this.remoteHost(id)!;
+    });
+  }
+  remoteHost(id: number): RemoteHostRow | undefined {
+    return this.db.prepare(`SELECT * FROM remote_hosts WHERE id = ?`).get(id) as RemoteHostRow | undefined;
+  }
+  remoteHostByBench(studyId: string, benchHostId: string): RemoteHostRow | undefined {
+    return this.db.prepare(`SELECT * FROM remote_hosts WHERE study_id = ? AND bench_host_id = ?`).get(studyId, benchHostId) as RemoteHostRow | undefined;
+  }
+  /** A study's machines, newest first (`live`: not gone). */
+  remoteHosts(studyId: string, opts: { live?: boolean; limit?: number } = {}): RemoteHostRow[] {
+    return this.db
+      .prepare(`SELECT * FROM remote_hosts WHERE study_id = ?${opts.live ? ` AND state != 'gone'` : ""} ORDER BY id DESC LIMIT ?`)
+      .all(studyId, opts.limit ?? 500) as RemoteHostRow[];
+  }
+  /** Every study's live machines (orphan cleanup, dispose). */
+  liveRemoteHosts(): RemoteHostRow[] {
+    return this.db.prepare(`SELECT * FROM remote_hosts WHERE state != 'gone' ORDER BY id`).all() as RemoteHostRow[];
+  }
+  /** Providers any study's machines ever came from (orphan cleanup asks each one). */
+  remoteProviders(): string[] {
+    return (this.db.prepare(`SELECT DISTINCT provider FROM remote_hosts ORDER BY provider`).all() as Array<{ provider: string }>).map((r) => r.provider);
+  }
+  updateRemoteHost(id: number, patch: Partial<Omit<RemoteHostRow, "id" | "study_id">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    const sets = keys.map((k) => `${k} = @${k}`).join(", ");
+    this.db.prepare(`UPDATE remote_hosts SET ${sets} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+  artifact(studyId: string, kind: RemoteArtifactRow["kind"], entry: number, key: string): RemoteArtifactRow | undefined {
+    return this.db.prepare(`SELECT * FROM remote_artifacts WHERE study_id = ? AND kind = ? AND entry = ? AND key = ?`).get(studyId, kind, entry, key) as RemoteArtifactRow | undefined;
+  }
+  artifacts(studyId: string): RemoteArtifactRow[] {
+    return this.db.prepare(`SELECT * FROM remote_artifacts WHERE study_id = ? ORDER BY id DESC LIMIT 50`).all(studyId) as RemoteArtifactRow[];
+  }
+  upsertArtifact(row: Omit<RemoteArtifactRow, "id" | "created_at">): RemoteArtifactRow {
+    this.db
+      .prepare(
+        `INSERT INTO remote_artifacts (study_id, kind, entry, key, state, path, sha256, bytes, files, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (study_id, kind, entry, key) DO UPDATE SET state = excluded.state, path = excluded.path, sha256 = excluded.sha256, bytes = excluded.bytes, files = excluded.files, detail_json = excluded.detail_json, created_at = excluded.created_at`,
+      )
+      .run(row.study_id, row.kind, row.entry, row.key, row.state, row.path, row.sha256, row.bytes, row.files, row.detail_json, this.now());
+    return this.artifact(row.study_id, row.kind, row.entry, row.key)!;
   }
 
   addHealthCheck(row: Omit<HealthCheckRow, "id" | "at">): number {
