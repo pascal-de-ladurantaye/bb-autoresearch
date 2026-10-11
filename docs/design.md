@@ -1757,7 +1757,7 @@ Append-only migrations: `bench_hosts.side_runs`, `bench_hosts.run_seconds`, `stu
 - **Notices.** Strategist round 2 (2 wins, a recalibration) said no "notices for you"; round 1 said 1 (calibration ready), round 4 1 (budget used up).
 - **Harvest h1 (the strategist's grouping, as asked: {c/1, c/4} and {c/3, c/6}).** The two groups' commits interleave on `src/steps.py`, so they were folded into one PR: "#1 and #2 need each other: their commits interleave on src/steps.py, so neither applies without the other"; #2 "ships inside #1's PR". One branch, its parent `main`, the gate passing in a checkout of it. The study's first harvest was numbered h1.
 - **Harvest h2 (one changeset per promotion).** A stack #1 → #2 → #3 → #4 in dependency order; four branches, each one's parent the branch below it (the first's `main`), the gate passing on every tip; contributions 23.3% and 18.8% of the gain for the two that could be ablated alone, the stack together 100.0% (CI 90.8% to 108.8%).
-- **Other studies.** The plugin database was backed up first; after reinstalling the released plugin, every other study's row and event count matched the backup (`render-perf-bb2`, harvesting, included).
+- **Other studies.** The plugin database was backed up first; after reinstalling the released plugin, every other study's row and event count matched the backup (a harvesting study included).
 - **Cleanup.** The study was archived with its seven threads, the temporary project, `/tmp` files and the harvest exports deleted, and the released plugin reinstalled from GitHub.
 
 ### Not done, and known issues
