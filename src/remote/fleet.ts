@@ -131,10 +131,22 @@ export class RemoteFleet {
         env: this.machineEnv(row, entry),
         stagingDir: this.config.stagingDir ?? join(tmpdir(), "bb-autoresearch-staging"),
         pollMs: this.config.execPollMs,
+        onLost: (reason) => this.lostByRunner(row.id, reason),
       });
       this.runners.set(row.id, r);
     }
     return r;
+  }
+
+  /**
+   * A call on the machine found it gone. A machine that measures, gates or
+   * calibrates leaves now (its work restarts elsewhere); a join in progress
+   * fails through its own path, which counts the failure and backs off.
+   */
+  private lostByRunner(rowId: number, reason: string): void {
+    const row = this.store.remoteHost(rowId);
+    if (!row || row.state === "gone" || row.state === "creating" || row.state === "joining") return;
+    this.leave(row, reason, { notify: true });
   }
 
   /** Environment of every command on a machine: the entry's env, plus what the plugin tells the benchmark. */
@@ -490,7 +502,9 @@ export class RemoteFleet {
     try {
       await this.join(rowId, entry, signal);
       if (signal.aborted) return;
-      this.store.updateRemoteHost(rowId, { join_seconds: (this.ctx.now() - started) / 1000 });
+      const seconds = (this.ctx.now() - started) / 1000;
+      this.store.updateRemoteHost(rowId, { join_seconds: seconds });
+      this.store.event(row0.study_id, "remote.joined", "plugin", { remote: rowId, host: row0.bench_host_id, seconds: Math.round(seconds * 10) / 10 });
       this.failures.delete(this.failureKey(row0.study_id, row0.entry));
       const study = this.store.study(row0.study_id)!;
       if (this.calibrating.has(study.id)) {
@@ -582,7 +596,6 @@ export class RemoteFleet {
       if (r.exitCode !== 0) throw new Error(`setup exited ${r.exitCode}${r.timedOut ? " (timeout)" : ""}: ${clip(`${r.stdout}\n${r.stderr}`.trim().slice(-600), 600)}`);
     }
     this.store.updateRemoteHost(rowId, { state: "calibrating", phase: "joined" });
-    this.store.event(study.id, "remote.joined", "plugin", { remote: rowId, host: row0.bench_host_id, seconds: 0 });
   }
 
   /** A/A on best on this machine alone, then it measures. */

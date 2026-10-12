@@ -46,6 +46,13 @@ describe("remote bench spec", () => {
     expect(bad(`[[oracle.remote_bench]]\nprovider = "p"\ncores = 1\nenv = { "1BAD" = "x" }\n`).ok).toBe(false);
   });
 
+  it("warns when the rotation lead is most of the lifetime (machines would rotate almost continuously)", () => {
+    const long = ok(withRemote(REMOTE.replace("lifetime_minutes = 60", "lifetime_minutes = 20\nrotate_before_minutes = 17")));
+    expect(long.warnings.join("\n")).toMatch(/rotate_before_minutes = 17 is more than half of lifetime_minutes = 20: each machine is replaced 3 min after it was created/u);
+    const fine = ok(withRemote(REMOTE.replace("lifetime_minutes = 60", "lifetime_minutes = 20\nrotate_before_minutes = 5")));
+    expect(fine.warnings.join("\n")).not.toMatch(/rotate almost continuously/u);
+  });
+
   it("older specs keep their oracle hash; operations don't change it, the machine does", () => {
     // The hash of this spec under v0.2.4's code.
     expect(oracleHash(ok(DETERMINISTIC_SPEC).spec)).toBe("8c0b5b606b195eed");

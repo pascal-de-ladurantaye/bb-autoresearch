@@ -830,7 +830,18 @@ export class Pipeline {
         return;
       }
       const host = store.benchHost(study.id, host0.host_id)!;
-      const health = await checkHealth(this.ctx, study, host, spec, "measure", (kind, text) => this.hooks.notify(study, kind, text));
+      let health;
+      try {
+        health = await checkHealth(this.ctx, study, host, spec, "measure", (kind, text) => this.hooks.notify(study, kind, text));
+      } catch (e) {
+        // The machine left before the measurement started: not the candidate's error; it stays queued for another host.
+        if (host.mode === "remote" && (e instanceof RemoteHostLostError || store.remoteHostByBench(study.id, host.host_id)?.state === "gone")) {
+          store.event(study.id, "measure.deferred", "plugin", { candidate: c.id, n: c.n, host: host.host_id, problems: [`remote bench host ${host.name} left`] });
+          this.changed(study.id);
+          return;
+        }
+        throw e;
+      }
       if (!health.ok) {
         // A failing health check defers the measurement: the candidate keeps its place, the host waits.
         store.event(study.id, "measure.deferred", "plugin", { candidate: c.id, n: c.n, host: host.host_id, problems: health.problems.slice(0, 5) });

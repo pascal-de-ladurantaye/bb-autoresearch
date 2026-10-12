@@ -215,6 +215,9 @@ describe("remote bench hosts (example provider, real git)", () => {
       expect(JSON.parse(r.calibration_json!).noiseFloor).toBe(b.noise_floor);
       expect(r.seed_sha).toMatch(/^[0-9a-f]{64}$/u);
       expect(r.base_sha).toBe(s.base_sha);
+      // The joined event carries the join time the row records.
+      const joined = store.events(s.id, { kinds: ["remote.joined"] }).map((e) => JSON.parse(e.data_json)).find((d) => d.remote === r.id);
+      expect(joined.seconds).toBe(Math.round(r.join_seconds! * 10) / 10);
     }
     const seg = store.segment(s.id, s.segment)!;
     expect(JSON.parse(seg.details_json!).hosts).toHaveLength(2);
@@ -317,6 +320,36 @@ describe("remote bench hosts (example provider, real git)", () => {
       void tick().catch(() => undefined);
       return ready().length === 2;
     }, 60_000, 20)).toBe(true);
+  });
+
+  it("a machine lost between status polls leaves at its first failed call: nothing more is sent to it, and the candidate counts no error", async () => {
+    setup();
+    await started(spec({ remote: "gates = true" }));
+    // No status poll after this: only the calls on the machine can notice that it is gone.
+    (engine.fleet.config as { statusPollMs: number }).statusPollMs = 10 * 3_600_000;
+    const sid = studyId();
+    for (const m of alive()) writeFileSync(join(m.home, "slow"), "");
+    const [a, b] = ready().sort((x, y) => x.id - y.id);
+    // The candidate lands on a (the first bench host): b takes no work until it measures.
+    store.updateBenchHost(sid, b!.bench_host_id, { active: 0 });
+    const id = queue(70);
+    expect(await waitFor(() => {
+      void engine.tick().catch(() => undefined);
+      return store.candidate(id)!.stage === "measuring" && store.samples(id).length > 0;
+    }, 30_000, 10)).toBe(true);
+    expect(store.candidate(id)!.bench_host_id).toBe(a!.bench_host_id);
+    store.updateBenchHost(sid, b!.bench_host_id, { active: 1 });
+    provider.kill(a!.remote_id!);
+    const c = await decided(id);
+    expect(c.measure_restarts).toBe(1);
+    expect(c.bench_host_id).toBe(b!.bench_host_id);
+    expect(c.attempts).toBe(0);
+    expect(store.events(sid, { kinds: ["pipeline.error"] })).toEqual([]);
+    const gone = store.remoteHost(a!.id)!;
+    expect(gone.state).toBe("gone");
+    expect(gone.left_reason).toMatch(/^remote machine .* (is gone|lost a running process)/u);
+    expect(store.events(sid, { kinds: ["measure.started"] }).filter((e) => JSON.parse(e.data_json).host === a!.bench_host_id)).toHaveLength(1);
+    expect(store.notices(sid).some((x) => x.kind === "remote.lost")).toBe(true);
   });
 
   it("a suspended machine leaves (never reused), and orphans are destroyed on load", async () => {

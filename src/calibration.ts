@@ -187,6 +187,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   const identityLine = ` ${identityText(identity)}`;
   const singleLine = single.on || spec.oracle.quiet_bench ? ` ${singleMachineText(single, spec, hosts.find((h) => h.host_id === study.host_id)?.name ?? null)}` : "";
   const hostLines = ok.length > 1 ? ` Per host: ${ok.map((r) => `${r.h.name} MDE ${(r.outcome.mde * 100).toFixed(2)}%`).join(", ")}.` : "";
+  const headline = headlineOutcome(ok.map((r) => r.outcome));
   const holdoutLine = spec.oracle.holdout ? " Holdout runs on every bench host." : "";
   const guardrails = worstGuardrailCalibration(ok.map((r) => r.outcome.guardrails ?? []));
   const guardrailLine = guardrails.length ? ` Guardrails: ${guardrails.map((g) => g.text).join("; ")}.` : "";
@@ -197,7 +198,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
     noiseFloor,
     mde,
     evalSeconds,
-    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + first.report + hostLines + holdoutLine + gateLine + guardrailLine + singleLine + identityLine,
+    report: (ok.length > 1 ? `${ok.length} bench hosts. ` : "") + headline.report + hostLines + holdoutLine + gateLine + guardrailLine + singleLine + identityLine,
     details: { ...first.details, existingBest: existingBest ?? "", benchHosts: ok.length, singleMachine: single.on, quietBench: spec.oracle.quiet_bench, commitIdentity: `${identity.name} <${identity.email}>`, commitIdentitySource: identity.source },
     hosts: ok.map((r) => ({ hostId: r.h.host_id, name: r.h.name, mode: r.h.mode, noiseFloor: r.outcome.noiseFloor, mde: r.outcome.mde, evalSeconds: r.outcome.evalSeconds, report: r.outcome.report, guardrails: r.outcome.guardrails ?? [], sideRuns: r.outcome.sideRuns ?? null, runSeconds: r.outcome.runSeconds ?? null })),
     guardrails,
@@ -244,6 +245,16 @@ export async function trackedIgnoredWarning(runner: { exec: HostRunner["exec"] }
   return [
     `the baseline tracks file(s) matching [scope] ignore (${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ", …" : ""}): changes to them are submitted, but new files next to them are left out of candidates. If they are sources, set [scope] ignore without the pattern that matches them.`,
   ];
+}
+
+/**
+ * The calibration report's headline with several bench hosts: the host whose
+ * MDE the segment takes (the worst), so the threshold, pairs and eval time it
+ * states match the segment's. The first host's report could name a smaller
+ * threshold than the one candidates must clear.
+ */
+export function headlineOutcome<T extends { mde: number }>(outcomes: T[]): T {
+  return outcomes.reduce((w, o) => (o.mde > w.mde ? o : w), outcomes[0]!);
 }
 
 /** Calibrate one bench host: health, transfer, two baseline checkouts, build, A/A, a holdout smoke run. */

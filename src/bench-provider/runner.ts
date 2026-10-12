@@ -42,6 +42,13 @@ export interface RemoteRunnerOptions {
   stagingDir: string;
   /** Longest wait between two execPoll calls (they start at 50 ms and double). */
   pollMs?: number;
+  /**
+   * Called once when a call finds the machine gone (`[not_found]`, or an exec
+   * that ended with signal LOST), so the fleet ends it at once instead of at
+   * its next status poll: until then the scheduler would keep handing the
+   * dead machine gates and measurements that fail in a fraction of a second.
+   */
+  onLost?: (reason: string) => void;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -116,8 +123,21 @@ export class RemoteBenchRunner implements HostRunner {
   }
 
   private wrap(e: unknown): never {
-    if (e instanceof BenchProviderError && e.code === "not_found") throw new RemoteHostLostError(`remote machine ${this.remoteId} is gone (${e.message})`);
+    if (e instanceof BenchProviderError && e.code === "not_found") throw this.lostNow(`remote machine ${this.remoteId} is gone (${e.message})`);
     throw e;
+  }
+
+  /** The machine is gone: later calls fail fast, and the fleet hears it once. */
+  private lostNow(reason: string): RemoteHostLostError {
+    if (this.lost === null) {
+      this.lost = reason;
+      try {
+        this.opts.onLost?.(reason);
+      } catch {
+        // The fleet's bookkeeping must not hide the error the caller gets.
+      }
+    }
+    return new RemoteHostLostError(reason);
   }
 
   // ---- processes ----
@@ -186,7 +206,7 @@ export class RemoteBenchRunner implements HostRunner {
       }
       if (p.done && !more) {
         // The process died without an exit record (the machine was suspended, say): not a result, a lost host.
-        if (p.signal === "LOST") throw new RemoteHostLostError(`remote machine ${this.remoteId} lost a running process (signal LOST)`);
+        if (p.signal === "LOST") throw this.lostNow(`remote machine ${this.remoteId} lost a running process (signal LOST)`);
         return {
           exitCode: p.exitCode,
           timedOut: p.signal === "TIMEOUT",

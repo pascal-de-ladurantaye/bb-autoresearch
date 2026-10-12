@@ -398,6 +398,10 @@ export function validateSemantics(spec: StudySpec): SpecResult {
   remote.forEach((r, i) => {
     const where = `oracle.remote_bench[${i}] (${r.provider})`;
     if (r.rotate_before_minutes !== undefined && r.rotate_before_minutes >= r.lifetime_minutes) errors.push(`${where}: rotate_before_minutes must be below lifetime_minutes`);
+    else if (r.rotate_before_minutes !== undefined && r.rotate_before_minutes > r.lifetime_minutes / 2) {
+      // A replacement joins and calibrates before the old machine retires; with a lead this long it is due again soon after.
+      warnings.push(`${where}: rotate_before_minutes = ${r.rotate_before_minutes} is more than half of lifetime_minutes = ${r.lifetime_minutes}: each machine is replaced ${+(r.lifetime_minutes - r.rotate_before_minutes).toFixed(1)} min after it was created, so machines rotate almost continuously (each rotation costs a join and a calibration)`);
+    }
     if (Object.keys(r.env).some((k) => k === "HOME" || k === "PATH")) warnings.push(`${where}: env overrides ${Object.keys(r.env).filter((k) => k === "HOME" || k === "PATH").join(" and ")} on the remote machine`);
     if (r.gates && !spec.oracle.gate.length) warnings.push(`${where}: gates = true, but oracle.gate is empty`);
   });
