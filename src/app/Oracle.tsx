@@ -74,10 +74,10 @@ export function OracleTab({ slug, o: overview, rpc, onChanged }: { slug: string;
                       <Mono>{shortSha(g.baselineSha)}</Mono>
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums">{frac(g.noiseFloor)}</td>
-                    <td className="px-3 py-2 text-right tabular-nums">{frac(g.mde)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{g.hosts.filter((h) => !h.excluded).length > 1 ? g.thresholds : frac(g.mde)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{duration(g.evalSeconds)}</td>
                     <td className="px-3 py-2 text-xs text-muted-foreground">
-                      {g.hosts.length ? g.hosts.map((h) => `${h.name}: noise ${frac(h.noiseFloor)}, MDE ${frac(h.mde)}, ${duration(h.evalSeconds)}${h.sideRuns && h.sideRuns > 1 ? `, ${h.sideRuns} runs a side` : ""}${h.runSeconds !== null ? `, one run ${duration(h.runSeconds)}` : ""}`).join("; ") : "—"}
+                      {g.hosts.length ? g.hosts.map((h) => `${h.name}: noise ${frac(h.noiseFloor)}, ${h.excluded ? "not used (much noisier than the other hosts)" : `win threshold ${frac(h.threshold)}`}, ${duration(h.evalSeconds)}${h.sideRuns && h.sideRuns > 1 ? `, ${h.sideRuns} runs a side` : ""}${h.runSeconds !== null ? `, one run ${duration(h.runSeconds)}` : ""}`).join("; ") : "—"}
                     </td>
                   </tr>
                 ))}
@@ -180,7 +180,15 @@ function Calibration({ c, specVersion, onAction }: { c: OracleView["calibration"
           <p className="text-sm">
             {c.noise === "deterministic" ? null : (
               <>
-                A win must improve by more than <strong>{frac(Math.max(...c.hosts.map((h) => h.mde)))}</strong> with confidence <Help term="mde" />
+                {c.hosts.filter((h) => !h.excluded).length > 1 ? (
+                  <>
+                    Each bench host decides with its own win threshold: a win must improve by more than <strong>{c.thresholds}</strong> with confidence <Help term="mde" />
+                  </>
+                ) : (
+                  <>
+                    A win must improve by more than <strong>{c.thresholds || frac(Math.max(...c.hosts.map((h) => h.threshold)))}</strong> with confidence <Help term="mde" />
+                  </>
+                )}
                 {c.detectable !== null ? <> (in practice, changes of about {frac(c.detectable)} or more are detected)</> : null}.{" "}
               </>
             )}
@@ -207,9 +215,12 @@ function Calibration({ c, specVersion, onAction }: { c: OracleView["calibration"
             <tbody>
               {c.hosts.map((h) => (
                 <tr key={h.name} className="border-t border-border">
-                  <td className="py-1">{h.name}</td>
+                  <td className="py-1">
+                    {h.name}
+                    {h.excluded ? <div className="text-warning-text" title={h.excluded}>not used: {h.excluded}</div> : null}
+                  </td>
                   <td className="py-1 text-right">{frac(h.noiseFloor)}</td>
-                  <td className="py-1 text-right">{frac(h.mde)}</td>
+                  <td className="py-1 text-right">{h.excluded ? "—" : frac(h.threshold)}</td>
                   <td className="py-1 text-right">{duration(h.evalSeconds)}</td>
                 </tr>
               ))}

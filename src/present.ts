@@ -171,10 +171,17 @@ export function noiseFloorText(noise: NoiseClass, floors: ReadonlyArray<number |
     case "deterministic":
       return `Deterministic: single runs, no spread; a candidate wins when it beats best by more than the tolerance (${magnitudePct(tolerance)})${floor !== null ? `, and a repeat of the baseline differed by ${magnitudePct(floor)}` : ""}.`;
     case "expensive":
-      return floor === null ? "Run-to-run noise: not measured." : `Run-to-run noise is ${magnitudePct(floor)} (σ of one run).`;
+      return floor === null ? "Run-to-run noise: not measured." : `Run-to-run noise is ${spread(measured, "(σ of one run)")}.`;
     default:
-      return floor === null ? "Run-to-run noise: not measured." : `Run-to-run noise is ${magnitudePct(floor)} per pair.`;
+      return floor === null ? "Run-to-run noise: not measured." : `Run-to-run noise is ${spread(measured, "per pair")}.`;
   }
+}
+
+/** One noise floor, or the range over several bench hosts ("2.42% to 5.44%, depending on the bench host"). */
+function spread(floors: readonly number[], unit: string): string {
+  const lo = Math.min(...floors);
+  const hi = Math.max(...floors);
+  return magnitudePct(lo) === magnitudePct(hi) ? `${magnitudePct(hi)} ${unit}` : `${magnitudePct(lo)} to ${magnitudePct(hi)} ${unit}, depending on the bench host`;
 }
 
 /** What a worker in each phase is doing, for the status line (live-model.ts WORKER_PHASES, in loop order). */

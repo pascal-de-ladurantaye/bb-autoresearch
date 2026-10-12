@@ -9,6 +9,7 @@ import type { GuardrailCost, StackRecord } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
 import { bestGuardrailPositions, guardrailChainBase, segmentGuardrailCalibration } from "./pipeline.ts";
 import { metricSnapshotOf } from "./snapshot.ts";
+import { hostThresholdsText } from "./host-choice.ts";
 import { amountText, bestHeadlineText, ciRangeText, ciText, clipWords, segmentRawText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
@@ -251,7 +252,9 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   lines.push(dossier ? clip(dossier.text, 8000) : "No dossier was written.");
   lines.push("", "## Calibration and segments", "");
   for (const g of store.segments(study.id)) {
-    lines.push(`- Segment ${g.k}: oracle \`${g.oracle_hash}\`, spec v${g.spec_version ?? "?"}, baseline \`${g.baseline_sha.slice(0, 10)}\`, noise floor ${magnitudePct(g.noise_floor)}, win threshold (MDE) ${magnitudePct(g.mde)}, ≈${formatDuration(g.eval_seconds ?? 0)} per evaluation.${g.report ? ` ${mdText(g.report, 400)}` : ""}`);
+    const measuring = (safeJson<{ hosts?: Array<{ name: string; mde: number; excluded?: string }> }>(g.details_json)?.hosts ?? []).filter((h) => !h.excluded);
+    const thresholds = measuring.length > 1 ? `win thresholds ${hostThresholdsText(measuring.map((h) => ({ name: h.name, mde: Math.max(spec.oracle.protocol.min_effect, h.mde) })))} (each host decides with its own)` : `win threshold (MDE) ${magnitudePct(g.mde)}`;
+    lines.push(`- Segment ${g.k}: oracle \`${g.oracle_hash}\`, spec v${g.spec_version ?? "?"}, baseline \`${g.baseline_sha.slice(0, 10)}\`, noise floor ${magnitudePct(g.noise_floor)}${measuring.length > 1 ? " (noisiest host)" : ""}, ${thresholds}, ≈${formatDuration(g.eval_seconds ?? 0)} per evaluation.${g.report ? ` ${mdText(g.report, 400)}` : ""}`);
   }
   const drift = store.driftChecks(study.id, 50);
   if (drift.length) lines.push(`- Drift checks: ${drift.length} (${drift.filter((d) => d.status === "drift").length} over the limit)`);

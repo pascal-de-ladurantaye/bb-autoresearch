@@ -6,7 +6,8 @@ import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from
 import type { StackRecord } from "./harvest.ts";
 import { dependencyReasons, prOrder, stackOrderText } from "./harvest-math.ts";
 import { changeFrom, changeWords, checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
-import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
+import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, measurementMde, studySingleMachine } from "./pipeline.ts";
+import { hostThresholdsText } from "./host-choice.ts";
 import { singleMachineText } from "./single-machine.ts";
 import { remoteView } from "./remote/view.ts";
 import { benchQueueOrder, queuePosition } from "./live-model.ts";
@@ -337,6 +338,8 @@ export function overview(engine: Engine, s: StudyRow) {
       status: s.calibration_status,
       approved: s.calibration_approved_at !== null,
       mde: seg?.mde ?? null,
+      /** The win threshold each measuring host decides with, in words ("1.42% on a, 3.33% on b"); "" before calibration. */
+      thresholds: specOf(engine, s) ? liveThresholds(engine, s).text : "",
       noiseFloor: seg?.noise_floor ?? null,
       evalSeconds: seg?.eval_seconds ?? null,
       report: report?.report ?? null,
@@ -408,6 +411,10 @@ export function benchHostsView(engine: Engine, s: StudyRow) {
       bestBuildSha: h.best_build_sha,
       noiseFloor: h.noise_floor,
       mde: h.mde,
+      /** The win threshold a measurement on this host uses: its own MDE, never below min_effect (null before calibration). */
+      threshold: spec && h.mde !== null ? measurementMde(store, s, spec, h) : null,
+      /** Why this host measures nothing until the next calibration (much noisier than its peers), or null. */
+      excluded: safeJson<{ reason?: string }>(h.excluded_json)?.reason ?? null,
       /** noisy: runs of the measure command per side, and one run's seconds at calibration. */
       sideRuns: h.side_runs,
       runSeconds: h.run_seconds,
@@ -419,6 +426,29 @@ export function benchHostsView(engine: Engine, s: StudyRow) {
       bundleBytes: sent.reduce((a, x) => a + x.bytes, 0),
     };
   });
+}
+
+/** A segment's per-host calibration: noise, MDE, the threshold each decides with (never below min_effect), and whether it was left out. */
+function segmentHosts(detailsJson: string | null, minEffect: number) {
+  type Row = { name: string; noiseFloor: number | null; mde: number; evalSeconds: number; sideRuns?: number | null; runSeconds?: number | null; excluded?: string };
+  return (safeJson<{ hosts?: Row[] }>(detailsJson)?.hosts ?? []).map((h) => ({
+    name: h.name,
+    noiseFloor: finiteOrNull(h.noiseFloor),
+    mde: h.mde,
+    threshold: Math.max(minEffect, h.mde),
+    evalSeconds: h.evalSeconds,
+    sideRuns: h.sideRuns ?? null,
+    runSeconds: finiteOrNull(h.runSeconds),
+    excluded: h.excluded ?? null,
+  }));
+}
+
+/** Each bench host that measures now, with the win threshold it decides with (quietest first), in words. */
+export function liveThresholds(engine: Engine, s: StudyRow): { text: string; hosts: Array<{ name: string; threshold: number }> } {
+  const spec = specOf(engine, s);
+  if (!spec) return { text: "", hosts: [] };
+  const hosts = engine.pipeline.dispatchHosts(s, spec).filter((h) => h.mde !== null).map((h) => ({ name: h.name, threshold: measurementMde(engine.ctx.store, s, spec, h) }));
+  return { text: hostThresholdsText(hosts.map((h) => ({ name: h.name, mde: h.threshold }))), hosts };
 }
 
 /** The active oracle segment and whether a pending spec changes it. */
@@ -785,8 +815,10 @@ export function oracleView(engine: Engine, s: StudyRow) {
       diff: lineDiff(active!.toml, p.toml).slice(0, 2000),
     };
   }
-  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; warnings?: string[]; guardrails?: GuardrailCalibration[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number; report: string }>; finishedAt?: number }>(s.calibration_json);
+  const report = safeJson<{ ok?: boolean; report?: string; problems?: string[]; warnings?: string[]; guardrails?: GuardrailCalibration[]; baselineSha?: string; oracleHash?: string; hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number; report: string; excluded?: string }>; finishedAt?: number }>(s.calibration_json);
   const spec = specOf(engine, s);
+  const minEffect = spec?.oracle.protocol.min_effect ?? 0;
+  const measuring = (report?.hosts ?? []).filter((h) => !h.excluded);
   return {
     slug: s.slug,
     state: s.state,
@@ -816,12 +848,15 @@ export function oracleView(engine: Engine, s: StudyRow) {
       guardrails: guardrailCalibrationRows(report?.guardrails ?? []),
       baselineSha: report?.baselineSha ?? null,
       oracleHash: report?.oracleHash ?? null,
-      hosts: (report?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, evalSeconds: h.evalSeconds, report: clip(h.report, 600) })),
+      /** Per host: noise floor, calibrated MDE, the win threshold it decides with (never below min_effect), cost, and why it isn't used (much noisier than its peers). */
+      hosts: (report?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, threshold: Math.max(minEffect, h.mde), evalSeconds: h.evalSeconds, report: clip(h.report, 600), excluded: h.excluded ?? null })),
+      /** Each measuring host's win threshold in words, quietest first ("1.42% on a, 3.33% on b"). */
+      thresholds: hostThresholdsText(measuring.map((h) => ({ name: h.name, mde: Math.max(minEffect, h.mde) }))),
       finishedAt: report?.finishedAt ?? null,
       /** The oracle's noise class: the noise is per pair (noisy), the σ of one run (expensive), or none (deterministic: single runs against the tolerance). */
       noise: spec?.oracle.noise ?? "noisy",
       /** The calibrated noise in one sentence for the class; "not measured" without an A/A floor. */
-      noiseText: noiseFloorText(spec?.oracle.noise ?? "noisy", (report?.hosts ?? []).map((h) => finiteOrNull(h.noiseFloor)), spec?.oracle.protocol.tolerance ?? 0),
+      noiseText: noiseFloorText(spec?.oracle.noise ?? "noisy", measuring.map((h) => finiteOrNull(h.noiseFloor)), spec?.oracle.protocol.tolerance ?? 0),
       /** The command that approves what's waiting, if anything (the page has the same action as a button). */
       nextCommand: s.state === "draft" && s.calibration_status !== "running" ? `bb study calibrate ${s.slug}` : s.state === "calibrating" && s.calibration_status === "ready" && s.calibration_approved_at === null ? `bb study start ${s.slug}` : null,
       /** The in-app action for what's waiting: approve the draft spec (and calibrate), or approve the calibration (and start). */
@@ -833,6 +868,8 @@ export function oracleView(engine: Engine, s: StudyRow) {
             : null,
       /** The smallest change a win can show with confidence at n_max pairs (MDE plus the CI half-width), when the report has it. */
       detectable: (() => {
+        // Several hosts: each detects its own size of change (the per-host table says how much).
+        if (measuring.length > 1) return null;
         const m = /Detects changes of ([\d.]+)%/u.exec(report?.report ?? "");
         return m ? Number(m[1]) / 100 : null;
       })(),
@@ -849,7 +886,9 @@ export function oracleView(engine: Engine, s: StudyRow) {
       evalSeconds: g.eval_seconds,
       gateSeconds: g.gate_seconds,
       report: g.report ? clip(g.report, 1500) : null,
-      hosts: (safeJson<{ hosts?: Array<{ name: string; noiseFloor: number | null; mde: number; evalSeconds: number; sideRuns?: number | null; runSeconds?: number | null }> }>(g.details_json)?.hosts ?? []).map((h) => ({ name: h.name, noiseFloor: finiteOrNull(h.noiseFloor), mde: h.mde, evalSeconds: h.evalSeconds, sideRuns: h.sideRuns ?? null, runSeconds: finiteOrNull(h.runSeconds) })),
+      hosts: segmentHosts(g.details_json, minEffect),
+      /** Each measuring host's win threshold in words, quietest first. */
+      thresholds: hostThresholdsText(segmentHosts(g.details_json, minEffect).filter((h) => !h.excluded).map((h) => ({ name: h.name, mde: h.threshold }))),
       /** Started by an automatic recalibration (same oracle), and why. */
       auto: safeJson<{ auto?: boolean }>(g.details_json)?.auto === true,
       autoReason: safeJson<{ reason?: string }>(g.details_json)?.reason ?? null,
@@ -1724,7 +1763,14 @@ export function statusLine(engine: Engine, s: StudyRow): string {
     case "running": {
       const line = runningStatusText(phases, measuring, store.candidates(s.id, { stages: ["queued"] }).length, store.candidates(s.id, { stages: ["gating"] }).length, testing);
       // An automatic recalibration holds the bench (or waits for it): best's runs got much shorter.
-      return s.recalibrate_due !== null ? `${line.replace(/\.$/u, "")}; recalibrating on best at the next free bench slot (its runs got much shorter).` : line;
+      if (s.recalibrate_due === null) return line;
+      const due = safeJson<{ health_retries?: number; retry_at?: number | null }>(s.recalibrate_due);
+      if (due?.health_retries && due.retry_at) {
+        const max = specOf(engine, s)?.oracle.health.recalibration_retries ?? 30;
+        const secs = Math.max(0, Math.round((due.retry_at - engine.ctx.now()) / 1000));
+        return `${line.replace(/\.$/u, "")}; recalibrating on best waits for a healthy bench (retry ${due.health_retries} of ${max}${secs > 0 ? `, next in ${secs} s` : ""}).`;
+      }
+      return `${line.replace(/\.$/u, "")}; recalibrating on best at the next free bench slot (its runs got much shorter).`;
     }
     case "paused": {
       const p = pauseInfo(engine, s);
@@ -1782,6 +1828,7 @@ export function noticeAction(
     case "bench.unhealthy":
     case "bench.offline":
     case "remote.lost":
+    case "bench.noisy_host":
     case "remote.failed":
     case "remote.seed_refused":
       return { label: "Open Bench", tab: "bench", command: `bb study bench ${slug}` };

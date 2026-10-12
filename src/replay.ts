@@ -89,6 +89,8 @@ export const REPLAY_VIEW_KINDS = [
   "worker.action",
   "drift.started",
   "drift.checked",
+  "bench.noisy_host",
+  "recalibration.deferred",
   "study.state",
   "scheduler.target",
   "idea.added",
@@ -129,6 +131,8 @@ const FEED_KINDS = new Set([
   "worker.abandoned",
   "drift.started",
   "drift.checked",
+  "bench.noisy_host",
+  "recalibration.deferred",
   "study.state",
 ]);
 

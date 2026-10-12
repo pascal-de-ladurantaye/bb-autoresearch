@@ -511,4 +511,11 @@ export const MIGRATIONS: string[] = [
     created_at INTEGER NOT NULL,
     UNIQUE (study_id, kind, entry, key)
   )`,
+  // ---- v1: measurement quality ----
+  /**
+   * A bench host taken out of the dispatch set because its calibrated noise
+   * floor was much above its peers' (JSON: reason, noise, peers, segment,
+   * at). Cleared by the next calibration, which measures it again.
+   */
+  `ALTER TABLE bench_hosts ADD COLUMN excluded_json TEXT`,
 ];

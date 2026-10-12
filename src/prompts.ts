@@ -69,6 +69,8 @@ export interface BriefInput {
   bestDiag: string[];
   relatedFindings: Array<FindingRow & { title?: string | null }>;
   mde: number | null;
+  /** Per-host win thresholds in words, when the bench hosts differ ("1.42% on a, 3.33% on b"). */
+  thresholds?: string;
   /** Best's position per guardrail against the segment base (remaining room under the total limit). */
   guardrailPositions?: Record<string, Position>;
 }
@@ -90,7 +92,7 @@ export function workerBrief(b: BriefInput): string {
     "## Objective",
     quoted(spec.study.objective, 1500),
     "",
-    `Primary metric: ${metric}.${b.mde !== null ? ` A win must clear about ${formatPct(b.mde)} with confidence.` : ""}`,
+    `Primary metric: ${metric}.${b.thresholds?.includes(" on ") ? ` A win must clear the win threshold of the bench host that measures it with confidence: ${b.thresholds}.` : b.mde !== null ? ` A win must clear about ${formatPct(b.mde)} with confidence.` : ""}`,
     spec.guardrail.length
       ? `Guardrails (a win that breaks one is a lose): ${spec.guardrail.map((g) => `${g.name} at most ${pctAbs(g.max_regression)} worse than best per step and ${pctAbs(g.max_total_regression ?? g.max_regression)} worse than the segment base in total`).join("; ")}. Each is judged on a CI: it breaks only when the whole CI is beyond a limit.`
       : "",
@@ -290,7 +292,7 @@ export function isControlNotice(kind: string): boolean {
  * knowing, nothing for the human to do. Everything else that isn't a control
  * asks for a decision or a fix (approve, start, resume, harvest, check a host).
  */
-const INFORMATIONAL_NOTICES = new Set(["best.new", "budget.threshold", "stall", "rate_limit", "usage.tight", "harvest.published", "segment.recalibrated", "remote.lost"]);
+const INFORMATIONAL_NOTICES = new Set(["best.new", "budget.threshold", "stall", "rate_limit", "usage.tight", "harvest.published", "segment.recalibrated", "remote.lost", "bench.noisy_host"]);
 
 export function isInformationalNotice(kind: string): boolean {
   return INFORMATIONAL_NOTICES.has(kind);

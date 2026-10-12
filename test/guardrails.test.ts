@@ -6,10 +6,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";
 import {
+  calibratePairedGuardrail,
   chainPosition,
   checkLimit,
   compose,
   estimateRuns,
+  guardrailProblems,
   headroomWords,
   invertRegression,
   judgeGuardrail,
@@ -340,7 +342,7 @@ describe("calibration: guardrail noise", () => {
     expect(exp.guardrails![0]!.judgeable).toBe(true);
   });
 
-  it("end to end: the report, the warning, the Oracle tab, and the noise used by the next verdict", async () => {
+  it("end to end (v1): a guardrail that can't be judged fails calibration with the two fixes, and the Oracle tab shows it", async () => {
     const host = new FakeHost();
     const made = makeCtx(host);
     const engine = new Engine(made.ctx);
@@ -354,16 +356,41 @@ describe("calibration: guardrail noise", () => {
     await engine.calibrate("toy-size", "human");
     await engine.waitForCalibration("toy-size", 5_000);
     const s = made.store.study("toy-size")!;
-    const report = JSON.parse(s.calibration_json!) as { report: string; warnings: string[]; guardrails: Array<{ name: string; judgeable: boolean }> };
-    expect(report.report).toMatch(/Guardrails: rss: noise \d+\.\d\d% per pair/u);
+    expect(s.calibration_status).toBe("failed");
+    expect(s.state).toBe("draft");
+    const report = JSON.parse(s.calibration_json!) as { ok: boolean; report: string; problems: string[]; warnings: string[]; guardrails: Array<{ name: string; judgeable: boolean }> };
+    expect(report.ok).toBe(false);
     expect(report.guardrails[0]).toMatchObject({ name: "rss", judgeable: false });
-    expect(report.warnings[0]).toMatch(/^guardrail rss: noise .* more than its 5\.0% limit: it can never be shown within the limit/u);
+    expect(report.problems).toHaveLength(1);
+    expect(report.problems[0]).toMatch(/^guardrail rss can't be judged: its CI half-width at a full evaluation is \d+\.\d\d% \(noise \d+\.\d\d%\), not below its 5\.0% limit, so every win would be flagged inconclusive on it\. Fix the spec: loosen its max_regression to at least \d+\.\d%, or raise oracle\.protocol n_max from 8 to about \d+/u);
+    expect(report.warnings).toEqual([]);
     const notice = made.store.notices(s.id)[0]!.text;
-    expect(notice).toContain("Warning: guardrail rss");
+    expect(notice).toContain("Calibration of `toy-size` failed");
+    expect(notice).toContain("guardrail rss can't be judged");
     const oracle = oracleView(engine, s);
-    expect(oracle.calibration.warnings).toHaveLength(1);
+    expect(oracle.calibration.problems[0]).toContain("guardrail rss can't be judged");
     expect(oracle.calibration.guardrails[0]).toMatchObject({ name: "rss", judgeable: false });
-    expect(oracle.segments[0]!.guardrails[0]!.name).toBe("rss");
+  });
+
+  it("the fix it names works: loosening the limit to what it says makes the guardrail judgeable", () => {
+    const s = spec({ noise: "noisy", protocol: "n_max = 20" });
+    const c = calibratePairedGuardrail({ name: "rss", max_regression: 0.01 }, (() => {
+      const rng = seededRng(4);
+      return Array.from({ length: 40 }, () => 0.03 * gauss(rng));
+    })(), { nMax: 20, confidence: 0.95, iterations: 400, rng: seededRng(1) })!;
+    expect(c.judgeable).toBe(false);
+    const [problem] = guardrailProblems([{ host: "local", guardrails: [c] }], s);
+    const loosen = Number(/at least ([\d.]+)%/u.exec(problem!)![1]) / 100;
+    const pairs = Number(/to about (\d+)/u.exec(problem!)![1]);
+    expect(loosen).toBeGreaterThan(c.halfWidth);
+    // The half-width shrinks with √n: at the pairs it names, it is below the limit.
+    expect(c.halfWidth * Math.sqrt(20 / pairs)).toBeLessThan(0.01);
+    // Judgeable guardrails are no problem; several hosts name the worst one.
+    expect(guardrailProblems([{ host: "a", guardrails: [{ ...c, judgeable: true }] }], s)).toEqual([]);
+    expect(guardrailProblems([{ host: "a", guardrails: [c] }, { host: "b", guardrails: [{ ...c, halfWidth: c.halfWidth * 2 }] }], s)[0]).toContain("can't be judged on b");
+    // Other classes name their own fixes.
+    expect(guardrailProblems([{ host: "a", guardrails: [c] }], spec({ noise: "expensive" }))[0]).toContain("confirm_runs");
+    expect(guardrailProblems([{ host: "a", guardrails: [{ ...c, noise: 0.08 }] }], spec())[0]).toContain('noise = "noisy"');
   });
 });
 

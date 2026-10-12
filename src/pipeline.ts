@@ -12,7 +12,8 @@
 //
 // M2: a study measures on every bench host its spec lists. Queued candidates
 // go, oldest first, to whichever of their study's hosts is free, online and
-// healthy. Each measurement runs health check → transfer (bundles, clone
+// healthy (v1: the quietest first, and each host judges with its own win
+// threshold). Each measurement runs health check → transfer (bundles, clone
 // mode) → build (best cached per host) → paired runs as host jobs → verdict
 // → confirmation → holdout → promotion. Measurements can be cancelled; a
 // host worker restart or an offline host restarts the measurement from
@@ -21,6 +22,7 @@
 import { ciRngFor } from "./band.ts";
 import { BenchSite, BenchTransferError, makeBench as makeBenchOn, tail } from "./bench.ts";
 import { HostMutex, type Ctx } from "./context.ts";
+import { quietestFirst } from "./host-choice.ts";
 import { StoreClosedError, type BenchHostRow, type BenchIntervalKind, type CandidateRow, type Store, type StudyRow, type ThreadRow } from "./db/store.ts";
 import { driftExpensive, driftNoisy, type DriftResult } from "./drift.ts";
 import { poolPaired, positionsFromChain, promotionChain, type GuardrailCalibration, type GuardrailEstimate, type Position } from "./guardrails.ts";
@@ -82,10 +84,32 @@ export function recalibrationTrigger(spec: StudySpec, host: Pick<BenchHostRow, "
   return ratio < below ? ratio : null;
 }
 
-/** The win threshold a measurement of `study` on `host` uses (segment MDE, at least the host's own). */
+/**
+ * The win threshold a measurement of `study` on `host` uses: the host's own
+ * calibrated MDE (the segment's for a host without a calibration), never
+ * below `min_effect`. Each host's threshold controls false wins on that host
+ * at the same rate, so a quiet host detects smaller wins than a noisy one
+ * (v1; before, every host used the segment's, the noisiest host's).
+ */
 export function measurementMde(store: Store, study: StudyRow, spec: StudySpec, host: Pick<BenchHostRow, "mde">): number {
+  const minEffect = spec.oracle.protocol.min_effect;
+  const own = host.mde ?? store.segment(study.id, study.segment)?.mde ?? minEffect;
+  return Math.max(minEffect, own);
+}
+
+/**
+ * The calibrated guardrail noise a measurement on `hostId` uses (expensive and
+ * deterministic classes): that host's own calibration (the segment's hosts,
+ * or a remote machine's arrival calibration), else the segment's worst host.
+ */
+export function hostGuardrailCalibration(store: Store, study: StudyRow, hostId: string): GuardrailCalibration[] {
   const segment = store.segment(study.id, study.segment);
-  return Math.max(segment?.mde ?? spec.oracle.protocol.min_effect, host.mde ?? 0);
+  const details = safeJson<{ hosts?: Array<{ hostId?: string; guardrails?: GuardrailCalibration[] }> }>(segment?.details_json ?? null);
+  const own = details?.hosts?.find((h) => h.hostId === hostId)?.guardrails;
+  if (own?.length) return own;
+  const remote = safeJson<{ guardrails?: GuardrailCalibration[]; sha?: string }>(store.remoteHostByBench(study.id, hostId)?.calibration_json ?? null);
+  if (remote?.guardrails?.length) return remote.guardrails;
+  return segmentGuardrailCalibration(store, study);
 }
 
 /** The calibrated per-run noise a measurement on `host` uses (expensive: σ of one run). */
@@ -312,6 +336,16 @@ export class Pipeline {
     return this.ctx.store.benchHosts(study.id);
   }
 
+  /**
+   * The hosts that take measurements and drift checks, quietest first (lowest
+   * effective win threshold, then noise floor, then spec order). A host taken
+   * out for being much noisier than its peers (`excluded_json`) is left out.
+   */
+  dispatchHosts(study: StudyRow, spec: StudySpec = this.ctx.store.spec(study)): BenchHostRow[] {
+    const rows = this.benchHosts(study).filter((h) => !h.excluded_json);
+    return quietestFirst(rows, (h) => measurementMde(this.ctx.store, study, spec, h));
+  }
+
   /** Latest bench progress lines for a study (study page). */
   progress(studyId: string): Array<{ hostId: string; text: string; at: number }> {
     return [...this.progressByKey.values()].filter((p) => p.studyId === studyId).map(({ hostId, text, at }) => ({ hostId, text, at }));
@@ -526,13 +560,13 @@ export class Pipeline {
         }
       }
       // Drift checks are due on idle hosts even with nothing queued.
-      if (study.state === "running" && !recal) for (const h of this.benchHosts(study)) this.maybeStartDrift(study, spec, h);
+      if (study.state === "running" && !recal) for (const h of this.dispatchHosts(study, spec)) this.maybeStartDrift(study, spec, h);
       if (recal) this.maybeStartRecalibration(study);
     }
     // Bench: one holder per lock key, oldest first across studies (a candidate
     // waits since it was queued, or, for a first gate, since it was submitted).
-    // A measurement goes to the first free, online, healthy host of its study;
-    // a serialized gate to its edit host's key.
+    // A measurement goes to the quietest free, online, healthy host of its study
+    // (dispatchHosts: lowest win threshold first); a serialized gate to its edit host's key.
     bench.sort((a, b) => (a.c.queued_at ?? a.c.submitted_at) - (b.c.queued_at ?? b.c.submitted_at) || a.c.id - b.c.id);
     const now = this.ctx.now();
     for (const { kind, study, spec, c, lockKey: gateKey, limit } of bench) {
@@ -570,7 +604,7 @@ export class Pipeline {
         });
         continue;
       }
-      for (const h of this.benchHosts(study)) {
+      for (const h of this.dispatchHosts(study, spec)) {
         const lockKey = benchLockKey(study, spec, h.host_id);
         if (this.keyBusy(lockKey)) continue;
         if (h.status === "offline" || (h.deferred_until ?? 0) > now) continue;
@@ -605,6 +639,9 @@ export class Pipeline {
   private maybeStartRecalibration(study: StudyRow): void {
     const key = `recal:${study.id}`;
     if (!this.hooks.recalibrate || this.jobs.has(key) || (this.backoff.get(key) ?? 0) > this.ctx.now()) return;
+    // A health-deferred retry keeps its time across a reload.
+    const retryAt = safeJson<{ retry_at?: number | null }>(study.recalibrate_due)?.retry_at;
+    if (typeof retryAt === "number" && retryAt > this.ctx.now()) return;
     if ([...this.measuringStudy.values()].includes(study.id)) return;
     if ([...this.jobs.keys()].some((k) => k.startsWith(`d:${study.id}:`))) return;
     this.start(key, async () => {
@@ -617,6 +654,17 @@ export class Pipeline {
         this.ctx.bb.log("warn", `automatic recalibration of ${study.slug}: ${errText(e)}`);
       }
     });
+  }
+
+  /** An automatic recalibration found a bench host unhealthy: its next try waits `ms` (v1: instead of pausing). */
+  deferRecalibration(studyId: string, ms: number): void {
+    this.backoff.set(`recal:${studyId}`, this.ctx.now() + ms);
+  }
+
+  /** When the study's deferred automatic recalibration tries again (null: not deferred). */
+  recalibrationRetryAt(studyId: string): number | null {
+    const at = this.backoff.get(`recal:${studyId}`);
+    return at !== undefined && at > this.ctx.now() ? at : null;
   }
 
   /**
@@ -990,7 +1038,7 @@ export class Pipeline {
     const baseline = safeJson<{ sha: string; runs: RunResult[] }>(store.benchHost(study.id, host.host_id)?.baseline_json ?? null);
     const mde = measurementMde(store, study, spec, host);
     const noiseFloor = measurementNoise(store, study, host);
-    const guardrailNoise = Object.fromEntries(segmentGuardrailCalibration(store, study).map((g) => [g.name, g.noise]));
+    const guardrailNoise = Object.fromEntries(hostGuardrailCalibration(store, study, host.host_id).map((g) => [g.name, g.noise]));
     // Guardrails: the step is judged against best, the total against the segment base (best's position so far).
     const prior = bestGuardrailPositions(store, study, spec);
     const outcome = await strategy.measure({
@@ -1290,7 +1338,7 @@ export class Pipeline {
     const study = this.ctx.store.study(studyId);
     if (!study) return;
     const spec = this.ctx.store.spec(study);
-    for (const h of this.benchHosts(study)) this.ctx.store.updateBenchHost(studyId, h.host_id, { evals_since_drift: Math.max(spec.oracle.drift.every, 1), deferred_until: null });
+    for (const h of this.dispatchHosts(study, spec)) this.ctx.store.updateBenchHost(studyId, h.host_id, { evals_since_drift: Math.max(spec.oracle.drift.every, 1), deferred_until: null });
     this.kick();
   }
 
