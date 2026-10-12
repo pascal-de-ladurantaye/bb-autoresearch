@@ -1,7 +1,7 @@
 // The bench provider contract: schemas, error codes (with BB's "HTTP nnn:"
 // prefix), the client's retries, and the runner's reading of execPoll.
 import { describe, expect, it } from "vitest";
-import { BenchProviderClient, toProviderError } from "../src/bench-provider/client.ts";
+import { BenchProviderClient, ProviderMissingError, toProviderError } from "../src/bench-provider/client.ts";
 import { BENCH_PROVIDER_CONTRACT_VERSION, benchProviderContract, errorCode, providerError } from "../src/bench-provider/contract.ts";
 import { RemoteBenchRunner, RemoteHostLostError } from "../src/bench-provider/runner.ts";
 
@@ -37,6 +37,9 @@ describe("bench provider contract", () => {
     expect(toProviderError(new Error("HTTP 500: [transient] try later"), "m", "p")).toMatchObject({ code: "transient", retryable: true });
     expect(toProviderError(new Error("boom"), "m", "p")).toMatchObject({ code: "internal", retryable: false });
     expect(toProviderError(new Error("plugin p is not installed"), "m", "p").code).toBe("not_found");
+    expect(toProviderError(new Error("plugin p is not installed"), "m", "p")).toBeInstanceOf(ProviderMissingError);
+    // A machine the provider doesn't know is not a missing provider (a reload waits for the latter).
+    expect(toProviderError(new Error("[not_found] no machine h1"), "m", "p")).not.toBeInstanceOf(ProviderMissingError);
   });
 
   it("the client retries [capacity] and [transient], not the others", async () => {

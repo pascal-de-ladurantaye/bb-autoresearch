@@ -7,6 +7,7 @@
 // improvement is positive when it is better, in the metric's own terms).
 import { remoteGates } from "./single-machine.ts";
 import { remoteLines, remoteView } from "./remote/view.ts";
+import { mib, type ArtifactUsage } from "./remote/fleet.ts";
 import { PluginCliError, cliCommand, defineCli, type PluginCliContext, type PluginCliRegistration } from "@get-bb/plugin-sdk";
 import { EngineError, type Caller, type Engine } from "./engine.ts";
 import { errText, evalTimes } from "./pipeline.ts";
@@ -284,16 +285,19 @@ export function studyCli(engine: Engine): PluginCliRegistration {
         positionals: slugArg,
         options: { ...jsonOpt },
         run: (input) =>
-          wrap(engine, input.positionals.slug, () =>
-            respond(
+          wrap(engine, input.positionals.slug, async () => {
+            const s0 = engine.study(input.positionals.slug);
+            // Seeds and base bundles on the edit host: only asked for when the study has remote bench hosts.
+            const artifacts = engine.ctx.store.artifacts(s0.id).length || hasRemoteBench(engine, s0) ? await engine.fleet.artifactUsage(s0) : null;
+            return respond(
               input.options.json,
-              () => benchText(engine, input.positionals.slug),
+              () => benchText(engine, input.positionals.slug, artifacts),
               () => {
                 const s = engine.study(input.positionals.slug);
-                return { slug: s.slug, state: s.state, segment: segmentView(engine, s), ...benchView(engine, s), segments: oracleView(engine, s).segments };
+                return { slug: s.slug, state: s.state, segment: segmentView(engine, s), ...benchView(engine, s), segments: oracleView(engine, s).segments, artifacts };
               },
-            ),
-          ),
+            );
+          }),
       }),
       pause: cliCommand({
         summary: "Pause: no new workers; running workers finish their current submission",
@@ -553,7 +557,22 @@ function benchLines(engine: Engine, s: StudyRow): string[] {
   ), ...remote];
 }
 
-function benchText(engine: Engine, slug: string): string {
+function hasRemoteBench(engine: Engine, s: StudyRow): boolean {
+  try {
+    return (engine.ctx.store.spec(s).oracle.remote_bench ?? []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** The edit host's seeds and base bundles for remote bench hosts, in one line. */
+export function artifactLine(a: ArtifactUsage): string {
+  const total = a.seeds.bytes + a.bases.bytes;
+  const last = a.lastCleanup ? ` · last cleanup (${a.lastCleanup.reason}) deleted ${a.lastCleanup.files} file(s), ${mib(a.lastCleanup.bytes)}` : "";
+  return `${a.seeds.files} seed(s) and ${a.bases.files} base bundle(s) on the edit host, ${mib(total)} · this study uses ${a.study.files} (${mib(a.study.bytes)}); the rest is deleted at the next load or archive unless another study uses it${last}`;
+}
+
+function benchText(engine: Engine, slug: string, artifacts: ArtifactUsage | null = null): string {
   const { store } = engine.ctx;
   const s = engine.study(slug);
   const v = benchView(engine, s);
@@ -564,6 +583,7 @@ function benchText(engine: Engine, slug: string): string {
       ["Utilization", utilizationLine(engine, s)],
       ["Queue", v.queue.length ? v.queue.map((q) => `c/${q.n} ${q.stage}${q.benchHostName ? ` on ${q.benchHostName}` : ""}`).join(", ") : "empty"],
       ["Gates", `${v.gates.flaky} flaky · ${v.gates.failed} failed`],
+      ["Remote artifacts", artifacts ? artifactLine(artifacts) : undefined],
     ]),
     ...section("Hosts", benchLines(engine, s)),
     ...section(

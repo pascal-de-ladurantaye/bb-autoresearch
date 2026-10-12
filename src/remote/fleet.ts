@@ -19,16 +19,25 @@
 //   a lost exec, a failed join. A measurement on a machine that leaves
 //   restarts from scratch elsewhere (Pipeline.cancelMeasurements).
 // - Cost guard: at most one machine per slot plus one replacement.
-// - Orphans: machines carry the study id and slot as labels; on load, pause,
-//   archive and unload the fleet lists them and destroys what isn't in use.
+// - Orphans: machines carry the study id and slot as labels; on load, pause
+//   and archive the fleet lists them and destroys what isn't in use.
+// - Plugin reload: unloading keeps calibrated machines (their rows stay
+//   `ready` in the database); the next instance re-adopts each one the
+//   provider still lists as ready and that answers a probe, and destroys the
+//   rest. Archive and pause still destroy machines; a disabled plugin's
+//   machines end with their lifetime (or at the next load).
+// - Artifacts: seeds and base bundles on the edit host that no non-archived
+//   study uses are deleted at load and on archive (host/artifacts.ts).
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BenchProviderClient } from "../bench-provider/client.ts";
+import { BenchProviderClient, ProviderMissingError } from "../bench-provider/client.ts";
 import { BenchProviderError, LEAVING_STATES, type DescribeOutput, type HostState } from "../bench-provider/contract.ts";
-import { RemoteBenchRunner, RemoteHostLostError } from "../bench-provider/runner.ts";
+import { RemoteBenchRunner, RemoteHostLostError, q } from "../bench-provider/runner.ts";
 import { HealthError, calibrateHost } from "../calibration.ts";
 import { DEFAULT_REMOTE_CONFIG, type Ctx, type RemoteFleetConfig } from "../context.ts";
 import { REMOTE_LIVE_STATES, type BenchHostRow, type RemoteArtifactRow, type RemoteHostRow, type StudyRow } from "../db/store.ts";
+import type { ArtifactReport } from "../host/contract.ts";
 import type { HostRunner } from "../host/runner.ts";
 import { seedFindingsText } from "../host/seed.ts";
 import type { CalibrationOutcome } from "../noise.ts";
@@ -76,6 +85,12 @@ const ORPHAN_SWEEP_MS = 10 * 60_000;
 /** Machine states that are joining (not measuring yet). */
 const JOINING = ["creating", "joining", "calibrating"] as const;
 
+/** After a reload, how long a kept machine may stay unverified (its provider not loaded yet, say) before it is given up. */
+const ADOPT_TIMEOUT_MS = 10 * 60_000;
+/** How often an unverified kept machine is checked again. */
+const ADOPT_RETRY_MS = 15_000;
+const ADOPT_PHASE = "re-adopting after a plugin reload";
+
 export class RemoteFleet {
   readonly config: RemoteFleetConfig;
   private clients = new Map<string, BenchProviderClient>();
@@ -93,6 +108,11 @@ export class RemoteFleet {
   private sweptAt = 0;
   /** When each row learned its machine's id (real time): a list started before that can't judge it. */
   private assignedAt = new Map<number, number>();
+  /** Machines kept across a reload that are not verified yet (row id → when adoption started, ctx clock). No work goes to them. */
+  private adopting = new Map<number, number>();
+  private adoptTriedAt = 0;
+  /** The latest artifact report per edit host (views). */
+  private artifactReports = new Map<string, { at: number; report: ArtifactReport; reason: string }>();
 
   constructor(
     private readonly ctx: Ctx,
@@ -263,6 +283,10 @@ export class RemoteFleet {
       this.sweptAt = now;
       this.startJob("orphans", () => this.cleanupOrphans().then(() => undefined));
     }
+    if (this.adopting.size && now - this.adoptTriedAt >= ADOPT_RETRY_MS) {
+      this.adoptTriedAt = now;
+      this.startJob("adopt", () => this.verifyAdoptions().then(() => undefined));
+    }
     const studies = new Map<string, StudyRow>();
     for (const s of this.store.studies()) {
       if (s.state === "archived") {
@@ -351,7 +375,7 @@ export class RemoteFleet {
   private mayCreate(study: StudyRow, entry: number, now: number): boolean {
     const f = this.failures.get(this.failureKey(study.id, entry));
     if (!f) return true;
-    if (f.seedKey !== undefined) return f.seedKey !== this.seedKey(study, this.seedBaseline(study));
+    if (f.seedKey !== undefined) return f.seedKey !== this.seedKey(study, entry, this.seedBaseline(study));
     return now >= f.until;
   }
 
@@ -402,6 +426,7 @@ export class RemoteFleet {
     this.aborts.get(row.id)?.abort();
     this.aborts.delete(row.id);
     this.joined.delete(row.id);
+    this.adopting.delete(row.id);
     this.runners.get(row.id)?.markLost(reason);
     const study = this.store.study(row.study_id);
     const name = this.store.benchHost(row.study_id, row.bench_host_id)?.name ?? row.bench_host_id;
@@ -452,7 +477,8 @@ export class RemoteFleet {
   }
 
   private pollStatus(study: StudyRow, row: RemoteHostRow, now: number): void {
-    if (!row.remote_id || row.state === "creating") return;
+    // A machine kept across a reload is checked by verifyAdoptions (its provider may not be loaded yet).
+    if (!row.remote_id || row.state === "creating" || this.adopting.has(row.id)) return;
     if (now - (this.polledAt.get(row.id) ?? 0) < this.config.statusPollMs) return;
     this.polledAt.set(row.id, now);
     this.startJob(`status:${row.id}`, async () => {
@@ -489,8 +515,21 @@ export class RemoteFleet {
   private seedBaseline(study: StudyRow): string {
     return this.calibrating.get(study.id) ?? this.store.segment(study.id, study.segment)?.baseline_sha ?? this.targetSha(study);
   }
-  private seedKey(study: StudyRow, baseline: string): string {
-    return `${baseline}:v${study.spec_version}`;
+  /**
+   * What an entry's seed is built from: the baseline it runs in, the seed
+   * command, its allowlist and the cores it is told about. A spec version
+   * that changes none of them (a budget, the protocol, another entry) reuses
+   * the seed instead of building it again.
+   */
+  seedKey(study: StudyRow, entryIndex: number, baseline: string): string {
+    let entry: RemoteBenchSpec | undefined;
+    try {
+      entry = this.entries(study)[entryIndex];
+    } catch {
+      entry = undefined;
+    }
+    const inputs = JSON.stringify({ seed: entry?.seed ?? null, allow: [...(entry?.seed_allow ?? [])].sort(), cores: entry?.cores ?? null });
+    return `${baseline}:${createHash("sha256").update(inputs).digest("hex").slice(0, 16)}`;
   }
 
   private async joinAndCalibrate(rowId: number, signal: AbortSignal): Promise<void> {
@@ -640,6 +679,7 @@ export class RemoteFleet {
     const row = this.store.remoteHostByBench(study.id, benchHostId);
     if (!row || row.state === "gone") return;
     this.joined.delete(row.id);
+    this.adopting.delete(row.id);
     const cal = { sha, noiseFloor: outcome.noiseFloor, mde: outcome.mde, evalSeconds: outcome.evalSeconds, sideRuns: outcome.sideRuns ?? null, runSeconds: outcome.runSeconds ?? null, problems: outcome.problems.slice(0, 5), report: clip(outcome.report, 2000), at: this.ctx.now() };
     const wasReady = row.state === "ready";
     this.store.tx(() => {
@@ -665,7 +705,7 @@ export class RemoteFleet {
     f.n += 1;
     f.last = msg;
     const now = this.ctx.now();
-    if (e instanceof SeedError && e.refused && study) f.seedKey = this.seedKey(study, this.seedBaseline(study));
+    if (e instanceof SeedError && e.refused && study) f.seedKey = this.seedKey(study, row.entry, this.seedBaseline(study));
     f.until = now + (f.n >= this.config.maxFailures ? this.config.blockedMs : this.config.retryMs * f.n);
     this.failures.set(key, f);
     this.store.updateRemoteHost(rowId, { error: clip(msg, 1000) });
@@ -699,11 +739,11 @@ export class RemoteFleet {
   /**
    * An entry's seed for a segment baseline: the seed command runs on the edit
    * host in a checkout of that commit, then the result is scanned for
-   * credentials and packed (host/seed.ts). Built once per segment (and spec
-   * version), cached by content hash.
+   * credentials and packed (host/seed.ts). Built once per baseline and seed
+   * inputs (seedKey), cached by content hash.
    */
   async seedFor(study: StudyRow, entryIndex: number, entry: RemoteBenchSpec, baseline: string): Promise<RemoteArtifactRow> {
-    const k = this.seedKey(study, baseline);
+    const k = this.seedKey(study, entryIndex, baseline);
     const cached = this.store.artifact(study.id, "seed", entryIndex, k);
     if (cached?.state === "refused") throw new SeedError(`the seed was refused: ${seedRefusalText(cached)}`, true);
     const edit = this.ctx.bb.hostRunner(study.host_id!);
@@ -777,15 +817,15 @@ export class RemoteFleet {
           for (let k = 1; k <= e.hosts; k++) {
             const slot = `${i}.${k}`;
             const mine = live.filter((r) => r.slot === slot);
-            if (mine.some((r) => r.state === "ready" || this.joined.has(r.id))) continue;
+            if (mine.some((r) => (r.state === "ready" && !this.adopting.has(r.id)) || this.joined.has(r.id))) continue;
             const f = this.failures.get(this.failureKey(study.id, i));
-            const seedBlocked = f?.seedKey !== undefined && f.seedKey === this.seedKey(study, this.seedBaseline(study));
+            const seedBlocked = f?.seedKey !== undefined && f.seedKey === this.seedKey(study, i, this.seedBaseline(study));
             if (f && (seedBlocked || (f.seedKey === undefined && f.n >= this.config.maxFailures))) problems.push(`remote bench ${i + 1} (${e.provider}) slot ${k}: ${clip(f.last, 400)}`);
             else waiting = true;
           }
         });
         if (!waiting) {
-          const rows = live.filter((r) => r.state === "ready" || this.joined.has(r.id)).map((r) => this.store.benchHost(study.id, r.bench_host_id)!).filter(Boolean);
+          const rows = live.filter((r) => (r.state === "ready" && !this.adopting.has(r.id)) || this.joined.has(r.id)).map((r) => this.store.benchHost(study.id, r.bench_host_id)!).filter(Boolean);
           return { hosts: rows, problems };
         }
         if (Date.now() - t0 > this.config.joinTimeoutMs) return { hosts: [], problems: [`remote bench: machines did not join within ${formatDuration(this.config.joinTimeoutMs / 1000)}`] };
@@ -868,45 +908,218 @@ export class RemoteFleet {
     for (const r of live) this.leave(r, reason, { expected: true });
     await this.settle();
     await this.cleanupOrphans([...new Set([...live.map((r) => r.provider), ...this.entries(study).map((e) => e.provider)])]);
+    await this.gcArtifacts("study archived").catch((e) => this.ctx.bb.log("warn", `remote bench artifact cleanup: ${errText(e)}`));
     return live.length;
   }
 
   /**
-   * Plugin load: live rows belong to a previous instance (its unload or crash
-   * ended them), so they are marked gone and every machine still listed is
-   * destroyed as an orphan. Machines rejoin as slots fill.
+   * Plugin load. Live rows belong to the previous instance. A machine it
+   * kept (calibrated, `ready`) is re-adopted once verified: the provider
+   * lists it as ready and a probe finds its repository there. Until then it
+   * takes no work; one that can't be verified within ADOPT_TIMEOUT_MS leaves.
+   * Rows that were joining, calibrating or retiring end, and every machine
+   * the providers list that no live row uses is destroyed as an orphan.
+   * Then seeds and base bundles no study uses are deleted.
    */
-  async reconcile(): Promise<{ ended: number; destroyed: number }> {
+  async reconcile(): Promise<{ ended: number; adopting: number; adopted: number; destroyed: number }> {
     let ended = 0;
+    const now = this.ctx.now();
     for (const r of this.store.liveRemoteHosts()) {
+      if (r.state === "ready" && r.remote_id && r.home) {
+        this.adopting.set(r.id, now);
+        this.store.tx(() => {
+          this.store.updateRemoteHost(r.id, { phase: ADOPT_PHASE });
+          this.store.updateBenchHost(r.study_id, r.bench_host_id, { active: 0, best_build_sha: null });
+        });
+        continue;
+      }
       this.store.tx(() => {
-        this.store.updateRemoteHost(r.id, { state: "gone", left_at: this.ctx.now(), left_reason: "plugin restarted", phase: null });
+        this.store.updateRemoteHost(r.id, { state: "gone", left_at: now, left_reason: "plugin restarted", phase: null });
         this.store.updateBenchHost(r.study_id, r.bench_host_id, { active: 0, best_build_sha: null });
         this.store.event(r.study_id, "remote.left", "plugin", { remote: r.id, host: r.bench_host_id, slot: r.slot, reason: "plugin restarted", expected: true });
       });
       ended += 1;
     }
+    const adopting = this.adopting.size;
+    this.adoptTriedAt = now;
+    const { adopted } = await this.verifyAdoptions();
     const destroyed = await this.cleanupOrphans();
-    return { ended, destroyed };
+    this.startJob("gc", () => this.gcArtifacts("plugin loaded").then(() => undefined));
+    return { ended, adopting, adopted, destroyed };
   }
 
   /**
-   * Plugin unload (reload, disable, shutdown): nothing uses the machines
-   * after this instance, so all of them are destroyed (best effort; the
-   * next load lists and destroys what is left).
+   * Check each kept machine: the provider's status must be ready, and a probe
+   * on the machine must find the bench repository (and the seed it had). A
+   * provider that can't answer yet (not loaded) is asked again on later
+   * ticks, until ADOPT_TIMEOUT_MS.
+   */
+  private async verifyAdoptions(): Promise<{ adopted: number }> {
+    let adopted = 0;
+    for (const [rowId, since] of [...this.adopting]) {
+      if (this.ctx.disposed) break;
+      const row = this.store.remoteHost(rowId);
+      if (!row || row.state === "gone") {
+        this.adopting.delete(rowId);
+        continue;
+      }
+      let status: { state: HostState; expiresAt: string | null; detail?: string };
+      try {
+        status = await this.client(row.provider).call("benchProvider.status", { hostId: row.remote_id! }, { retries: 1 });
+      } catch (e) {
+        if (e instanceof BenchProviderError && e.code === "not_found" && !(e instanceof ProviderMissingError)) {
+          this.leave(row, "the provider no longer knows the machine (after a plugin reload)", { expected: true });
+        } else if (this.ctx.now() - since >= ADOPT_TIMEOUT_MS) {
+          this.leave(row, `could not be re-adopted after a plugin reload: ${clip(errText(e), 300)}`, { notify: true });
+        } else this.store.updateRemoteHost(rowId, { phase: `${ADOPT_PHASE}: waiting for ${row.provider} (${clip(errText(e), 200)})` });
+        continue;
+      }
+      if (status.state !== "ready") {
+        this.leave(row, `the machine is ${status.state} after a plugin reload${status.detail ? ` (${clip(status.detail, 200)})` : ""}`, { expected: true });
+        continue;
+      }
+      const exp = status.expiresAt ? Date.parse(status.expiresAt) : NaN;
+      if (Number.isFinite(exp) && (row.expires_at === null || exp < row.expires_at)) this.store.updateRemoteHost(rowId, { expires_at: exp });
+      const runner = this.runnerOf(row);
+      const seedDir = row.seed_sha ? `${row.home}/bb-autoresearch/seed/${row.seed_sha}` : null;
+      const probe = await runner
+        .exec({ cwd: row.home!, command: `test -f ${q(`${runner.repoPath}/HEAD`)}${seedDir ? ` && test -f ${q(`${seedDir}/.autoresearch-seed-ok`)}` : ""} && echo ok`, timeoutMs: 60_000 })
+        .catch((e: unknown) => ({ exitCode: -1, stdout: "", stderr: errText(e), timedOut: false, durationMs: 0 }));
+      if (this.store.remoteHost(rowId)?.state === "gone") {
+        this.adopting.delete(rowId);
+        continue;
+      }
+      if (probe.exitCode !== 0 || !probe.stdout.includes("ok")) {
+        this.leave(row, `could not be re-adopted after a plugin reload: ${probe.exitCode === -1 ? clip(probe.stderr, 300) : "its repository or seed is missing"}`, { expected: true });
+        continue;
+      }
+      this.adopting.delete(rowId);
+      this.store.tx(() => {
+        this.store.updateRemoteHost(rowId, { phase: null, status_at: this.ctx.now() });
+        this.store.updateBenchHost(row.study_id, row.bench_host_id, { active: 1, status: "online", status_at: this.ctx.now() });
+        this.store.event(row.study_id, "remote.readopted", "plugin", { remote: row.id, host: row.bench_host_id, slot: row.slot, provider: row.provider });
+      });
+      adopted += 1;
+      this.hooks.publish(row.study_id);
+      this.hooks.kick();
+    }
+    return { adopted };
+  }
+
+  /** Whether a machine is kept across a reload but not verified yet (views). */
+  isAdopting(rowId: number): boolean {
+    return this.adopting.has(rowId);
+  }
+
+  /**
+   * Plugin unload (reload, disable, shutdown). Calibrated machines are kept:
+   * their rows stay `ready`, and the next instance re-adopts them (or, when
+   * the plugin stays off, the provider ends them with their lifetime). This
+   * instance stops using them at once: work in flight on them is cancelled.
+   * Machines that were still joining, calibrating or retiring are destroyed
+   * (best effort, bounded; the next load lists and destroys what is left).
    */
   async dispose(timeoutMs = 8_000): Promise<void> {
     const live = this.store.liveRemoteHosts();
     for (const a of this.aborts.values()) a.abort();
-    for (const r of live) {
-      this.runners.get(r.id)?.markLost("plugin unloaded");
+    const drop = live.filter((r) => !(r.state === "ready" && r.remote_id && r.home));
+    for (const r of live) this.runners.get(r.id)?.markLost("plugin unloaded");
+    for (const r of drop) {
       this.store.tx(() => {
         this.store.updateRemoteHost(r.id, { state: "gone", left_at: this.ctx.now(), left_reason: "plugin unloaded", phase: null });
         this.store.updateBenchHost(r.study_id, r.bench_host_id, { active: 0 });
       });
     }
-    const destroys = live.filter((r) => r.remote_id).map((r) => this.client(r.provider).call("benchProvider.destroy", { hostId: r.remote_id! }, { retries: 0 }).catch(() => undefined));
+    const destroys = drop.filter((r) => r.remote_id).map((r) => this.client(r.provider).call("benchProvider.destroy", { hostId: r.remote_id! }, { retries: 0 }).catch(() => undefined));
     await Promise.race([Promise.allSettled(destroys), new Promise((r) => setTimeout(r, timeoutMs))]);
+  }
+
+  // ------------------------------------------------------------ artifacts on disk
+
+  /**
+   * Paths of the seeds and base bundles a study still uses: the seed of each
+   * spec entry for its current baseline and inputs (and the newest one built,
+   * should the two differ), and the base bundle of its base.
+   */
+  private artifactsInUse(study: StudyRow): string[] {
+    const rows = this.store.artifacts(study.id).filter((a) => a.state === "ok" && a.path).sort((x, y) => y.created_at - x.created_at || y.id - x.id);
+    const keep = new Set<string>();
+    const seen = new Set<number>();
+    let entries: RemoteBenchSpec[] = [];
+    try {
+      entries = this.entries(study);
+    } catch {
+      // no spec yet
+    }
+    const baseline = this.seedBaseline(study);
+    entries.forEach((_, i) => {
+      const current = baseline ? this.store.artifact(study.id, "seed", i, this.seedKey(study, i, baseline)) : undefined;
+      if (current?.state === "ok" && current.path) keep.add(current.path);
+    });
+    for (const a of rows) {
+      if (a.kind === "seed" && !seen.has(a.entry)) {
+        seen.add(a.entry);
+        keep.add(a.path!);
+      }
+      if (a.kind === "base" && (a.key === study.base_sha || a.key === study.best_sha)) keep.add(a.path!);
+    }
+    return [...keep];
+  }
+
+  /**
+   * Delete the seeds and base bundles on each edit host that no
+   * non-archived study uses (at load, and when a study is archived).
+   */
+  async gcArtifacts(reason: string): Promise<Map<string, ArtifactReport>> {
+    const keepByHost = new Map<string, Set<string>>();
+    for (const s of this.store.studies()) {
+      if (!s.host_id) continue;
+      const keep = keepByHost.get(s.host_id) ?? new Set<string>();
+      keepByHost.set(s.host_id, keep);
+      if (s.state !== "archived") for (const p of this.artifactsInUse(s)) keep.add(p);
+    }
+    const out = new Map<string, ArtifactReport>();
+    for (const [hostId, keep] of keepByHost) {
+      if (this.ctx.disposed) break;
+      let report: ArtifactReport;
+      try {
+        report = await this.ctx.bb.hostRunner(hostId).artifacts({ keep: [...keep], gc: true });
+      } catch (e) {
+        this.ctx.bb.log("info", `remote bench: artifact cleanup on ${hostId} failed: ${errText(e)}`);
+        continue;
+      }
+      out.set(hostId, report);
+      this.artifactReports.set(hostId, { at: this.ctx.now(), report, reason });
+      if (report.deleted.files || report.scratch) {
+        this.store.event(null, "remote.artifacts_deleted", "plugin", { host: hostId, reason, files: report.deleted.files, bytes: report.deleted.bytes, scratch: report.scratch, kept: report.seeds.files + report.bases.files - report.deleted.files });
+        this.ctx.bb.log("info", `remote bench: deleted ${report.deleted.files} unused seed(s) and base bundle(s) (${mib(report.deleted.bytes)}) on ${hostId} (${reason})`);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * What a study's edit host keeps on disk for remote bench hosts (a report,
+   * nothing deleted), with what this study uses and what the last cleanup
+   * deleted. Null when the host can't be asked.
+   */
+  async artifactUsage(study: StudyRow): Promise<ArtifactUsage | null> {
+    if (!study.host_id) return null;
+    let report: ArtifactReport;
+    try {
+      report = await this.ctx.bb.hostRunner(study.host_id).artifacts({ keep: [], gc: false });
+    } catch {
+      return null;
+    }
+    const mine = new Set(study.state === "archived" ? [] : this.artifactsInUse(study));
+    const used = report.files.filter((f) => mine.has(f.path));
+    const last = this.artifactReports.get(study.host_id);
+    return {
+      seeds: report.seeds,
+      bases: report.bases,
+      study: { files: used.length, bytes: used.reduce((a, f) => a + f.bytes, 0) },
+      lastCleanup: last ? { at: last.at, reason: last.reason, files: last.report.deleted.files, bytes: last.report.deleted.bytes } : null,
+    };
   }
 
   /** Live and recent machines of a study (views). */
@@ -922,7 +1135,16 @@ export class RemoteFleet {
   }
 }
 
-function mib(bytes: number): string {
+/** Seeds and base bundles on a study's edit host (`bb study bench`, the Bench tab). */
+export interface ArtifactUsage {
+  seeds: { files: number; bytes: number };
+  bases: { files: number; bytes: number };
+  /** What this study uses of them (its newest seed per entry, its base bundle). */
+  study: { files: number; bytes: number };
+  lastCleanup: { at: number; reason: string; files: number; bytes: number } | null;
+}
+
+export function mib(bytes: number): string {
   return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 

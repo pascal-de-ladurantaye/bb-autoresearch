@@ -3,18 +3,21 @@
 // seed and a setup step, calibrate per host, measure, rotate, leave, and are
 // cleaned up; a seed with credentials is refused before any machine exists.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createLocalBenchProvider, type LocalBenchProvider } from "../examples/bench-provider-local/provider.ts";
 import { benchProviderContract, type BenchProviderMethod } from "../src/bench-provider/contract.ts";
-import type { Store } from "../src/db/store.ts";
+import type Database from "better-sqlite3";
+import { HostMutex, type Ctx } from "../src/context.ts";
+import { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";
 import { gatesSerialized } from "../src/pipeline.ts";
 import { liveView } from "../src/live.ts";
 import { remoteLines } from "../src/remote/view.ts";
 import { benchView } from "../src/views.ts";
+import { artifactLine } from "../src/cli.ts";
 import { Clock, localRunner, makeCtx, waitFor, type FakePort } from "./helpers.ts";
 
 const SLUG = "toy-remote";
@@ -102,6 +105,7 @@ describe("remote bench hosts (example provider, real git)", () => {
   let port: FakePort;
   let clock: Clock;
   let provider: LocalBenchProvider;
+  let ctx: Ctx;
   let n = 0;
   /** Most live machines per slot seen at any tick (cost guard). */
   let maxPerSlot = 0;
@@ -125,7 +129,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     clock = new Clock();
     const runner = localRunner(join(root, "edit-data"), "host_test", { pollMs: 10, progressMs: 10 });
     const made = makeCtx(runner, clock);
-    ({ store, port } = made);
+    ({ store, port, ctx } = made);
     made.ctx.config.remote = { statusPollMs: 0, readyPollMs: 10, execPollMs: 10, retryMs: 0, joinTimeoutMs: 30_000, stagingDir: join(root, "staging") };
     port.projectCheckout = async () => repo;
     port.addThread("thr_study");
@@ -146,6 +150,23 @@ describe("remote bench hosts (example provider, real git)", () => {
     await new Promise((r) => setTimeout(r, 50));
     rmSync(root, { recursive: true, force: true });
   });
+
+  /**
+   * A plugin reload: the old instance is disposed (its store closes; the
+   * database stays, as BB keeps the file), and a new engine on the same
+   * database reconciles.
+   */
+  async function reload() {
+    await engine.fleet.settle().catch(() => undefined);
+    await engine.dispose();
+    const handle = (store as unknown as { handle: Database.Database }).handle;
+    store = new Store(handle, clock.now);
+    ctx = { ...ctx, store, benchLock: new HostMutex(), disposed: false };
+    delete ctx.remoteRunner;
+    engine = new Engine(ctx);
+    await engine.reconcile();
+    await engine.fleet.settle();
+  }
 
   const live = () => store.remoteHosts(store.study(SLUG)!.id, { live: true });
   const ready = () => live().filter((r) => r.state === "ready");
@@ -366,15 +387,16 @@ describe("remote bench hosts (example provider, real git)", () => {
     const orphan = await provider.handlers["benchProvider.create"]({ key: "orphan-1", cores: 1, lifetimeSeconds: 600, labels: { owner: "bb-autoresearch", study: sid, slot: "9.9" } }, CALLER);
     expect(await engine.fleet.cleanupOrphans()).toBe(1);
     expect(provider.machines().find((m) => m.hostId === orphan.hostId)!.state).toBe("gone");
-    // A reload: the previous instance's machines are ended and destroyed (new ones join as slots fill).
+    // A load: rows that were not measuring yet are ended and their machines destroyed; a ready one is re-adopted.
     await engine.fleet.settle();
-    const before = live().map((x) => x.remote_id);
-    expect(before.length).toBeGreaterThan(0);
+    const joining = live().filter((x) => x.state !== "ready" && x.remote_id);
+    const readyIds = ready().map((x) => x.remote_id);
     const r = await engine.fleet.reconcile();
-    expect(r.ended).toBe(before.length);
+    expect(r.ended).toBe(joining.length);
+    expect(r.adopted).toBe(readyIds.length);
     await engine.fleet.settle();
-    for (const id of before) expect(provider.machines().find((m) => m.hostId === id)!.state).toBe("gone");
-    expect(before.every((id) => !live().some((x) => x.remote_id === id))).toBe(true);
+    for (const x of joining) expect(provider.machines().find((m) => m.hostId === x.remote_id)!.state).toBe("gone");
+    for (const id of readyIds) expect(provider.machines().find((m) => m.hostId === id)!.state).toBe("ready");
   });
 
   it("pause releases the machines, resume brings new ones; archive and unload destroy everything", async () => {
@@ -396,12 +418,182 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(alive()).toHaveLength(0);
   });
 
-  it("plugin unload destroys the machines", async () => {
+  it("a plugin reload keeps calibrated machines: the new instance re-adopts them and measures on them without new ones", async () => {
     setup();
     await started();
-    expect(alive()).toHaveLength(2);
-    await engine.dispose();
+    const sid = studyId();
+    const before = ready().map((r) => ({ id: r.id, remote: r.remote_id, bench: r.bench_host_id, noise: store.benchHost(sid, r.bench_host_id)!.noise_floor }));
+    expect(before).toHaveLength(2);
+    const created = provider.calls()["benchProvider.create"];
+    const seedBuilds = store.events(sid, { kinds: ["remote.seed_building"] }).length;
+    await reload();
+    // Nothing was destroyed or created: the same machines, still ready, with their own calibration.
+    expect(alive().map((m) => m.hostId).sort()).toEqual(before.map((b) => b.remote).sort());
+    expect(provider.calls()["benchProvider.create"]).toBe(created);
+    for (const b of before) {
+      const row = store.remoteHost(b.id)!;
+      expect(row.state).toBe("ready");
+      expect(row.phase).toBeNull();
+      expect(engine.fleet.isAdopting(b.id)).toBe(false);
+      const host = store.benchHost(sid, b.bench)!;
+      expect(host.active).toBe(1);
+      expect(host.noise_floor).toBe(b.noise);
+    }
+    expect(store.events(sid, { kinds: ["remote.readopted"] })).toHaveLength(2);
+    expect(store.events(sid, { kinds: ["remote.left"] })).toHaveLength(0);
+    // The new instance measures on them; nothing joins, and the seed is not built again.
+    const id = queue(50);
+    const c = await decided(id);
+    expect(c.verdict).toBe("win");
+    expect(before.map((b) => b.bench)).toContain(c.bench_host_id);
+    await tick(3);
+    await engine.fleet.settle();
+    expect(provider.calls()["benchProvider.create"]).toBe(created);
+    expect(store.events(sid, { kinds: ["remote.seed_building"] })).toHaveLength(seedBuilds);
+    expect(ready()).toHaveLength(2);
+    // Archive still destroys them.
+    const text = await engine.archiveStudy(SLUG, "human");
+    expect(text).toMatch(/2 remote machine\(s\) destroyed/u);
     expect(alive()).toHaveLength(0);
+  });
+
+  it("after a reload, a machine that died meanwhile or lost its repository is not re-adopted, and its slot fills again", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    const [a, b] = ready().sort((x, y) => x.id - y.id);
+    await engine.fleet.settle();
+    await engine.dispose();
+    // While no instance runs: a dies, b loses its bench repository.
+    provider.kill(a!.remote_id!);
+    const homeB = provider.machines().find((m) => m.hostId === b!.remote_id)!.home;
+    rmSync(join(homeB, "bb-autoresearch", "repo.git"), { recursive: true, force: true });
+    await reload();
+    expect(store.remoteHost(a!.id)!.state).toBe("gone");
+    expect(store.remoteHost(b!.id)!.state).toBe("gone");
+    expect(store.remoteHost(b!.id)!.left_reason).toMatch(/re-adopted.*repository or seed is missing/u);
+    expect(provider.machines().find((m) => m.hostId === b!.remote_id)!.state).toBe("gone");
+    expect(store.events(sid, { kinds: ["remote.readopted"] })).toHaveLength(0);
+    expect(await waitFor(() => {
+      void tick().catch(() => undefined);
+      return ready().length === 2;
+    }, 60_000, 20)).toBe(true);
+    expect(ready().every((r) => r.id !== a!.id && r.id !== b!.id)).toBe(true);
+  });
+
+  it("after a reload, a kept machine waits (and takes no work) until its provider answers", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    const kept = ready().map((r) => r.id);
+    const handler = port.plugins.get("bench-provider-local")!;
+    port.plugins.delete("bench-provider-local");
+    await reload();
+    for (const id of kept) {
+      expect(engine.fleet.isAdopting(id)).toBe(true);
+      const row = store.remoteHost(id)!;
+      expect(row.state).toBe("ready");
+      expect(row.phase).toMatch(/re-adopting after a plugin reload/u);
+      expect(store.benchHost(sid, row.bench_host_id)!.active).toBe(0);
+    }
+    expect(benchView(engine, store.study(SLUG)!).remote.machines.filter((m) => m.state === "ready").every((m) => /re-adopting/u.test(m.stateText))).toBe(true);
+    // The provider comes up: the next tick after the retry interval verifies them.
+    port.plugins.set("bench-provider-local", handler);
+    clock.advance(20_000);
+    await tick();
+    await engine.fleet.settle();
+    for (const id of kept) {
+      expect(engine.fleet.isAdopting(id)).toBe(false);
+      expect(store.benchHost(sid, store.remoteHost(id)!.bench_host_id)!.active).toBe(1);
+    }
+    expect(store.events(sid, { kinds: ["remote.readopted"] })).toHaveLength(2);
+  });
+
+  it("an unload while machines join destroys the joining ones (only calibrated machines are kept)", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    const [a] = ready();
+    provider.kill(a!.remote_id!);
+    await tick();
+    await engine.fleet.settle();
+    // a left; its replacement starts joining. Unload before it is calibrated.
+    expect(await waitFor(() => {
+      void tick().catch(() => undefined);
+      return live().some((r) => r.slot === a!.slot && r.id !== a!.id && r.remote_id !== null && r.state !== "ready");
+    }, 30_000, 5)).toBe(true);
+    const joiningRow = live().find((r) => r.slot === a!.slot && r.id !== a!.id)!;
+    await engine.dispose();
+    const handle = (store as unknown as { handle: Database.Database }).handle;
+    const after = new Store(handle, clock.now);
+    expect(after.remoteHost(joiningRow.id)!.state).toBe("gone");
+    expect(after.remoteHost(joiningRow.id)!.left_reason).toBe("plugin unloaded");
+    expect(after.remoteHosts(sid, { live: true }).filter((r) => r.state === "ready")).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(provider.machines().find((m) => m.hostId === joiningRow.remote_id)?.state ?? "gone").toBe("gone");
+    // Keep afterEach's dispose harmless: a fresh instance on the same database.
+    await reload();
+  });
+
+  it("a spec version that leaves the seed's inputs alone reuses the seed; one that changes them builds it again", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    expect(store.events(sid, { kinds: ["remote.seed_building"] })).toHaveLength(1);
+    // Spec v2 changes the budget only (no recalibration): a replacement reuses the seed.
+    await engine.proposeStudy("thr_study", "proj_1", spec().replace("max_candidates = 20", "max_candidates = 21"));
+    engine.approve(SLUG, "human");
+    expect(store.study(SLUG)!.spec_version).toBe(2);
+    const [a] = ready();
+    provider.kill(a!.remote_id!);
+    expect(await waitFor(() => {
+      void tick().catch(() => undefined);
+      return ready().length === 2 && !ready().some((r) => r.id === a!.id);
+    }, 60_000, 20)).toBe(true);
+    expect(store.events(sid, { kinds: ["remote.seed_building"] })).toHaveLength(1);
+    expect(store.artifacts(sid).filter((x) => x.kind === "seed")).toHaveLength(1);
+    // The key changes with the seed command, its allowlist and the cores, not with the spec version.
+    const s = store.study(SLUG)!;
+    const k = engine.fleet.seedKey(s, 0, s.best_sha!);
+    expect(k).toBe(store.artifacts(sid).find((x) => x.kind === "seed")!.key);
+    expect(k.startsWith(`${s.best_sha}:`)).toBe(true);
+  });
+
+  it("seeds and base bundles no study uses are deleted on archive and at load, and \`bb study bench\` reports their size", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    const seedRow = store.artifacts(sid).find((a) => a.kind === "seed" && a.state === "ok")!;
+    const baseRow = store.artifacts(sid).find((a) => a.kind === "base")!;
+    expect(existsSync(seedRow.path!)).toBe(true);
+    expect(existsSync(baseRow.path!)).toBe(true);
+    // A stale seed from an earlier study, older than the grace period: deleted at load.
+    const stale = join(root, "edit-data", "seeds", `${"a".repeat(64)}.tar.gz`);
+    writeFileSync(stale, "old");
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(stale, old, old);
+    // `bb study bench`: the size line.
+    const usage = await engine.fleet.artifactUsage(store.study(SLUG)!);
+    expect(usage!.seeds.files).toBe(2);
+    expect(usage!.bases.files).toBe(1);
+    expect(usage!.study.files).toBe(2);
+    expect(artifactLine(usage!)).toMatch(/^2 seed\(s\) and 1 base bundle\(s\) on the edit host, .* · this study uses 2 /u);
+    await reload();
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(seedRow.path!)).toBe(true);
+    expect(existsSync(baseRow.path!)).toBe(true);
+    const handle = (store as unknown as { handle: Database.Database }).handle;
+    expect(handle.prepare(`SELECT COUNT(*) AS n FROM events WHERE study_id IS NULL AND kind = 'remote.artifacts_deleted'`).get()).toEqual({ n: 1 });
+    expect((await engine.fleet.artifactUsage(store.study(SLUG)!))!.lastCleanup).toMatchObject({ reason: "plugin loaded", files: 1 });
+    // Archive: nothing uses them any more (no other study): both are deleted.
+    await engine.archiveStudy(SLUG, "human");
+    await engine.fleet.settle();
+    // Files built in the last 10 minutes are kept by the grace period; age them and archive's cleanup runs again at load.
+    for (const p of [seedRow.path!, baseRow.path!]) utimesSync(p, old, old);
+    await reload();
+    expect(existsSync(seedRow.path!)).toBe(false);
+    expect(existsSync(baseRow.path!)).toBe(false);
+    expect(readdirSync(join(root, "edit-data", "seeds")).filter((f) => !f.startsWith("."))).toEqual([]);
   });
 
   it("refuses a seed with credentials before any machine exists, and accepts it with seed_allow", async () => {

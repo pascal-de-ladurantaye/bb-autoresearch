@@ -230,6 +230,17 @@ export const seedPackOutput = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(false), findings: z.array(seedFinding).max(5000), allowed: z.array(seedFinding).max(5000), files: z.number().int(), error: z.string().optional() }).strict(),
 ]);
 export type SeedPack = z.infer<typeof seedPackOutput>;
+const artifactTotals = z.object({ files: z.number().int(), bytes: z.number() }).strict();
+export const artifactsOutput = z
+  .object({
+    files: z.array(z.object({ path: absPath, kind: z.enum(["seed", "base"]), bytes: z.number(), kept: z.boolean(), deleted: z.boolean() }).strict()).max(500),
+    seeds: artifactTotals,
+    bases: artifactTotals,
+    deleted: artifactTotals,
+    scratch: z.number().int(),
+  })
+  .strict();
+export type ArtifactReport = z.infer<typeof artifactsOutput>;
 
 export const hostContract = defineRpcContract({
   ping: {
@@ -364,6 +375,11 @@ export const hostContract = defineRpcContract({
   seedPack: {
     input: z.object({ source: z.string().min(1).max(4096), cwd: absPath, allow: z.array(z.string().min(1).max(400)).max(256) }).strict(),
     output: seedPackOutput,
+  },
+  /** Report the seeds and base bundles under the data dir; with `gc`, delete those not in `keep` (host/artifacts.ts). */
+  artifacts: {
+    input: z.object({ keep: z.array(absPath).max(5000), gc: z.boolean() }).strict(),
+    output: artifactsOutput,
   },
   /** Remove plugin-owned checkouts whose key starts with `keyPrefix`. */
   removeCheckouts: {

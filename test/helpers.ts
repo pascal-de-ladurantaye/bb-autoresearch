@@ -423,6 +423,11 @@ export class FakeHost implements HostRunner {
     this.seedPacks.push(input);
     return { ok: true as const, path: "/fake/seeds/seed.tar.gz", sha256: "1".repeat(64), fileSha256: "1".repeat(64), bytes: 2000, files: 3, kind: "dir" as const, cached: false, allowed: [] };
   }
+  artifactCalls: Array<{ keep: string[]; gc: boolean }> = [];
+  async artifacts(input: { keep: string[]; gc: boolean }) {
+    this.artifactCalls.push(input);
+    return { files: [], seeds: { files: 0, bytes: 0 }, bases: { files: 0, bytes: 0 }, deleted: { files: 0, bytes: 0 }, scratch: 0 };
+  }
   async removeCheckouts(_repo: string, prefix: string) {
     let n = 0;
     for (const k of [...this.checkouts.keys()]) if (k.startsWith(this.coPath(prefix))) {

@@ -111,8 +111,8 @@ export class Engine {
    */
   dispose(): Promise<void> {
     if (this.ctx.disposed) return Promise.resolve();
-    // Remote machines: nothing uses them after this instance. Their rows are ended now (the store
-    // closes below); the provider calls that destroy them finish on their own (bounded wait).
+    // Remote machines: calibrated ones are kept for the next instance to re-adopt; joining ones are
+    // ended now (the store closes below) and destroyed by provider calls that finish on their own.
     const remote = this.fleet.dispose();
     this.ctx.disposed = true;
     this.pipeline.cancelMeasurements(() => true, "plugin disposed");
@@ -1906,7 +1906,7 @@ export class Engine {
   /** Run once on load, after every handler is registered. Safe to repeat. */
   async reconcile(): Promise<{ requeued: number; workers: number; calibrations: number }> {
     const { requeued } = this.pipeline.reconcile();
-    // Remote machines of a previous instance are ended, and whatever a provider still lists is destroyed.
+    // Remote machines the previous instance kept are re-adopted once verified; the rest are ended and destroyed.
     await this.fleet.reconcile().catch((e) => this.ctx.bb.log("warn", `remote bench reconcile: ${errText(e)}`));
     // Worker turns held by a previous instance (quiet bench) are re-decided: no measurement runs now.
     this.ctx.bb.recheckDispatch().catch(() => undefined);
