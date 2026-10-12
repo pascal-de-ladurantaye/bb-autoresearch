@@ -1848,6 +1848,7 @@ The same textkit-style toy as earlier releases (a Python pipeline, `METRIC wall_
 ### Not done, and known issues
 
 - **Seeds are rebuilt per spec version.** Any approved spec change (a budget, say) builds and uploads the seed again for new machines, even when the seed command didn't change.
+- **Seeds and base bundles stay on disk.** Packed seeds and shallow base bundles (content-addressed, possibly shared between studies) stay in the plugin's data directory after the study is archived; a seed command whose output isn't byte-identical (macOS tar) leaves one tarball per build.
 - **Dispatch order.** A candidate goes to the first free bench host in spec order (local before remote), so with one candidate at a time a local host takes everything; there is no preference for the quieter machine.
 - **One threshold for all hosts.** A quiet remote machine measures with the segment's threshold when that is larger than its own (decision above), so it doesn't detect smaller wins than the noisiest host.
 - **Unload destroys machines** even on a reload; a reload costs one join and one calibration per slot.
