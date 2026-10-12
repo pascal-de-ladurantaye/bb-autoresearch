@@ -41,6 +41,16 @@ How each version was built: what it added, the decisions taken on the way, every
 
 `docs/design.md` is the design alone. The implementation notes of every version moved here, newest first (the v0.3.1 notes had landed after "Credits"). `docs/guide.md` is a short user guide, the README points at the three, and `docs/stability.md` says what 1.0 keeps stable and how versions change.
 
+### Live check (BB 0.45, one MacBook, a second BB instance with its own data dir, the example provider, a toy repo under /tmp)
+
+The installed plugin was left alone: a second BB server and host daemon (`bb-app --data-dir …` on other ports) ran this branch and the example provider. Toy: `src/cost.txt` holds a number, a protected measure prints it, a seed of 2 MB, `setup` runs a tool from it; remote only, 2 machines, noisy, `n_min` 3.
+
+- **Calibration and a first run.** Both machines joined and calibrated in seconds; two candidates (one win, one loss) used the budget, and the pause destroyed both machines.
+- **Seed reuse.** Spec v2 raised the budget only (approved without recalibration). On resume, two new machines joined with the seed built for v1: no `remote.seed_building` event.
+- **Reload.** `bb plugin reload bb-autoresearch` with both machines ready: one second later both were `remote.readopted` with the same provider ids, no machine was created or destroyed, and nine seconds later the next candidate was measured on one of them. A second reload re-adopted them again.
+- **Cleanup.** A stale 3 MB seed file aged past the grace period was deleted at that reload (`remote.artifacts_deleted`, `bb study bench` showed "last cleanup (plugin loaded) deleted 1 file(s), 2.9 MiB"). Archiving destroyed both machines and, with the study's own seed and base bundle aged past the grace period, deleted them too: nothing was left under the data dir's `seeds/` and `bundles/`.
+- **Found.** The example provider keeps its registry at one default root under the OS temp dir, shared by every BB instance on the machine; two instances smoke-testing at once overwrite each other's `state.json` (each keeps its own machines in memory, so nothing was destroyed). Start a second instance with its own `TMPDIR` to keep them apart.
+
 ### Known issues
 
 - A kept machine that is re-adopted keeps the calibration it had; it is not recalibrated after the reload (the code and the machine are the same, and drift checks continue).
