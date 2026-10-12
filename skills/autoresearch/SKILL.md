@@ -17,7 +17,7 @@ A **study** improves one metric of a codebase over hours or days. The plugin run
 | `bb study calibrate <slug> [--wait]` | Approve the current (or pending) spec; run gates and A/A noise measurement on every bench host. Mid-run this is an oracle change: new segment |
 | `bb study approve <slug>` | Apply a pending spec whose oracle is unchanged (budget, agents), without recalibration |
 | `bb study start <slug>` | Approve calibration and start running (or resume) |
-| `bb study bench <slug>` | Bench hosts: health checks, git bundle transfers, drift checks, segments |
+| `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration): health checks, git bundle transfers, drift checks, segments |
 | `bb study drift <slug>` | Run a drift check (A/A on best) on every bench host at its next free slot |
 | `bb study pause <slug>` / `resume <slug>` | Pause: no new workers; running workers finish their submission |
 | `bb study concurrency <slug> <n\|auto>` | Lower the worker limit below the spec's `max_workers` (requests above it are clamped), or return to the spec's value |
@@ -77,6 +77,7 @@ Harvest freezes best (in-flight candidates finish; new submissions are refused),
 ## Constraints
 
 - Up to `max_workers` workers at once; W adapts as min(max_workers, ceil(think/eval)+1), and no worker spawns while the bench queue is at least W deep.
-- The server's own machine is the edit host (workers, gates). Bench hosts are `local` (plugin checkouts here) or BB machines with their own clone, fed by git bundles; queued candidates go oldest first to whichever bench host is free, online and healthy.
+- The server's own machine is the edit host (workers, gates). Bench hosts are `local` (plugin checkouts here), BB machines with their own clone, fed by git bundles, or **remote machines** lent by a bench provider plugin (`[[oracle.remote_bench]]`); queued candidates go oldest first to whichever bench host is free, online and healthy.
+- Remote machines join (seed upload, shallow repository, setup), calibrate on arrival (each its own noise floor and win threshold, never below the segment's), and are replaced before their lifetime ends: the replacement calibrates first, then the old machine takes no new work and is destroyed once idle. A machine that leaves (suspended, gone, failed) has its measurement restarted elsewhere. They are destroyed when the study pauses, is archived, or the plugin unloads; `bb study bench` shows each one's state, expiry, rotation and calibration. A seed with anything credential-like is refused before any machine is created (the notice lists what matched). With `gates = true` the gates run on those machines.
 - `noisy` and `expensive` oracles take the bench lock: one measurement at a time per bench host; gates run in parallel outside it, except in single-machine mode (`oracle.single_machine`, on by default when a bench host is the edit machine): then gates take that lock too, in one oldest-first queue with measurements, so a gate never overlaps a measurement, and T_eval is gate + measure time. With `oracle.quiet_bench`, a new worker turn on that machine waits (for at most one measurement) while a measurement runs.
 - The spec lives in plugin storage, not the repo. Proposing a revised spec after start makes it pending until the human approves it (`approve` without an oracle change, `calibrate` with one).

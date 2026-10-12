@@ -33,6 +33,8 @@ Pick the noise class:
 
 Pick the bench hosts (`oracle.bench_hosts`): `["local"]` (default) measures in plugin checkouts on this machine. Any other entry is a BB machine name or host id (see `bb host list`); that machine keeps its own clone and receives commits as git bundles. A dedicated, quiet machine of the production architecture is best. When the bench host is this machine (the laptop case), **single-machine mode** (`oracle.single_machine`, default `"auto"`) turns on: gates take the same bench lock as measurements, one at a time, so tests never run while a candidate is timed. Size the gate for that: its time now counts as bench time per candidate. `quiet_bench = true` also holds new worker turns while a measurement runs. Ask whether there is a **holdout** workload that lives only on the bench host (a different input set): it is run on every win before promotion, and agents only learn pass/fail.
 
+**Remote machines** (`[[oracle.remote_bench]]`): when a bench provider plugin is installed (a BB plugin that lends short-lived machines; see docs/bench-providers.md in the bb-autoresearch repo, and `bb plugin list`), the study can measure on `hosts` machines from it at a time, each its own bench host with its own calibration. Ask how many cores the production machine has and set `cores` to match (code that sizes thread pools from the CPU count otherwise behaves differently there; every command gets `AUTORESEARCH_CORES`). Machines live `lifetime_minutes` (capped by the provider) and are replaced before they end. They start from nothing: a shallow copy of the study base, plus what `seed` ships (a command run here in a checkout of best that prints the path of a directory or tarball: toolchains, dependency caches, vendored packages) and what `setup` does there (run in a checkout of best after the seed is unpacked, with `AUTORESEARCH_SEED` pointing at it). The seed is scanned for credentials before any upload and refused if anything matches: never put tokens, `.netrc`, SSH keys, cloud CLI configs or `.env` files in it; list known test fixtures in `seed_allow`. With `gates = true` the gates run on those machines too (so single-machine mode no longer serializes them here). With remote machines and no `bench_hosts`, only the remote machines measure; add `"local"` to measure here too. The holdout, if any, must reach the machines through the seed.
+
 Run `measure` once yourself to check the METRIC lines parse. If the harness lives in the repo, list its paths under `protected` (its content hash becomes part of the oracle).
 
 ## 3. Write the spec
@@ -74,6 +76,19 @@ max_bundle_mib = 256             # optional: largest git bundle sent to a bench 
 offline_grace_minutes = 10       # optional: notify when a bench host stays offline
 single_machine = "auto"          # optional: auto | on | off. On: gates share the bench lock with measurements (auto: when a bench host is this machine)
 quiet_bench = false              # optional: hold new worker turns on the bench machine while a measurement runs
+
+[[oracle.remote_bench]]          # optional, repeatable: machines from a bench provider plugin
+provider = "bench-provider-local" # the provider plugin's id
+hosts = 2                        # machines measuring at a time (+1 replacement per slot while rotating)
+cores = 8                        # match the production machine
+memory_gb = 16                   # optional
+lifetime_minutes = 120           # capped by the provider; replaced before the end
+rotate_before_minutes = 20       # optional: when the replacement starts (default: a fifth of the lifetime, at least 1.5x a join)
+seed = "scripts/build_seed.sh"   # optional: runs here in a checkout of best; prints a directory or tarball to ship
+seed_allow = ["vendor/cache/**"] # optional: seed paths the credential scan ignores (known test fixtures)
+setup = "scripts/remote_setup.sh" # optional: runs on each machine in a checkout of best, after the seed is unpacked
+env = { LANG = "C.UTF-8" }       # optional: environment for every command there
+gates = false                    # optional: run the gates on these machines too
 
 [oracle.holdout]                 # optional: hidden workload on the bench host
 measure = "/srv/holdout/parse.sh"   # prints METRIC lines like measure
@@ -135,7 +150,7 @@ The plugin commits each worker's worktree for it (`git add`), so a repo without 
 
 Guardrails are judged on a confidence interval, like the primary metric: a guardrail breaks a win only when its whole CI is beyond a limit; when the CI straddles a limit it is flagged inconclusive, not a rejection. Calibration measures each guardrail's noise and warns when it exceeds the limit (such a guardrail can never be shown within it): then loosen the limit, make its measurement steadier, or raise `n_max`.
 
-Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries must name enrolled BB machines (checked when you call `study_propose`). Unknown keys are rejected.
+Rules: globs are repo-relative (`**` spans directories). `bench_hosts` entries must name enrolled BB machines (checked when you call `study_propose`). A `remote_bench` entry is checked against its provider when the human approves the spec (calibration): available, enough machines, cores in range. Unknown keys are rejected.
 
 ## 4. Submit
 

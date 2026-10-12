@@ -120,6 +120,74 @@ The Oracle tab, the calibration report and `bb study show` say whether
 single-machine mode is on and why; the Overview, Bench and Live views show
 "testing c/N" on the bench host while a gate holds it.
 
+### Remote bench hosts
+
+A study can also measure on short-lived machines lent by a **bench provider**:
+another BB plugin that creates machines, moves files and runs processes for
+bb-autoresearch over a small RPC contract ([docs/bench-providers.md](docs/bench-providers.md)).
+Machines that can't be BB machines (cloud machines that only allow outbound
+calls, say) work, because the BB server drives them. Each `[[oracle.remote_bench]]`
+entry keeps `hosts` machines measuring at a time; each machine is its own
+bench host with its own calibration and drift checks.
+
+```toml
+[[oracle.remote_bench]]
+provider = "bench-provider-local"   # the provider plugin's id
+hosts = 2                           # machines at a time
+cores = 8                           # match the production machine
+lifetime_minutes = 120              # capped by the provider
+seed = "scripts/build_seed.sh"      # runs here in a checkout of best; prints a directory or tarball to ship
+setup = "scripts/remote_setup.sh"   # runs on each machine after the seed is unpacked
+gates = true                        # run the gates there too
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `provider` | (required) | The bench provider plugin's id. |
+| `hosts` | 1 | Machines measuring at a time. While one rotates its slot has one more (never more than `hosts` + one replacement per slot). |
+| `cores`, `memory_gb` | (required), none | The machine shape. Match the production machine's core count: code that sizes thread pools from the visible CPU count behaves differently on a machine whose quota is lower (every command gets `AUTORESEARCH_CORES`, and the Bench tab warns when the counts differ). |
+| `lifetime_minutes` | 120 | How long a machine lives, capped by the provider's maximum. |
+| `rotate_before_minutes` | a fifth of the lifetime, at least 1.5× the last join plus one evaluation | When the replacement starts. It joins and calibrates first; the old machine then takes no new work and is destroyed once nothing runs on it. |
+| `seed` | none | A command run on the edit host in a checkout of the segment's baseline that prints the path of a directory or tarball (toolchains, dependency caches, vendored packages). Built once per segment, packed and cached by content hash, uploaded to each machine and unpacked; `AUTORESEARCH_SEED` points at it. |
+| `seed_allow` | `[]` | Seed paths (globs) the credential scan ignores: known test fixtures. |
+| `setup` | none | A command run on each machine in a checkout of best, after the seed is unpacked. |
+| `env` | `{}` | Environment for every command on the machines. |
+| `gates` | `false` | Run the gates on these machines (under their bench lock), so single-machine mode no longer serializes them with measurements here. |
+
+- **Joining.** The seed is built and scanned before any machine exists; then
+  create, wait until ready, upload the seed, a shallow git bundle of the study
+  base (built once), best as a delta bundle, and `setup`. Each candidate then
+  travels as a delta bundle (a few KiB) into a reused checkout.
+- **Calibration per host.** The study's calibration waits for its machines
+  and calibrates them with every other bench host (the segment takes the
+  worst). A machine that joins later (a replacement) runs an A/A on best on
+  its own; it measures with its own noise floor and win threshold, never
+  below the segment's. A machine noisier than `max_mde` is replaced.
+- **Leaving.** A machine whose lifetime ends, or that the provider reports
+  suspended, gone or failed, leaves at once and is never reused (it may come
+  back on different hardware); a measurement on it restarts from scratch on
+  another bench host.
+- **Seed safety.** Before any upload the seed is scanned for credentials
+  (token and key patterns; files such as gem, bundler and npm credentials,
+  `.netrc`, SSH keys, cloud CLI configs, `.env`). Anything that matches (minus
+  `seed_allow`) refuses the seed: no machine is created, and a notice lists
+  what matched (paths and rules, never the values).
+- **Cleanup.** Machines carry the study id and slot as labels. They are
+  destroyed when the study pauses (once idle), is archived, or the plugin
+  unloads; on load, and every 10 minutes, the plugin lists each provider's
+  machines and destroys the ones no study uses.
+- **Where it shows.** The Bench tab's *Remote bench hosts* section (each
+  entry, each machine's state, expiry, rotation and calibration, what it
+  measures, recently gone ones), the bench host lists, the Live bench strip
+  (joining machines included) and its feed, notices for provider failures,
+  and `bb study bench`.
+
+With remote machines and an empty `bench_hosts`, only the remote machines
+measure; `bench_hosts = ["local"]` measures here too. Machines lent this way
+are reached only through the provider: nothing on them holds your
+credentials. [`examples/bench-provider-local/`](examples/bench-provider-local/)
+is a provider for local temp directories, for tests and trying it out.
+
 ### Measurement protocol (noisy oracles)
 
 `[oracle.protocol]` keys that decide how much bench time a candidate takes. They are part of the oracle hash (changing one recalibrates), except where noted:
@@ -167,7 +235,7 @@ next to it. Nothing is pushed before you publish. Every candidate stays under
 | `bb study concurrency <slug> <n\|auto>` | Lower max workers (clamped to the spec) |
 | `bb study ideas add <slug> "<title>" [...]` / `ideas list <slug>` | The idea board |
 | `bb study workers <slug>` | Worker threads |
-| `bb study bench <slug>` | Health checks, bundle transfers, drift checks, segments |
+| `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration), health checks, bundle transfers, drift checks, segments |
 | `bb study drift <slug>` | Request an A/A drift check on every bench host |
 | `bb study harvest <slug> [--wait] [--restart] [--one-per-promotion] [--no-measure-standalone]` | Start or show a dry-run harvest |
 | `bb study harvest <slug> --publish` | Publish the ready harvest as DRAFT PRs on GitHub |
@@ -206,6 +274,8 @@ the threat model in the design).
 | `src/publisher.ts` | `PrPublisher`: dry-run (local branches + files) and GitHub (draft PRs via `gh`) |
 | `src/report.ts` | PR bodies and the Markdown study report |
 | `src/bench.ts`, `src/transfer.ts`, `src/health.ts`, `src/drift.ts`, `src/holdout.ts` | Bench sites, git bundle relay, health checks, drift checks, the private holdout |
+| `src/bench-provider/`, `src/remote/` | The bench provider contract (zod schemas), its client and the remote bench runner; the fleet that joins, calibrates, rotates and cleans up remote machines, and its view |
+| `examples/bench-provider-local/` | An example bench provider plugin (local temp directories and child processes) |
 | `src/spec.ts`, `src/scope.ts`, `src/stats.ts`, `src/noise.ts`, `src/verdict.ts`, `src/calibration.ts` | Spec, scope check, statistics, noise classes, verdicts, calibration |
 | `src/scheduler.ts` | Pure policy: adaptive W, backpressure, provider-limit W, idea choice, budgets, strategist triggers, idle handling |
 | `src/views.ts`, `src/rpc.ts`, `src/cli.ts`, `src/tools.ts`, `src/prompts.ts` | View models, RPC, `bb study`, role-gated agent tools, agent-facing text |
