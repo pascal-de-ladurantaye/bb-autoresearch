@@ -148,7 +148,7 @@ describe("v0.2.4 engine (fake hosts)", () => {
     edit.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     edit.metric.set(tree, value);
     if (runMs !== undefined) edit.runMs.set(tree, runMs);
-    return await engine.submit(thread, `change ${tree} for speed`);
+    return await engine.submit(thread, { title: `change ${tree} for speed` });
   }
 
   const measures = () => benchA.commands.filter((c) => c.startsWith("measure")).length;
@@ -288,7 +288,7 @@ describe("v0.2.4 engine (fake hosts)", () => {
     expect(live.best).toMatchObject({ text: "75.0% lower size (4.0×) across 2 segments", segments: 2, raw: "this segment 500 → 250 ms" });
     expect(studyReport(engine.ctx, s, store.spec(s), null)).toContain("75.0% lower size (4.0×) across 2 segments (compounded from the promoted candidates) · this segment 500 → 250 ms");
     // A harvest after a recalibration: the base's raw value comes from its own base-vs-best measurement, not the segment's baseline.
-    const h = store.insertHarvest({ study_id: id, from_state: "paused", measure_standalone: 1 }, "human");
+    const h = store.insertHarvest({ study_id: id, from_state: "paused" }, "human");
     store.updateHarvest(h.id, { state: "ready", base_sha: s.base_sha, best_sha: s.best_sha, total_effect: 3, total_ci_lo: 2.9, total_ci_hi: 3.1 });
     expect((harvestView(engine, store.study(id)!).harvest as { headline: { raw: string } }).headline.raw).toBe("≈ 1,000 → 250 ms");
   });

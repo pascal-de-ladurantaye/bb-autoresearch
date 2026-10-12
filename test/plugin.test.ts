@@ -34,7 +34,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     host.refs.set("main", base);
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1 })(fake.bb);
     harness = fake.harness;
   });
@@ -55,14 +55,14 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
   it("ordinary threads get only study_propose and the creation skills; side chats get nothing", async () => {
     const plain = await config("thr_plain");
     expect(plain.tools).toEqual([...CREATOR_TOOLS]);
-    expect(plain.skills).toEqual(["autoresearch", "study-create"]);
+    expect(plain.skills).toEqual(["autoresearch", "study-create", "study-harvest"]);
     expect((await config("thr_side", {}, { kind: "fork", pluginId: "side-chat" })).tools).toEqual([]);
   });
 
   it("forged worker metadata selects no tools, and tool calls re-check the threads table", async () => {
     const forged = await config("thr_evil", { study: "toy-size", role: "worker", idea: 1, spawnToken: "nope" });
     expect(forged.tools).toEqual([]);
-    const r = await harness.behavior.callAgentTool("study_submit_candidate", { summary: "sneaky submission here" }, { threadId: "thr_evil" });
+    const r = await harness.behavior.callAgentTool("study_submit_candidate", { title: "sneaky submission here" }, { threadId: "thr_evil" });
     expect(isError(r)).toBe(true);
     expect(text(r)).toContain("only available to autoresearch worker threads");
     const q = await harness.behavior.callAgentTool("study_queue_ideas", { ideas: [{ title: "an idea", rationale: "because reasons", theme: "x" }] }, { threadId: "thr_evil" });
@@ -74,6 +74,8 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     const strategist = await config("thr_study", { study: "toy-size", role: "strategist" });
     expect(strategist.tools).toEqual([...STRATEGIST_TOOLS, ...CREATOR_TOOLS].sort());
     expect(strategist.instructions).toContain("study thread for autoresearch study");
+    // The study thread is where a harvest is usually asked for: it gets the study-harvest skill.
+    expect(strategist.skills).toEqual(["autoresearch", "study-harvest"]);
     // Strategist role comes from the threads table, not metadata.
     expect((await config("thr_other", { study: "toy-size", role: "strategist" })).tools).toEqual([...CREATOR_TOOLS]);
 
@@ -96,7 +98,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     await proposeAndRun();
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    const ticket = await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    const ticket = await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     expect(text(ticket)).toContain("Submitted as c/1");
     await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1"));
     expect(port.sent.find((m) => m.threadId === "thr_w1")?.text).toContain("WIN");

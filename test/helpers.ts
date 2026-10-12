@@ -322,7 +322,7 @@ export class FakeHost implements HostRunner {
   }
   async resolveRef(_repo: string, ref: string) {
     this.maybeFail("resolveRef");
-    return this.refs.get(ref) ?? null;
+    return this.refs.get(ref) ?? (this.commits.has(ref) ? ref : null);
   }
   async updateRef(_repo: string, ref: string, newSha: string, oldSha: string | null) {
     this.maybeFail("updateRef");
@@ -397,8 +397,16 @@ export class FakeHost implements HostRunner {
     this.maybeFail("diffSummary");
     return { files: [{ path: "src/a.ts", added: 3, deleted: 1 }], patch: `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-${from.slice(0, 6)}\n+${to.slice(0, 6)}\n`, truncated: false };
   }
-  async commitLog(): Promise<never> {
-    throw new Error("FakeHost: commitLog is real-git only (see harvest tests)");
+  /** First-parent commits from..to, oldest first (paths: the tree id, as one fake path). */
+  async commitLog(_repo: string, from: string, to: string) {
+    this.maybeFail("commitLog");
+    const out: Array<{ sha: string; parent: string | null; subject: string; message: string; paths: string[] }> = [];
+    for (let cur: string | null = to; cur && cur !== from; cur = this.commits.get(cur)?.parent ?? null) {
+      const c = this.commits.get(cur);
+      if (!c) break;
+      out.push({ sha: cur, parent: c.parent, subject: c.message.split("\n")[0] ?? "", message: c.message, paths: [`tree/${c.tree}`] });
+    }
+    return out.reverse();
   }
   async composeCommits(): Promise<never> {
     throw new Error("FakeHost: composeCommits is real-git only (see harvest tests)");
@@ -601,7 +609,7 @@ export class FakePort implements BbPort {
 export function makeCtx(host: HostRunner = new FakeHost(), clock = new Clock()): { ctx: Ctx; store: Store; port: FakePort; clock: Clock } {
   const store = new Store(makeDb(), clock.now);
   const port = new FakePort(host);
-  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, harvestGroupGraceMs: 0, harvestHealthTries: 2, usagePollMs: 0, tokenPollMs: 0, liveDwellMs: 0 } };
+  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, adhocHealthTries: 2, usagePollMs: 0, tokenPollMs: 0, liveDwellMs: 0 } };
   return { ctx, store, port, clock };
 }
 

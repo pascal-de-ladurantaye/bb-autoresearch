@@ -40,12 +40,10 @@ export interface EngineConfig {
   bundleChunkBytes?: number;
   /** How long a bench host's connection status is trusted before asking BB again. */
   hostStatusTtlMs: number;
-  /** Harvest polling period (waiting for the bench to drain, for the strategist's grouping). */
+  /** Harvest polling period (waiting for the bench to drain before best freezes). */
   harvestPollMs: number;
-  /** After the grouping round's turn ends without a valid proposal, wait this long before the fallback grouping. */
-  harvestGroupGraceMs: number;
-  /** Health deferrals a harvest measurement waits through before failing. */
-  harvestHealthTries: number;
+  /** Health deferrals a requested measurement (`bb study measure`) waits through before failing. */
+  adhocHealthTries: number;
   /** How often provider usage windows are read (bb.sdk.system.usageLimits). */
   usagePollMs: number;
   /** How often a live thread's token usage is read. */
@@ -106,8 +104,7 @@ export const DEFAULT_CONFIG: EngineConfig = {
   finishingTimeoutMs: 3 * 60_000,
   hostStatusTtlMs: 15_000,
   harvestPollMs: 2_000,
-  harvestGroupGraceMs: 60_000,
-  harvestHealthTries: 30,
+  adhocHealthTries: 30,
   usagePollMs: 120_000,
   tokenPollMs: 60_000,
 };

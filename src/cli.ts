@@ -13,6 +13,7 @@ import { errText, evalTimes } from "./pipeline.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import { ciText, magnitudePct, reasonText, sharePct, signedPct, verdictCause } from "./present.ts";
 import {
+  adhocRunView,
   benchHostsView,
   benchView,
   harvestView,
@@ -29,6 +30,7 @@ import {
 } from "./views.ts";
 import type { StudyRow } from "./db/store.ts";
 import { studyReport } from "./report.ts";
+import { studyEvidence } from "./evidence.ts";
 
 /** Text output bound (characters). */
 const MAX = 60_000;
@@ -72,6 +74,67 @@ export function jsonOut(value: Record<string, unknown>): CliOut {
 
 function respond(json: boolean | undefined, text: () => string, data: () => Record<string, unknown>): CliOut {
   return json ? jsonOut(data()) : out(text());
+}
+
+/**
+ * Measurement and gate requests: any thread but a study's own worker (a
+ * worker measuring its own candidates would spend the bench budget outside
+ * the pipeline). The study thread and ordinary threads may: harvesting is
+ * their job.
+ */
+function guardAgent(engine: Engine, ctx: PluginCliContext): string {
+  if (ctx.threadId) {
+    const row = engine.ctx.store.threadById(ctx.threadId);
+    if (row?.role === "worker") throw new PluginCliError("study workers can't request measurements or gates; the plugin measures your submissions", { code: "forbidden", hint: "Submit with study_submit_candidate." });
+    return ctx.threadId;
+  }
+  return "human";
+}
+
+/** A measurement or gate run: its line, or the whole result in JSON. */
+function runOut(engine: Engine, slug: string, id: number, json: boolean | undefined): CliOut {
+  const row = engine.ctx.store.adhocRun(id)!;
+  const v = adhocRunView(row);
+  return respond(
+    json,
+    () => {
+      const lines = [v.line];
+      const r = v.result;
+      if (r?.kind === "measure") {
+        lines.push(...kv([
+          ["A", `${r.a.ref} ${r.a.sha.slice(0, 10)}`],
+          ["B", `${r.b.ref} ${r.b.sha.slice(0, 10)}`],
+          ["Host", r.host.name],
+          ["Reasons", r.reasons.map((x) => reasonText(x)).join("; ")],
+          ...Object.entries(r.guardrails).map(([name, g]): [string, string] => [`Guardrail ${name}`, `${g.state}: ${clip(g.text, 200)}`]),
+          ["Bench time", formatDuration(row.bench_seconds)],
+        ]));
+      } else if (r?.kind === "gate") {
+        for (const c of r.commands) lines.push(`  ${c.ok ? (c.flaky ? "flaky" : "pass") : "FAIL"} \`${clip(c.command, 120)}\` (${formatDuration(c.seconds)})${c.ok ? "" : `\n${c.tail.split("\n").slice(-15).map((l) => `    ${l}`).join("\n")}`}`);
+      }
+      if (row.state === "queued" || row.state === "running") lines.push(`Still ${row.state}. \`bb study results ${slug} r${row.seq} --wait\` waits for it.`);
+      return lines.join("\n");
+    },
+    () => ({ run: v }),
+  );
+}
+
+function evidenceText(doc: Awaited<ReturnType<typeof studyEvidence>>): string {
+  const frozen = doc.git.frozen;
+  const lines = [
+    `Evidence of ${doc.study.slug} (${doc.study.state}) · format ${doc.format} v${doc.version} · use --json for the full document`,
+    ...kv([
+      ["Base → best", `${doc.git.base?.slice(0, 10) ?? "?"} → ${doc.git.best?.slice(0, 10) ?? "?"} (${doc.git.bestBranch})`],
+      ["Frozen", frozen ? `h${frozen.harvest} ${frozen.best?.slice(0, 10)} (${frozen.ref})` : "no harvest frozen"],
+      ["Metric", `${doc.study.metric.name}, ${doc.study.metric.direction} is better · ${doc.study.noise} oracle`],
+      ["Candidates", `${doc.candidates.length} · findings ${doc.findings.length} · runs ${doc.runs.length}`],
+    ]),
+    "",
+    `Promotions on best (${doc.promotions.length}, oldest first)`,
+    ...(doc.promotions.length ? doc.promotions.map((p) => `  ${p.sha.slice(0, 10)} ${p.n !== null ? `c/${p.n} ` : ""}${clip(p.title, 90)} (${p.paths.length} file(s))`) : ["  none"]),
+  ];
+  if (doc.promotionsError) lines.push(`  (could not read best's log: ${clip(doc.promotionsError, 200)})`);
+  return lines.join("\n");
 }
 
 function guardHuman(engine: Engine, ctx: PluginCliContext, allowStrategist = false): string {
@@ -203,7 +266,7 @@ export function studyCli(engine: Engine): PluginCliRegistration {
         run: (input) => wrap(engine, undefined, () => listStudies(engine, input.options.json)),
       }),
       needs: cliCommand({
-        summary: "What needs you (approvals, system pauses, failures, a ready harvest), with the command for each",
+        summary: "What needs you (approvals, system pauses, failures, a frozen harvest), with the command for each",
         positionals: [{ name: "slug", description: "Only this study (default: every active study)" }] as const,
         options: { ...jsonOpt },
         run: (input) =>
@@ -429,39 +492,143 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       harvest: cliCommand({
-        summary: "Harvest base→best into changesets with measured contributions and draft PRs (dry run; --publish opens DRAFT PRs on GitHub)",
+        summary: "Freeze best for harvest (no new workers, submissions closed), or show the current harvest; an agent then harvests it with the study-harvest skill",
         positionals: slugArg,
         options: {
           ...jsonOpt,
-          publish: { type: "boolean", description: "Publish the READY harvest: push its branches and open DRAFT PRs with gh (refuses without a GitHub remote)" },
-          restart: { type: "boolean", description: "Start a fresh harvest when the last one is ready, failed, or cancelled" },
-          "one-per-promotion": { type: "boolean", description: "Skip the strategist's grouping: one changeset per promotion (deterministic)" },
-          "no-measure-standalone": { type: "boolean", description: "Only gate each changeset on its PR base; skip measuring its standalone effect (saves bench time)" },
-          wait: { type: "boolean", description: "Wait for the harvest to finish (up to --timeout)" },
+          publish: { type: "boolean", description: "Removed in v1: an agent publishes with the repository's own tools (study-harvest skill)" },
+          harvest: { type: "integer", min: 1, max: 1_000_000, description: "Show harvest h<N> instead of the latest (read only)" },
+          wait: { type: "boolean", description: "Wait for best to freeze (in-flight candidates finish first; up to --timeout)" },
           timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait with --wait (default 25m, max 30m)" },
         },
         run: (input, ctx) =>
           wrap(engine, input.positionals.slug, async () => {
             const slug = input.positionals.slug;
-            const actor = guardHuman(engine, ctx);
-            const view = () => harvestView(engine, engine.study(slug));
             if (input.options.publish) {
-              await engine.auditControl(slug, "publish", caller(ctx), "harvest publish requested (GitHub draft PRs)");
-              const message = await engine.publishHarvest(slug, actor, true);
-              return respond(input.options.json, () => message, () => ({ ok: true, message, ...view() }));
+              throw new PluginCliError("the plugin no longer drafts or publishes PRs (v1): an agent does, with the repository's own tools", {
+                code: "removed",
+                hint: `Ask an agent to harvest ${slug} with the study-harvest skill and to publish when you say so. It starts from \`bb study evidence ${slug} --json\`.`,
+              });
             }
-            const before = store.latestHarvest(engine.study(slug).id);
+            const s0 = engine.study(slug);
+            const seq = input.options.harvest;
+            if (seq !== undefined) {
+              const h = store.harvests(s0.id).find((x) => x.seq === seq);
+              if (!h) throw new PluginCliError(`${slug} has no harvest h${seq}`, { code: "not_found", hint: `\`bb study harvest ${slug}\` shows the latest.` });
+              return respond(input.options.json, () => harvestText(engine, slug, h.id), () => harvestView(engine, s0, h.id));
+            }
+            const view = () => harvestView(engine, engine.study(slug));
+            const before = store.latestHarvest(s0.id);
             // An archived study can't harvest again, but its last harvest stays readable.
-            if (engine.study(slug).state === "archived" && before && !input.options.restart) return respond(input.options.json, () => harvestText(engine, slug), () => view());
-            const r = engine.startHarvest(slug, actor, { restart: Boolean(input.options.restart), measureStandalone: !input.options["no-measure-standalone"], onePerPromotion: Boolean(input.options["one-per-promotion"]) });
-            const started = r.harvest.id !== before?.id;
-            if (started) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.seq} started (dry run)`, { harvest: r.harvest.id });
+            if (s0.state === "archived") return respond(input.options.json, () => harvestText(engine, slug), () => view());
+            // Showing a harvest that is waiting or frozen is a read; starting one is a human control.
+            const showing = s0.state === "harvesting" && before && ["waiting", "frozen"].includes(before.state);
+            const actor = showing ? (ctx.threadId ?? "human") : guardHuman(engine, ctx);
+            const r = engine.startHarvest(slug, actor);
+            if (r.started) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.seq} started: best freezes for an agent to harvest`, { harvest: r.harvest.id });
             if (input.options.wait) await engine.waitForHarvest(slug, input.options.timeout ?? 25 * 60_000);
+            const started = r.started && r.harvest.id !== before?.id;
             return respond(
               input.options.json,
               () => (started && !input.options.wait ? r.text : `${started ? `${r.text}\n\n` : ""}${harvestText(engine, slug)}`),
               () => ({ ...(started ? { message: r.text } : {}), ...view() }),
             );
+          }),
+      }),
+      measure: cliCommand({
+        summary: "Measure B against A (any two commits) with the study's protocol, guardrails and bench hosts; counts as bench time",
+        positionals: [
+          { name: "slug", description: "Study slug", required: true },
+          { name: "a", description: "Reference side A: a sha, branch, tag, best, base, c/<n>, or rev syntax (best~1)", required: true },
+          { name: "b", description: "Side B, measured against A (better is positive)", required: true },
+        ] as const,
+        options: {
+          ...jsonOpt,
+          pairs: { type: "integer", min: 2, max: 200, description: "Pairs to measure (noisy oracles; default: the study's n_max)" },
+          host: { type: "string", description: "Bench host name or id (default: the first online, healthy, idle one)" },
+          detach: { type: "boolean", description: "Return at once with the run id; read it later with `bb study results <slug> <id>`" },
+          timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait (default 25m, max 30m); the run continues after it" },
+        },
+        run: (input, ctx) =>
+          wrap(engine, input.positionals.slug, async () => {
+            const { slug, a, b } = input.positionals;
+            const actor = guardAgent(engine, ctx);
+            const row = await engine.requestMeasure(slug, { refA: a, refB: b, pairs: input.options.pairs ?? null, host: input.options.host ?? null }, actor);
+            if (!input.options.detach) await engine.primitives.wait(row.id, input.options.timeout ?? 25 * 60_000);
+            return runOut(engine, slug, row.id, input.options.json);
+          }),
+      }),
+      gate: cliCommand({
+        summary: "Run the study's gates on any commit (edit host; single-machine mode takes the bench lock)",
+        positionals: [
+          { name: "slug", description: "Study slug", required: true },
+          { name: "ref", description: "A sha, branch, tag, best, base, c/<n>, or rev syntax", required: true },
+        ] as const,
+        options: {
+          ...jsonOpt,
+          detach: { type: "boolean", description: "Return at once with the run id; read it later with `bb study results <slug> <id>`" },
+          timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait (default 25m, max 30m); the run continues after it" },
+        },
+        run: (input, ctx) =>
+          wrap(engine, input.positionals.slug, async () => {
+            const { slug, ref } = input.positionals;
+            const actor = guardAgent(engine, ctx);
+            const row = await engine.requestGate(slug, { ref }, actor);
+            if (!input.options.detach) await engine.primitives.wait(row.id, input.options.timeout ?? 25 * 60_000);
+            return runOut(engine, slug, row.id, input.options.json);
+          }),
+      }),
+      results: cliCommand({
+        summary: "Measurements and gates asked for with `bb study measure|gate` (newest first), or one of them in full",
+        positionals: [
+          { name: "slug", description: "Study slug", required: true },
+          { name: "id", description: "A run id (r3 or 3); omit for the list" },
+        ] as const,
+        options: {
+          ...jsonOpt,
+          wait: { type: "boolean", description: "With an id: wait for it to finish (up to --timeout)" },
+          timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait with --wait (default 25m, max 30m)" },
+        },
+        run: (input) =>
+          wrap(engine, input.positionals.slug, async () => {
+            const slug = input.positionals.slug;
+            const s = engine.study(slug);
+            if (input.positionals.id !== undefined) {
+              const seq = Number(String(input.positionals.id).replace(/^r/u, ""));
+              if (!Number.isInteger(seq) || seq < 1) throw new PluginCliError(`${JSON.stringify(input.positionals.id)} is not a run id`, { code: "invalid_value", hint: `Run ids look like r3; \`bb study results ${slug}\` lists them.` });
+              const row = engine.adhocRun(slug, seq);
+              if (input.options.wait) await engine.primitives.wait(row.id, input.options.timeout ?? 25 * 60_000);
+              return runOut(engine, slug, row.id, input.options.json);
+            }
+            const runs = store.adhocRuns(s.id, { limit: 50 }).map(adhocRunView);
+            return respond(
+              input.options.json,
+              () => (runs.length ? [`Measurements and gates of ${slug} (newest first)`, ...runs.map((r) => `  ${r.line}`)].join("\n") : `No measurements or gates asked for yet. \`bb study measure ${slug} <A> <B>\` and \`bb study gate ${slug} <ref>\` run them.`),
+              () => ({ runs }),
+            );
+          }),
+      }),
+      evidence: cliCommand({
+        summary: "Everything an agent needs to harvest: candidates, commit messages, diffs, verdicts, guardrails, findings, segments, base/best, runs (stable JSON with --json)",
+        positionals: slugArg,
+        options: {
+          ...jsonOpt,
+          samples: { type: "boolean", description: "Include each candidate's raw samples (large)" },
+          candidates: { type: "string", description: "Only these candidates, e.g. 3,7,12 (default: all)" },
+        },
+        run: (input) =>
+          wrap(engine, input.positionals.slug, async () => {
+            const slug = input.positionals.slug;
+            const s = engine.study(slug);
+            const only = input.options.candidates ? input.options.candidates.split(/[,\s]+/u).filter(Boolean).map((x) => Number(x.replace(/^c\//u, ""))) : null;
+            if (only?.some((n) => !Number.isInteger(n) || n < 1)) throw new PluginCliError("--candidates takes candidate numbers, e.g. 3,7,12", { code: "invalid_value" });
+            const doc = await studyEvidence(engine.ctx, s, store.spec(s), { samples: Boolean(input.options.samples), candidates: only });
+            if (!input.options.json) return out(evidenceText(doc));
+            const text = JSON.stringify(doc);
+            if (text.length <= JSON_MAX) return { exitCode: 0, stdout: `${text}\n` };
+            // Too large for one CLI response: the whole document goes to a file on this machine, never trimmed.
+            const dir = await engine.ctx.bb.hostRunner(s.host_id!).writeExport(`${slug}-evidence`, [{ path: "evidence.json", content: text }]);
+            return { exitCode: 0, stdout: `${JSON.stringify({ format: doc.format, version: doc.version, file: `${dir.replace(/\/$/u, "")}/evidence.json`, bytes: text.length })}\n` };
           }),
       }),
       report: cliCommand({
@@ -691,14 +858,30 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
   return lines.join("\n");
 }
 
-export function harvestText(engine: Engine, slug: string): string {
+export function harvestText(engine: Engine, slug: string, harvestId?: number): string {
   const s = engine.study(slug);
-  const v = harvestView(engine, s);
+  const v = harvestView(engine, s, harvestId);
   const h = v.harvest;
-  if (!h) return `${slug}: no harvest yet. ${v.canStart ? `\`${v.startCommand}\` starts one (dry run).` : (v.cannotStartReason ?? "")}`;
+  if (!h) return `${slug}: no harvest yet. ${v.canStart ? `\`${v.startCommand}\` freezes best for an agent to harvest.` : (v.cannotStartReason ?? "")}`;
+  const runsLines = v.runs.length ? section("Measurements and gates asked for (newest first)", v.runs.slice(0, 10).map((r) => `  ${r.line}`)) : [];
+  if (!h.legacy) {
+    const lines = [
+      `Harvest h${h.seq} of ${s.slug} · ${h.state}${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
+      ...kv([
+        ["Error", h.error ? clip(h.error, 300) : null],
+        ["Base → best", h.bestSha ? `${h.baseSha?.slice(0, 10) ?? "?"} → ${h.bestSha.slice(0, 10)}${h.frozenRef ? ` (pinned as ${h.frozenRef})` : ""}` : "best not frozen yet"],
+      ]),
+    ];
+    if (h.promotions.length) lines.push(...section(`Promotions (${h.promotions.length}, oldest first)`, h.promotions.map((p) => `  ${p.sha.slice(0, 10)} ${p.n !== null ? `c/${p.n} ` : ""}${clip(p.title, 80)}${p.effectText ? ` · ${p.effectText} when promoted` : ""} · ${p.files} file(s)`)));
+    lines.push(...runsLines);
+    if (h.state === "frozen") {
+      lines.push("", "Next: ask an agent to harvest it with the study-harvest skill, for example:", `  "${v.guide.prompt}"`, "It uses:", ...v.guide.commands.map((c) => `  ${c.command}  (${c.what})`), `Or \`bb study resume ${slug}\` (keep exploring) · \`bb study archive ${slug}\` (done).`);
+    }
+    return lines.join("\n");
+  }
   const acc = h.accounting;
   const lines = [
-    `Harvest h${h.seq} of ${s.slug} · ${h.state}${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
+    `Harvest h${h.seq} of ${s.slug} · ${h.state} (before v1)${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
     ...kv([
       ["Error", h.error ? clip(h.error, 300) : null],
       ["Base → best", `${h.baseSha?.slice(0, 10) ?? "?"} → ${h.bestSha?.slice(0, 10) ?? "?"} · grouping ${h.groupingSource ?? "pending"}${h.groupingNotes ? ` (${clip(h.groupingNotes, 200)})` : ""} · bench ${formatDuration(h.benchSeconds)}`],
@@ -733,11 +916,12 @@ export function harvestText(engine: Engine, slug: string): string {
     lines.push(...section("Stacks (PR order)", h.stacks.map((st) => `  stack ${st.stack}: ${st.order}${st.contribution ? ` · together ${st.contribution.text}` : ` · ${st.status}`}`)));
   }
   const next = [
+    "Drafted by the plugin before v1; read only.",
     h.exportDir ? `Dry-run export (report.md, prs/*.md, manifest.json): ${h.exportDir}` : "",
     h.published ? `Published: ${h.published.map((p) => `#${p.k} ${p.url ?? p.status}`).join(" · ")}` : "",
-    h.state === "ready" ? `Next: \`bb study harvest ${slug} --publish\` (DRAFT PRs on GitHub) · \`bb study resume ${slug}\` (keep exploring) · \`bb study archive ${slug}\` (done) · \`bb study report ${slug}\`` : "",
-    h.state === "failed" ? `Next: \`bb study harvest ${slug} --restart\`` : "",
+    s.state === "harvesting" && h.publishState !== "published" ? `Next: ask an agent to finish it with the study-harvest skill (it can reuse these branches and drafts) · \`bb study resume ${slug}\` · \`bb study archive ${slug}\`` : "",
   ].filter(Boolean);
-  if (next.length) lines.push("", ...next);
+  lines.push(...runsLines);
+  lines.push("", ...next);
   return lines.join("\n");
 }

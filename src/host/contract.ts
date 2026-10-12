@@ -78,7 +78,8 @@ export type ExecResult = z.infer<typeof execOutput>;
 export const snapshotInput = z
   .object({
     worktreePath: absPath,
-    message: z.string().min(1).max(4096),
+    /** The worker's commit message plus the plugin's trailers (title ≤ 72 + body ≤ 4000 characters). */
+    message: z.string().min(1).max(8192),
     candidateRef: ref,
     baseSha: sha,
     /**

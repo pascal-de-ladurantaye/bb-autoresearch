@@ -6,18 +6,16 @@ import { resolveBenchHosts } from "./bench.ts";
 import { recordCalibration, runAutoRecalibration, runCalibration, type AutoRecalibration, type CalibrationReport } from "./calibration.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
-import { applyProposal, harvestBranch, harvestExportKey, prOrder, type Promotion } from "./harvest-math.ts";
 import { RemoteFleet } from "./remote/fleet.ts";
-import { Harvester, harvestReadyText } from "./harvest.ts";
+import { Harvester, harvestFrozenText } from "./harvest.ts";
+import { Primitives } from "./primitives.ts";
 import { checkHealth } from "./health.ts";
 import type { DispatchDecision, DispatchQuery } from "./ports.ts";
 import { LiveRecorder } from "./live.ts";
 import { classifyItem, type Activity } from "./live-model.ts";
-import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
-import { studyReport } from "./report.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
 import { ciText, compound, improvementText, type MetricInfo } from "./present.ts";
-import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief, type CodeInfo } from "./prompts.ts";
+import { clip, formatDuration, nudgeMessage, safeJson, strategistDigest, workerBrief, type CodeInfo } from "./prompts.ts";
 import { actionLabel, itemLabel } from "./action.ts";
 import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
 import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
@@ -60,6 +58,8 @@ export interface UsageReading {
 export class Engine {
   readonly pipeline: Pipeline;
   readonly harvester: Harvester;
+  /** `bb study measure` and `bb study gate`: measurements and gates agents ask for. */
+  readonly primitives: Primitives;
   private currentTick: Promise<void> | null = null;
   private tickAgain = false;
   private calibrations = new Map<string, Promise<void>>();
@@ -82,7 +82,10 @@ export class Engine {
     });
     this.harvester = new Harvester(ctx, this.pipeline, {
       notify: (study, kind, text, opts) => this.notify(study.id, kind, text, opts),
-      sendGroupingRound: (study, harvest, promotions) => this.sendGroupingRound(study, harvest, promotions),
+      publish: (studyId) => this.publish(studyId),
+    });
+    this.primitives = new Primitives(ctx, this.pipeline, {
+      notify: (study, kind, text) => this.notify(study.id, kind, text),
       publish: (studyId) => this.publish(studyId),
     });
     this.live = new LiveRecorder(ctx);
@@ -117,6 +120,7 @@ export class Engine {
     this.ctx.disposed = true;
     this.pipeline.cancelMeasurements(() => true, "plugin disposed");
     this.harvester.abortAll();
+    this.primitives.abortAll();
     this.live.dispose();
     this.ctx.store.close();
     return remote;
@@ -470,14 +474,14 @@ export class Engine {
   resume(slug: string, actor: string): string {
     const study = this.study(slug);
     if (study.state === "harvesting") {
-      // "Keep exploring": back to Running. A harvest still in progress is cancelled; a ready one stays for review.
+      // "Keep exploring": back to Running. A harvest still waiting to freeze is cancelled; a frozen one keeps its ref.
       const h = this.store.latestHarvest(study.id);
-      const cancelled = h && !["ready", "failed", "cancelled"].includes(h.state);
+      const cancelled = h?.state === "waiting";
       if (h && cancelled) this.harvester.cancel(h.id);
       this.pipeline.resetAttempts(study.id);
       this.store.setStudyState(study.id, "running", actor, { from_harvest: h?.id ?? null });
       this.kick();
-      return `${slug} is running again (keep exploring)${cancelled ? `; harvest h${h!.seq} was cancelled` : h?.state === "ready" ? `; harvest h${h.seq} stays available for review (a new \`bb study harvest\` starts a fresh one)` : ""}.`;
+      return `${slug} is running again (keep exploring)${cancelled ? `; harvest h${h!.seq} was cancelled before best froze` : h?.best_sha ? `; harvest h${h.seq}'s frozen best stays pinned at ${h.best_sha.slice(0, 10)} (refs/studies/${slug}/harvest/h${h.seq})` : ""}.`;
     }
     if (study.state !== "paused") throw new EngineError(`${slug} is ${study.state}, not paused`);
     this.pipeline.resetAttempts(study.id);
@@ -491,26 +495,23 @@ export class Engine {
   // ------------------------------------------------------------ harvest
 
   /**
-   * Start a harvest (Running/Paused → Harvesting), or report the current
-   * one. Dry-run: local branches and files only; publishing is a separate,
-   * explicit step (`publishHarvest`).
+   * Freeze best for harvest (Running/Paused → Harvesting), or report the
+   * current harvest. In-flight candidates finish first; then base, best and
+   * the promotion list are recorded and best is pinned. Grouping, measuring,
+   * branches, PR descriptions and publishing are an agent's job (the
+   * study-harvest skill), with `bb study evidence`, `measure` and `gate`.
    */
-  startHarvest(slug: string, actor: string, opts: { restart?: boolean; measureStandalone?: boolean; onePerPromotion?: boolean } = {}): { harvest: HarvestRow; text: string } {
+  startHarvest(slug: string, actor: string): { harvest: HarvestRow; started: boolean; text: string } {
     const study = this.study(slug);
     const latest = this.store.latestHarvest(study.id);
-    if (study.state === "harvesting" && latest) {
-      const active = !["ready", "failed", "cancelled"].includes(latest.state);
-      if (!opts.restart || active) {
-        if (active && !this.harvester.running(latest.id)) this.harvester.start(latest.id);
-        return { harvest: latest, text: `${slug} is harvesting: harvest h${latest.seq} is ${latest.state}${latest.phase_detail ? ` (${latest.phase_detail})` : ""}.${active && opts.restart ? " It is still running; wait for it or `bb study resume` to cancel it." : ""}` };
-      }
-    } else if (!["running", "paused"].includes(study.state)) {
-      throw new EngineError(`${slug} is ${study.state}; harvest starts from Running or Paused`);
+    if (study.state === "harvesting" && latest && ["waiting", "frozen"].includes(latest.state)) {
+      if (latest.state === "waiting" && !this.harvester.running(latest.id)) this.harvester.start(latest.id);
+      return { harvest: latest, started: false, text: latest.state === "frozen" ? harvestFrozenText(study, latest) : `${slug} is harvesting: harvest h${latest.seq} is waiting${latest.phase_detail ? ` (${latest.phase_detail})` : ""}.` };
     }
+    if (!["running", "paused", "harvesting"].includes(study.state)) throw new EngineError(`${slug} is ${study.state}; harvest starts from Running or Paused`);
     if (!study.best_sha || !study.base_sha) throw new EngineError(`${slug} has no best commit yet`);
-    const spec = this.store.spec(study);
     const from = study.state === "harvesting" ? (latest?.from_state ?? "paused") : (study.state as "running" | "paused");
-    const h = this.store.insertHarvest({ study_id: study.id, from_state: from, measure_standalone: opts.measureStandalone === false ? 0 : 1, grouping_source: opts.onePerPromotion ? "fallback" : null }, actor);
+    const h = this.store.insertHarvest({ study_id: study.id, from_state: from }, actor);
     if (study.state !== "harvesting") this.store.setStudyState(study.id, "harvesting", actor, { harvest: h.id });
     this.harvester.start(h.id);
     this.publish(study.id);
@@ -518,11 +519,11 @@ export class Engine {
     const live = this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length;
     return {
       harvest: h,
+      started: true,
       text: [
-        `${slug} is harvesting (h${h.seq}, dry run). No new workers start and submissions are closed${live ? `; ${live} live worker(s) finish their current idea` : ""}.`,
-        inFlight ? `First, ${inFlight} in-flight candidate(s) finish so best is final.` : "",
-        `Then: ${opts.onePerPromotion ? "one changeset per promotion (no strategist round)" : "the strategist groups the promotions into changesets (or one per promotion)"}, each changeset is ablated from best and measured (${spec.oracle.noise} protocol), checked alone on its PR base${spec.harvest.measure_standalone && opts.measureStandalone !== false ? " and measured" : ""}, and drafted as a local branch with a PR body. Nothing is pushed.`,
-        `Follow it on the Harvest tab or with \`bb study harvest ${slug}\`.`,
+        `${slug} is harvesting (h${h.seq}). No new workers start and submissions are closed${live ? `; ${live} live worker(s) finish their current idea` : ""}.`,
+        inFlight ? `First, ${inFlight} in-flight candidate(s) finish so best is final; then best freezes.` : "Best freezes now.",
+        `Then ask an agent to harvest it with the study-harvest skill: it reads \`bb study evidence ${slug} --json\`, measures with \`bb study measure\`, gates with \`bb study gate\`, and builds branches and PR descriptions with the repository's own tools. Nothing is pushed unless you ask it to publish.`,
       ]
         .filter(Boolean)
         .join("\n"),
@@ -534,81 +535,42 @@ export class Engine {
     if (h) await this.harvester.wait(h.id, timeoutMs);
   }
 
-  /**
-   * Exactly what publishing the ready harvest would do: which branches go to
-   * which remote, which draft PRs open on which base, which changesets are
-   * skipped, and whether the preflight (GitHub remote, gh) passes. Reads
-   * only; the confirmation dialog and `--publish` show it.
-   */
-  async publishPlan(slug: string, harvestId?: number) {
+  // ------------------------------------------------------------ primitives
+
+  private liveWorkers(study: StudyRow): number {
+    return this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] }).length;
+  }
+
+  /** `bb study measure`: B against A with the study's protocol on one of its bench hosts. */
+  async requestMeasure(slug: string, input: { refA: string; refB: string; pairs?: number | null; host?: string | null }, actor: string) {
     const study = this.study(slug);
-    const h = this.store.latestHarvest(study.id);
-    if (!h || (harvestId !== undefined && h.id !== harvestId)) throw new EngineError(`${slug} has no such harvest${harvestId !== undefined ? ` (id ${harvestId})` : ""}; reload the Harvest tab`);
-    const spec = this.store.spec(study);
-    const runner = this.ctx.bb.hostRunner(study.host_id!);
-    const publisher = new GithubPublisher(runner, study.repo_path!, spec.harvest.remote, true);
-    let remoteUrl: string | null = null;
-    let problem: string | null = null;
-    if (h.state !== "ready") problem = `harvest h${h.seq} is ${h.state}, not ready`;
-    else if (h.publish_state === "published") problem = `harvest h${h.seq} was already published`;
-    else {
-      try {
-        remoteUrl = (await publisher.preflight()).remoteUrl;
-      } catch (e) {
-        problem = e instanceof PublishRefused ? e.message : errText(e);
-      }
+    try {
+      const row = await this.primitives.requestMeasure(study, input, actor, this.liveWorkers(study));
+      this.publish(study.id);
+      return row;
+    } catch (e) {
+      throw e instanceof EngineError ? e : new EngineError(errText(e));
     }
-    const drafts = this.publishDrafts(study, spec, h);
-    return {
-      harvestId: h.id,
-      /** Shown as h<seq>. */
-      seq: h.seq,
-      remote: spec.harvest.remote,
-      remoteUrl,
-      ok: problem === null,
-      problem,
-      prs: drafts.map((d) => ({ k: d.draft.k, title: d.draft.title, branch: d.draft.branch, base: d.draft.baseBranch, stacked: d.draft.stacked, push: d.skip === null, skip: d.skip })),
-    };
   }
 
-  /**
-   * The PR drafts of a harvest in publish order (PR order: each stack bottom
-   * first), with the reason a changeset is skipped (no branch, dropped by the
-   * human, or stacked on a skipped one). A changeset folded into another's PR
-   * is listed with `folded` (it ships inside that PR, never on its own).
-   */
-  private publishDrafts(study: StudyRow, spec: StudySpec, h: HarvestRow): Array<{ draft: PrDraft; skip: string | null; folded: boolean }> {
-    const changesets = this.store.changesets(h.id);
-    const skipped = new Set<string>();
-    return prOrder(changesets).map((c) => {
-      const base = c.pr_base && c.pr_base !== "base" ? changesets.find((x) => `#${x.k}` === c.pr_base) : undefined;
-      const host = c.folded_into !== null ? changesets.find((x) => x.id === c.folded_into) : undefined;
-      const draft: PrDraft = { changesetId: c.id, k: c.k, branch: c.branch ?? harvestBranch(study, h, c), baseBranch: base ? (base.branch ?? harvestBranch(study, h, base)) : spec.study.base, title: c.pr_title ?? c.title, body: c.pr_body ?? "", sha: c.branch ? c.standalone_sha : null, stacked: Boolean(base) };
-      const skip = host ? `ships inside #${host.k}'s PR` : !draft.sha ? "did not apply on its PR base: no branch" : c.human_choice === "drop" ? "dropped by you" : draft.stacked && skipped.has(draft.baseBranch) ? `its base ${draft.baseBranch} is not published` : null;
-      if (skip && !host) skipped.add(draft.branch);
-      return { draft, skip, folded: Boolean(host) };
-    });
-  }
-
-  /** Human control: keep or drop a changeset when publishing (only one nothing else builds on). */
-  setChangesetChoice(slug: string, harvestId: number, k: number, choice: "keep" | "drop" | null, actor: string): string {
+  /** `bb study gate`: the study's gates on one commit, on the edit host. */
+  async requestGate(slug: string, input: { ref: string }, actor: string) {
     const study = this.study(slug);
-    const h = this.store.latestHarvest(study.id);
-    if (!h || h.id !== harvestId) throw new EngineError(`that harvest (id ${harvestId}) is not ${slug}'s latest harvest; reload the Harvest tab`);
-    if (h.publish_state === "published") throw new EngineError(`harvest h${h.seq} was already published`);
-    const all = this.store.changesets(h.id);
-    const c = all.find((x) => x.k === k);
-    if (!c) throw new EngineError(`harvest h${h.seq} has no changeset #${k}`);
-    const host = c.folded_into !== null ? all.find((x) => x.id === c.folded_into) : undefined;
-    if (choice === "drop" && host) throw new EngineError(`#${k} can't be dropped alone: it ships inside #${host.k}'s PR`);
-    const inside = all.filter((x) => x.folded_into === c.id);
-    if (choice === "drop" && inside.length) throw new EngineError(`#${k} can't be dropped: its PR also ships ${inside.map((x) => `#${x.k}`).join(", ")}`);
-    const dependents = all.filter((o) => (safeJson<number[]>(o.depends_on_json) ?? []).includes(c.id));
-    if (choice === "drop" && dependents.length) throw new EngineError(`#${k} can't be dropped: ${dependents.map((d) => `#${d.k}`).join(", ")} build${dependents.length === 1 ? "s" : ""} on it`);
-    this.store.updateChangeset(c.id, { human_choice: choice });
-    this.store.event(study.id, "harvest.choice", actor, { harvest: h.id, changeset: k, choice });
-    this.publish(study.id);
-    return choice === "drop" ? `#${k} will be skipped when publishing.` : choice === "keep" ? `#${k} will be published.` : `#${k}: choice cleared.`;
+    try {
+      const row = await this.primitives.requestGate(study, input, actor, this.liveWorkers(study));
+      this.publish(study.id);
+      return row;
+    } catch (e) {
+      throw e instanceof EngineError ? e : new EngineError(errText(e));
+    }
+  }
+
+  /** A measurement or gate run by its number within the study (r<seq>). */
+  adhocRun(slug: string, seq: number) {
+    const study = this.study(slug);
+    const r = this.store.adhocRunBySeq(study.id, seq);
+    if (!r) throw new EngineError(`${slug} has no run r${seq}; see \`bb study results ${slug}\``);
+    return r;
   }
 
   /** The human looked at the notices: they no longer count as new. */
@@ -636,75 +598,6 @@ export class Engine {
     return { text: await this.calibrate(slug, actor), kind: "calibrate" };
   }
 
-  /** Publish a ready harvest as DRAFT PRs on GitHub. Only behind an explicit confirmation (`--publish`, or the page's dialog); refuses without a GitHub remote. */
-  async publishHarvest(slug: string, actor: string, confirmed: boolean, harvestId?: number): Promise<string> {
-    const study = this.study(slug);
-    const h = this.store.latestHarvest(study.id);
-    if (!h || h.state !== "ready") throw new EngineError(`${slug} has no ready harvest to publish; run \`bb study harvest ${slug}\` (a dry run) first and review it`);
-    if (harvestId !== undefined && h.id !== harvestId) throw new EngineError(`that harvest (id ${harvestId}) is not the latest (h${h.seq} is); review h${h.seq} first`);
-    if (h.publish_state === "published") throw new EngineError(`harvest h${h.seq} was already published`);
-    const spec = this.store.spec(study);
-    const runner = this.ctx.bb.hostRunner(study.host_id!);
-    const publisher = new GithubPublisher(runner, study.repo_path!, spec.harvest.remote, confirmed);
-    try {
-      await publisher.preflight();
-    } catch (e) {
-      if (e instanceof PublishRefused) {
-        // Keep the refusal on the harvest so the page shows it (and what to fix).
-        this.store.updateHarvest(h.id, { publish_state: "failed", error: clip(`publish refused: ${e.message}`, 500) });
-        this.store.event(study.id, "harvest.publish_refused", actor, { harvest: h.id, reason: clip(e.message, 300) });
-        this.publish(study.id);
-        throw new EngineError(`publish refused: ${e.message}`);
-      }
-      throw e;
-    }
-    const changesets = this.store.changesets(h.id);
-    // A dropped changeset goes in without a sha, so the publisher skips it (and anything stacked on it).
-    const all: PrDraft[] = this.publishDrafts(study, spec, h).filter((d) => !d.folded).map(({ draft }) => ({ ...draft, sha: changesets.find((c) => c.id === draft.changesetId)?.human_choice === "drop" ? null : draft.sha }));
-    this.store.updateHarvest(h.id, { publisher: "github", publish_state: "publishing", error: null });
-    this.store.event(study.id, "harvest.publishing", actor, { harvest: h.id, prs: all.length });
-    try {
-      const out = await publisher.publish({ key: harvestExportKey(study, h), drafts: all, report: studyReport(this.ctx, study, spec, h) });
-      // A dropped changeset has no sha in its draft, so the publisher skips it; say why.
-      for (const p of out.prs) if (changesets.find((c) => c.id === p.changesetId)?.human_choice === "drop") Object.assign(p, { status: "skipped", detail: "dropped by you" });
-      for (const p of out.prs) {
-        this.store.updateChangeset(p.changesetId, { pr_url: p.url, pr_status: p.status === "opened" ? "opened" : p.status === "pushed" ? "pushed" : p.status === "failed" ? "failed" : this.store.changeset(p.changesetId)!.pr_status });
-      }
-      const opened = out.prs.filter((p) => p.status === "opened");
-      this.store.updateHarvest(h.id, { publish_state: opened.length === out.prs.filter((p) => p.status !== "skipped").length ? "published" : "failed", publish_json: JSON.stringify(out) });
-      this.store.event(study.id, "harvest.published", actor, { harvest: h.id, opened: opened.length, prs: out.prs.length });
-      const failed = out.prs.filter((p) => p.status === "failed" || p.status === "pushed");
-      await this.notify(study.id, "harvest.published", `Harvest h${h.seq} of \`${study.slug}\`: ${opened.length} draft PR(s) opened${failed.length ? `, ${failed.length} failed` : ""}.${failed.length ? " Next: see each PR's error on the Harvest tab." : ""}\n${out.prs.map((p) => `- #${p.k} ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 160)})` : ""}`).join("\n")}`);
-      this.publish(study.id);
-      return [`Harvest h${h.seq}: ${opened.length} draft PR(s) opened.`, ...out.prs.map((p) => `#${p.k} ${p.branch} → ${p.baseBranch}: ${p.status}${p.url ? ` ${p.url}` : ""}${p.detail && p.status !== "opened" ? ` (${clip(p.detail, 200)})` : ""}`)].join("\n");
-    } catch (e) {
-      this.store.updateHarvest(h.id, { publish_state: "failed", error: clip(errText(e), 500) });
-      throw e;
-    }
-  }
-
-  /** The grouping round: one strategist turn asking for study_propose_harvest. */
-  private async sendGroupingRound(study: StudyRow, harvest: HarvestRow, promotions: Promotion[]): Promise<boolean> {
-    const fresh = this.store.study(study.id)!;
-    if (!fresh.study_thread_id) return false;
-    const strategist = this.store.threadById(fresh.study_thread_id);
-    if (!strategist || strategist.role !== "strategist" || strategist.state !== "active") return false;
-    const spec = this.store.spec(fresh);
-    const candidates = new Map(promotions.filter((p) => p.n !== null).map((p) => [p.n!, this.store.candidateByN(study.id, p.n!)] as const));
-    const text = harvestRoundPrompt({ study: fresh, spec, harvest, promotions, candidates, dossier: this.store.dossier(study.id), code: this.codeInfo(fresh, spec) });
-    this.store.tx(() => {
-      this.store.updateStudy(study.id, { round_in_flight: 1, rounds: fresh.rounds + 1, last_round_at: this.ctx.now(), last_round_event_id: this.store.lastEventId() });
-      this.store.event(study.id, "strategist.round", "plugin", { round: fresh.rounds + 1, trigger: "harvest", harvest: harvest.id, promotions: promotions.length });
-    });
-    try {
-      await this.ctx.bb.send(fresh.study_thread_id, text);
-    } catch (e) {
-      this.store.updateStudy(study.id, { round_in_flight: 0 });
-      throw e;
-    }
-    return true;
-  }
-
   /**
    * End a study: stop and archive its workers, cancel a harvest and in-flight
    * measurements, remove bench checkouts and clones. With `archiveThread`, the
@@ -729,6 +622,7 @@ export class Engine {
     this.publish(study.id);
     const harvest = this.store.latestHarvest(study.id);
     if (harvest) this.harvester.cancel(harvest.id);
+    this.primitives.cancelStudy(study.id, "study archived");
     let stopped = 0;
     for (const w of this.store.threads(study.id, { role: "worker", states: [...LIVE_WORKER_STATES] })) {
       await this.endWorker(w, "abandoned", "study archived");
@@ -848,14 +742,14 @@ export class Engine {
 
   // -------------------------------------------------------- worker tools
 
-  async submit(threadId: string, summary: string): Promise<string> {
+  async submit(threadId: string, message: { title: string; body?: string | null }): Promise<string> {
     const { study, row } = await this.requireRole(threadId, "worker");
     let worker = row!;
     if (!worker.worktree_path) {
       await this.resolveWorktree(worker);
       worker = this.store.threadRow(worker.id)!;
     }
-    return (await this.pipeline.submit(study!, worker, summary)).text;
+    return (await this.pipeline.submit(study!, worker, message)).text;
   }
 
   recordFinding(threadId: string, args: { outcome: string; learned: string; revisit_if?: string; evidence?: string; candidate?: number }): Promise<string> {
@@ -1011,21 +905,6 @@ export class Engine {
       for (const c of cands.slice(0, 15)) lines.push(`- c/${c.n} idea #${c.idea_id ?? "?"} ${c.verdict} ${formatPct(c.effect)}: ${clip(c.summary.split("\n")[0] ?? "", 160)}`);
     }
     return clip(lines.join("\n"), 8000);
-  }
-
-  async proposeHarvest(threadId: string, groups: Array<{ title: string; candidates: number[]; rationale: string }>): Promise<string> {
-    const { study } = await this.requireRole(threadId, "strategist");
-    const h = this.store.latestHarvest(study!.id);
-    if (!h || h.state !== "grouping" || !h.promotions_json) {
-      const id = this.store.addHarvestProposal(study!.id, groups, threadId);
-      return `Harvest proposal #${id} recorded (${groups.length} changesets), but no harvest is waiting for a grouping right now. When the human runs \`bb study harvest\`, you will be asked again with the final list of promotions.`;
-    }
-    const promotions = JSON.parse(h.promotions_json) as Promotion[];
-    const r = applyProposal(promotions, groups);
-    if (!r.ok) throw new EngineError(`Grouping not accepted; fix it and call study_propose_harvest again:\n${r.errors.map((e) => `- ${e}`).join("\n")}`);
-    const id = this.store.addHarvestProposal(study!.id, groups, threadId, h.id);
-    this.publish(study!.id);
-    return [`Harvest grouping #${id} accepted for harvest h${h.seq}: ${r.changesets.length} changeset(s).`, ...r.notes.map((n) => `Note: ${n}.`), "The plugin now ablates and measures each changeset; end your turn."].join("\n");
   }
 
   // -------------------------------------------------------- thread events
@@ -1957,6 +1836,12 @@ export class Engine {
     let harvests = 0;
     for (const h of this.store.activeHarvests()) {
       const s = this.store.study(h.study_id);
+      if (h.state !== "waiting") {
+        // A harvest the plugin ran before v1, stopped mid-way by the upgrade: frozen on its best, readable as it is.
+        if (h.best_sha && s?.state === "harvesting") this.harvester.stopLegacy(h);
+        else this.store.updateHarvest(h.id, { state: "cancelled", finished_at: this.ctx.now() });
+        continue;
+      }
       if (s?.state !== "harvesting") {
         this.store.updateHarvest(h.id, { state: "cancelled", finished_at: this.ctx.now() });
         continue;
@@ -1965,6 +1850,7 @@ export class Engine {
       this.harvester.start(h.id);
       harvests += 1;
     }
+    this.primitives.reconcile();
     this.store.event(null, "plugin.reconciled", "plugin", { requeued, workers, calibrations, harvests });
     this.kick();
     return { requeued, workers, calibrations };

@@ -20,7 +20,7 @@ describe("rpc: study page data and controls", () => {
     host.refs.set("main", base);
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 } })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec().replace("max_workers = 1", "max_workers = 2") }, { threadId: "thr_study", projectId: "proj_1" });
@@ -36,7 +36,7 @@ describe("rpc: study page data and controls", () => {
   async function winOnce() {
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
   }
 

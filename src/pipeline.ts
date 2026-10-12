@@ -32,6 +32,7 @@ import type { RemoteFleet } from "./remote/fleet.ts";
 import { BenchError, strategyFor, type Bench, type MeasureOutcome, type RunResult, type Side } from "./noise.ts";
 import { clip, formatDuration, messageText, safeJson, verdictMessage, type AgentMessage } from "./prompts.ts";
 import { checkScope } from "./scope.ts";
+import { candidateCommitMessage, checkCommitMessage } from "./commit.ts";
 import { identityText, resolveCommitIdentity, type CommitIdentity } from "./identity.ts";
 import { remoteGates, singleMachineMode, type SingleMachineMode } from "./single-machine.ts";
 import { bestBranch, candidateRef, formatPct, type StudySpec } from "./spec.ts";
@@ -322,16 +323,19 @@ export class Pipeline {
   }
 
   // ---- stage 1-2: snapshot + scope (synchronous inside study_submit_candidate) ----
-  async submit(study: StudyRow, worker: ThreadRow, summary: string): Promise<SubmitResult> {
+  async submit(study: StudyRow, worker: ThreadRow, message: { title: string; body?: string | null }): Promise<SubmitResult> {
     return await this.submissions.run(study.id, async () => {
       const fresh = this.ctx.store.study(study.id) ?? study;
       const row = this.ctx.store.threadRow(worker.id) ?? worker;
-      return await this.submitLocked(fresh, row, summary);
+      return await this.submitLocked(fresh, row, message);
     });
   }
 
-  private async submitLocked(study: StudyRow, worker: ThreadRow, summary: string): Promise<SubmitResult> {
+  private async submitLocked(study: StudyRow, worker: ThreadRow, message: { title: string; body?: string | null }): Promise<SubmitResult> {
     const { store } = this.ctx;
+    const commit = checkCommitMessage(message.title, message.body);
+    if (!commit.ok) return { ok: false, text: `Not submitted: ${commit.reason}. Nothing was committed; call study_submit_candidate again.` };
+    const summary = commit.body ? `${commit.title}\n\n${commit.body}` : commit.title;
     const spec = store.spec(study);
     // A study recalibrating after an oracle change keeps taking submissions; they wait at the gate until it runs again.
     const recalibrating = study.state === "calibrating" && store.hasRun(study.id);
@@ -349,10 +353,9 @@ export class Pipeline {
     if (!study.best_sha) return { ok: false, text: "Study has no best commit yet." };
     const identity = await this.commitIdentity(study);
     const n = store.nextCandidateNumber(study.id);
-    const firstLine = clip(summary.split("\n")[0] ?? "", 120);
     const snap = await this.runner(study).snapshot({
       worktreePath: worker.worktree_path,
-      message: `autoresearch c/${n}: ${firstLine}`,
+      message: candidateCommitMessage(study.slug, { n, commit_title: commit.title, commit_body: commit.body, summary }),
       candidateRef: candidateRef(study.slug, n),
       baseSha: worker.fork_sha,
       bestSha: study.best_sha,
@@ -371,7 +374,9 @@ export class Pipeline {
         worker_id: worker.id,
         sha: snap.sha,
         parent_sha: forkSha,
-        summary: clip(summary, 4000),
+        summary: clip(summary, 4100),
+        commit_title: commit.title,
+        commit_body: commit.body,
         stage: "submitted",
         changed_paths_json: JSON.stringify(snap.changedPaths.slice(0, 500)),
         lines_added: snap.linesAdded,
@@ -725,7 +730,7 @@ export class Pipeline {
       bestSha: best,
       forkSha: c.parent_sha,
       candidateSha: c.sha,
-      message: `autoresearch c/${c.n}: ${clip(c.summary.split("\n")[0] ?? "", 120)}`,
+      message: candidateCommitMessage(study.slug, c, c.idea_id ? store.idea(c.idea_id)?.title : null),
       identity: gitId(await this.commitIdentity(study)),
     });
     if (prepared.status === "conflict") {
@@ -1055,7 +1060,8 @@ export class Pipeline {
         await this.hooks.systemPause(study, `oracle broken: ${h.reason} on ${host.name} (details stay on the bench host)`);
         return;
       }
-      result = h.pass ? { verdict: "win", reasons: [...result.reasons, h.reason] } : { verdict: "lose", reasons: [...result.reasons, HOLDOUT_FAIL] };
+      // Keep the guardrail judgement: it was dropped here before v1, so wins checked against a holdout had none recorded.
+      result = h.pass ? { ...result, verdict: "win", reasons: [...result.reasons, h.reason] } : { ...result, verdict: "lose", reasons: [...result.reasons, HOLDOUT_FAIL] };
     }
     stillMine();
     const seconds = (this.ctx.now() - started) / 1000;
@@ -1319,20 +1325,8 @@ export class Pipeline {
       this.requeue(c, "best moved before promotion");
       return;
     }
-    const idea = c.idea_id ? store.idea(c.idea_id) : undefined;
-    const reasons = (JSON.parse(c.reasons_json ?? "[]") as string[]).slice(0, 3);
-    const message = [
-      clip(idea?.title ?? c.summary.split("\n")[0] ?? `candidate c/${c.n}`, 72),
-      "",
-      `Autoresearch study ${study.slug}, candidate c/${c.n}${idea ? `, idea #${idea.id}` : ""}.`,
-      `${spec.metric.name}: ${formatPct(c.effect)}${c.ci_lo !== null && c.ci_hi !== null ? ` (CI ${formatPct(c.ci_lo)}..${formatPct(c.ci_hi)})` : ""}`,
-      ...reasons.map((r) => `- ${r}`),
-      "",
-      clip(c.summary, 2000),
-      "",
-      `Autoresearch-Candidate: c/${c.n}`,
-      `Autoresearch-Source: ${c.sha}`,
-    ].join("\n");
+    // The worker's message, verbatim, plus the plugin's trailers. Measurements live in the evidence (`bb study evidence`), not in the commit.
+    const message = candidateCommitMessage(study.slug, c, c.idea_id ? store.idea(c.idea_id)?.title : null);
     const promoted = await runner.rewordCommit(study.repo_path!, c.prepared_sha!, message, gitId(await this.commitIdentity(study)));
     store.updateCandidate(c.id, { promoted_sha: promoted });
     const r = await runner.updateRef(study.repo_path!, branch, promoted, c.against_sha);

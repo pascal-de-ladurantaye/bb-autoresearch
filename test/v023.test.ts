@@ -15,7 +15,6 @@ import { liveView, replayBundle } from "../src/live.ts";
 import { benchHealthText, benchQueueOrder, progressText, queuePosition, workerCountText } from "../src/live-model.ts";
 import { clipWords, effectStatisticText, runningStatusText, workersDoingText } from "../src/present.ts";
 import { codeLines, strategistDigest } from "../src/prompts.ts";
-import { revertedWords } from "../src/report.ts";
 import { ReplayModel } from "../src/replay.ts";
 import { sampleTableRows } from "../src/sample-rows.ts";
 import { candidateDetail, noticeAction, noticesView, overview, statusLine } from "../src/views.ts";
@@ -187,12 +186,6 @@ describe("wording (pure)", () => {
     expect(clipWords("first, second", 8)).toBe("first…");
   });
 
-  it("ablation and dependency text: no '+22.00% worse', no ambiguous 'it'", () => {
-    expect(revertedWords(0.22)).toBe("best with this change reverted is 22.00% worse than best");
-    expect(revertedWords(-0.01)).toBe("best with this change reverted is 1.00% better than best");
-    expect(revertedWords(0)).toBe("best with this change reverted measures the same as best");
-  });
-
   it("names the statistic of a candidate's headline per noise class", () => {
     expect(effectStatisticText("noisy")).toMatch(/median of the per-pair changes/u);
     expect(effectStatisticText("deterministic")).toBe("single run of each side");
@@ -264,7 +257,7 @@ describe("noticeAction follows the state", () => {
   it("offers 'Start harvest' only while a harvest can start", () => {
     expect(noticeAction("budget.exhausted", s({ state: "paused" }))).toMatchObject({ label: "Start harvest", tab: "harvest" });
     expect(noticeAction("budget.exhausted", s({ state: "harvesting" }), { state: "ablating" })).toMatchObject({ label: "Open Harvest", tab: "harvest" });
-    expect(noticeAction("budget.exhausted", s({ state: "harvesting" }), { state: "ready" })).toMatchObject({ label: "Review harvest", tab: "harvest" });
+    expect(noticeAction("budget.exhausted", s({ state: "harvesting" }), { state: "frozen" })).toMatchObject({ label: "Open Harvest", tab: "harvest" });
     expect(noticeAction("budget.exhausted", s({ state: "running" }))).toMatchObject({ label: "See budget", tab: "overview" });
     expect(noticeAction("budget.exhausted", s({ state: "archived" }))).toBeNull();
     // Without the state (old callers): the original action.
@@ -317,7 +310,7 @@ describe("v0.2.3 (fake host)", () => {
     host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     host.metric.set(tree, value);
     host.rss.set(tree, rss);
-    return await engine.submit(thread, `change ${tree}`);
+    return await engine.submit(thread, { title: `change ${tree}` });
   }
 
   it("lanes, cards, the Overview and the bench queue agree on queue positions", async () => {
@@ -486,7 +479,7 @@ describe("strategist rounds say where best's code is", () => {
     // After a promotion: best's new commit and the count.
     host.nextSnapshotFor.set("/wt/thr_w1", { tree: "TA" });
     host.metric.set("TA", 600);
-    await engine.submit("thr_w1", "change TA");
+    await engine.submit("thr_w1", { title: "change TA" });
     await engine.settle();
     const s1 = store.study(SLUG)!;
     expect(s1.best_sha).not.toBe(s0.best_sha);

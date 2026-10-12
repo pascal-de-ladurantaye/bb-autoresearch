@@ -123,7 +123,7 @@ describe("cumulative creep across kept wins (deterministic class, end to end)", 
     host.metric.set(tree, 1000 - 10 * k);
     host.rss.set(tree, (host.rss.get(bestTree) ?? 100) * factor);
     host.nextSnapshot = { tree };
-    await engine.submit("thr_w1", `step ${k}`);
+    await engine.submit("thr_w1", { title: `step ${k}` });
     await engine.settle();
     return store.candidateByN(s.id, k)!;
   }

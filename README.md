@@ -2,8 +2,9 @@
 
 A BB plugin for long-running, measured code-optimization studies. Short-lived
 agent workers propose changes in parallel; the plugin owns the loop, the
-measurements, and every keep or discard decision, then turns the wins into
-reviewable PRs whose contributions are measured by ablation.
+measurements, and every keep or discard decision. When the study is done, an
+agent turns the wins into PRs (the `study-harvest` skill), and every number it
+puts in them comes from the plugin.
 
 ![The Live tab mid-study: one lane per worker, candidate cards moving from tests to the bench and Promoted, and the measurement's confidence interval narrowing pair by pair against the win threshold](docs/screenshots/live.jpg)
 
@@ -29,9 +30,8 @@ bb plugin install . --yes
 bb plugin enable bb-autoresearch
 ```
 
-Requires BB ≥ 0.45, git ≥ 2.38 on every machine a study uses (for
-`git merge-tree --write-tree`), and the GitHub CLI (`gh`) only if you publish
-PRs.
+Requires BB ≥ 0.45 and git ≥ 2.38 on every machine a study uses (for
+`git merge-tree --write-tree`).
 
 ## Run a study
 
@@ -86,23 +86,22 @@ wait.
    verdict); the full detail goes to the agent as an agent-only block.
    Notices (new best, stall, budget thresholds, broken oracle, drift, rate
    limits, harvest ready) mark the study thread unread. A "?" next to each
-   statistical term (MDE, CI, noise floor, ablation, dependency) explains it.
+   statistical term (MDE, CI, noise floor) explains it.
 5. **Harvest.** When the budget is used up the study pauses and Needs you
-   offers *Start harvest* (or start one any time from the Overview; CLI
-   `bb study harvest <slug>`). It freezes best and works through the
-   promotions:
-   - The strategist groups the promotions into changesets (or one per promotion, if you tick that in the dialog or pass `--one-per-promotion`).
-   - Each changeset is ablated: best with it reverted is measured against best. Its contribution is shown as a share of the base→best gain, in points and metric units, with the CI. A revert conflict or a gate failure becomes a dependency, explained in words, and dependent changesets form a stack.
-   - Dependent changesets form a stack in dependency order (from the detected edges and the files their commits share). Each layer is gated (and measured) on its PR base; one that doesn't apply or pass its gates there is folded into the layer it needs, and the page and PR body say why. Only layers that apply and pass are drafted, as local branches `studies/<slug>/harvest/h<N>/*` (N counts this study's harvests) with a PR body you can preview. The bodies and `report.md` are exported under the plugin's data dir.
-
-   Then: **Publish draft PRs…** shows exactly which branches go to which
-   remote and which draft PRs open (and refuses without a GitHub remote), and
-   keeps the PR URLs or errors on the page afterwards; droppable changesets can
-   be kept or dropped first. Or *Keep exploring* (resume), or *Archive*. CLI:
-   `bb study harvest <slug> --publish`, `bb study resume <slug>`,
-   `bb study archive <slug>`.
-
-   ![A harvest review: each changeset with its measured share of the gain and CI, independent changesets based on main, and dependent ones grouped into stacks with the dependency explained in words](docs/screenshots/harvest.jpg)
+   offers to harvest (or start one any time from the Overview; CLI
+   `bb study harvest <slug>`). Harvest **freezes best**: no new workers,
+   submissions close, in-flight candidates finish, and best is pinned as
+   `refs/studies/<slug>/harvest/h<N>`. Then ask an agent to harvest it (the
+   Harvest tab has the prompt and opens a thread with it; the study thread
+   works too). Following the `study-harvest` skill, it reads
+   `bb study evidence`, groups and splits the changes, builds branches or a
+   stack, has the plugin measure each PR (`bb study measure <slug> <A> <B>`)
+   and run the gates (`bb study gate <slug> <ref>`), writes the PR
+   descriptions in your repository's style, and publishes with your
+   repository's own tools only when you ask. The Harvest tab shows the frozen
+   best, its promotions with their commit messages, and every measurement and
+   gate asked for. Or *Keep exploring* (`bb study resume <slug>`), or
+   *Archive*. Harvests made by the plugin before 1.0 stay readable there.
 
 ### One machine for everything
 
@@ -204,9 +203,11 @@ is a provider for local temp directories, for tests and trying it out.
 
 ### Commit identity
 
-The plugin commits in the studied repository: worker snapshots, candidates,
-promotions on `studies/<slug>/best`, and harvest branches. `[git] identity`
-says as whom:
+The plugin commits in the studied repository: worker snapshots, candidates
+and promotions on `studies/<slug>/best`. Their messages are the workers': a
+title (at most 72 characters) and a body they pass to `study_submit_candidate`,
+used verbatim, plus the plugin's `Autoresearch-Study` and
+`Autoresearch-Candidate` trailers. `[git] identity` says as whom:
 
 | Value | Commits are authored and committed as |
 |---|---|
@@ -218,7 +219,7 @@ bench host's clone sees exactly the same commits. Not part of the oracle hash.
 
 Every number reads the same everywhere: **better is positive, in the
 metric's own terms** ("74.7% fewer ops (4.0×)", "+74.7%"), with raw values
-next to it. Nothing is pushed before you publish. Every candidate stays under
+next to it. The plugin never pushes. Every candidate stays under
 `refs/studies/<slug>/c/<n>`.
 
 ## CLI
@@ -237,14 +238,17 @@ next to it. Nothing is pushed before you publish. Every candidate stays under
 | `bb study workers <slug>` | Worker threads |
 | `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration), health checks, bundle transfers, drift checks, segments |
 | `bb study drift <slug>` | Request an A/A drift check on every bench host |
-| `bb study harvest <slug> [--wait] [--restart] [--one-per-promotion] [--no-measure-standalone]` | Start or show a dry-run harvest |
-| `bb study harvest <slug> --publish` | Publish the ready harvest as DRAFT PRs on GitHub |
+| `bb study harvest <slug> [--wait] [--harvest N]` | Freeze best for harvest, or show the current (or an older) harvest |
+| `bb study evidence <slug> [--samples] [--candidates 3,7]` | Everything an agent needs to harvest, as stable JSON with `--json` (`bb-autoresearch/evidence` v1) |
+| `bb study measure <slug> <A> <B> [--pairs N] [--host H] [--detach]` | Measure B against A (any two commits) with the study's protocol and guardrails on its bench host; counts as bench time |
+| `bb study gate <slug> <ref> [--detach]` | The study's gates on any commit |
+| `bb study results <slug> [r<N>] [--wait]` | Measurements and gates asked for |
 | `bb study report <slug>` | The study report (Markdown) |
-| `bb study archive <slug> [--archive-thread]` | Stop for good: workers, bench checkouts and clones, a running harvest; `--archive-thread` also archives the study thread (the app's archive dialog does by default) |
+| `bb study archive <slug> [--archive-thread]` | Stop for good: workers, bench checkouts and clones, measurements still running; `--archive-thread` also archives the study thread (the app's archive dialog does by default) |
 
 Every command takes `--json` (one JSON document from the same view models as
-the page; errors carry a hint with the next command). Approval and publishing
-work in the app or the CLI; both are deliberate, audited the same way, and the
+the page; errors carry a hint with the next command). Approval, harvest and
+archiving work in the app or the CLI; both are deliberate, audited the same way, and the
 CLI refuses human controls from a study's own worker and study threads (see
 the threat model in the design).
 
@@ -255,7 +259,7 @@ the threat model in the design).
 - **Budgets.** Max workers, candidates, bench hours, deadline, and tokens (per-thread usage as BB reports it) are enforced. Dollar cost isn't available to plugins.
 - **Provider limits.** Rate-limited turns are retried at the window reset, and spawns hold until then. A tight usage window halves W. Neither path has been seen live yet.
 - **Snapshots.** Workers' worktrees are committed with `git add -A`: give the repo a `.gitignore` for build outputs.
-- **Harvest.** Dependencies are detected only through revert conflicts, gate failures and changed files. Stacks are ordered by dependency; a layer that doesn't apply or pass its gates on its PR base is folded into the layer it needs, so a stack can have fewer PRs than changesets. Contributions are measured relative to best and shown as shares of the gain.
+- **Harvest.** The plugin freezes best and measures and gates what an agent asks; grouping, PR descriptions and publishing are the agent's, with the repository's own tools. `measure` and `gate` are refused while the study runs workers and its bench is busy.
 
 ## Layout
 
@@ -269,10 +273,11 @@ the threat model in the design).
 | `src/present.ts` | The improvement convention (better is positive), shared by the page, CLI, report and agent messages |
 | `host.ts`, `src/host/` | `bb.host` entry and ops: git (snapshot, prepare, compose/revert, logs), background jobs, bundles, bench clones, health, exports |
 | `src/engine.ts` | Lifecycle, control loop, worker/strategist tools, budgets, rate limits, notices, harvest control, reconciliation |
+| `src/commit.ts` | Worker commit messages: checks, trailers, mapping commits back to candidates |
+| `src/primitives.ts`, `src/evidence.ts` | `bb study measure` / `gate` (requested measurements and gates on the study's bench) and the `bb study evidence` document |
 | `src/pipeline.ts` | Candidate pipeline and job launcher (parallel gates, one measurement per bench lock) |
-| `src/harvest.ts`, `src/harvest-math.ts` | Harvest phases (grouping, ablation, dependencies, stacks, standalone, drafting) and their pure math |
-| `src/publisher.ts` | `PrPublisher`: dry-run (local branches + files) and GitHub (draft PRs via `gh`) |
-| `src/report.ts` | PR bodies and the Markdown study report |
+| `src/harvest.ts`, `src/harvest-legacy.ts` | Harvest as a freeze (wait for the bench, pin best), and the display helpers for harvests the plugin ran before 1.0 |
+| `src/report.ts` | The Markdown study report |
 | `src/bench.ts`, `src/transfer.ts`, `src/health.ts`, `src/drift.ts`, `src/holdout.ts` | Bench sites, git bundle relay, health checks, drift checks, the private holdout |
 | `src/bench-provider/`, `src/remote/` | The bench provider contract (zod schemas), its client and the remote bench runner; the fleet that joins, calibrates, rotates and cleans up remote machines, and its view |
 | `examples/bench-provider-local/` | An example bench provider plugin (local temp directories and child processes) |
@@ -280,7 +285,7 @@ the threat model in the design).
 | `src/scheduler.ts` | Pure policy: adaptive W, backpressure, provider-limit W, idea choice, budgets, strategist triggers, idle handling |
 | `src/views.ts`, `src/rpc.ts`, `src/cli.ts`, `src/tools.ts`, `src/prompts.ts` | View models, RPC, `bb study`, role-gated agent tools, agent-facing text |
 | `src/db/` | SQLite schema (append-only migrations) and typed store |
-| `skills/` | `study-create` and `autoresearch` (usage, strategist, harvest) |
+| `skills/` | `study-create`, `autoresearch` (usage, strategist) and `study-harvest` (an agent's harvest into PRs, one study or several) |
 
 ## Develop
 

@@ -76,7 +76,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     await runningStudy();
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 900);
-    const ticket = await engine.submit("thr_w1", "Remove padding from the output");
+    const ticket = await engine.submit("thr_w1", { title: "Remove padding from the output" });
     expect(ticket).toContain("Submitted as c/1");
     expect(ticket).toContain("END YOUR TURN");
     await engine.settle();
@@ -114,23 +114,23 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     await runningStudy();
     host.nextSnapshot = { tree: "T2" };
     host.metric.set("T2", 1100);
-    await engine.submit("thr_w1", "Make it bigger by accident");
+    await engine.submit("thr_w1", { title: "Make it bigger by accident" });
     await engine.settle();
     const s = store.study(SLUG)!;
     expect(store.candidateByN(s.id, 1)!.verdict).toBe("lose");
     expect(s.best_sha).toBe(base);
     host.nextSnapshot = { tree: "T3" };
     host.metric.set("T3", 1000);
-    await engine.submit("thr_w1", "A change with no effect at all");
+    await engine.submit("thr_w1", { title: "A change with no effect at all" });
     await engine.settle();
     expect(store.candidateByN(s.id, 2)!.verdict).toBe("inconclusive");
-    expect(await engine.submit("thr_w1", "third submission over the cap")).toContain("Submission cap reached");
+    expect(await engine.submit("thr_w1", { title: "third submission over the cap" })).toContain("Submission cap reached");
   });
 
   it("rejects out-of-scope changes immediately without measuring", async () => {
     await runningStudy();
     host.nextSnapshot = { tree: "T4", changedPaths: ["bench/measure.sh"] };
-    const text = await engine.submit("thr_w1", "Tweak the benchmark harness");
+    const text = await engine.submit("thr_w1", { title: "Tweak the benchmark harness" });
     expect(text).toContain("REJECTED (scope)");
     expect(text).toContain("protected paths changed: bench/measure.sh");
     const c = store.candidateByN(store.study(SLUG)!.id, 1)!;
@@ -144,14 +144,14 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     host.nextSnapshot = { tree: "T5" };
     host.metric.set("T5", 900);
     host.gateFailures.set("T5", 1);
-    await engine.submit("thr_w1", "Passes on the second try");
+    await engine.submit("thr_w1", { title: "Passes on the second try" });
     await engine.settle();
     const s = store.study(SLUG)!;
     expect(store.candidateByN(s.id, 1)!.verdict).toBe("win");
     expect(store.events(s.id, { kinds: ["gate.flaky"] })).toHaveLength(1);
     host.nextSnapshot = { tree: "T6" };
     host.gateFailures.set("T6", 2);
-    await engine.submit("thr_w1", "Breaks the tests for real");
+    await engine.submit("thr_w1", { title: "Breaks the tests for real" });
     await engine.settle();
     const c2 = store.candidateByN(s.id, 2)!;
     expect(c2.verdict).toBe("gate_failed");
@@ -168,7 +168,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
       host.conflicts.add(r.sha);
       return r;
     };
-    await engine.submit("thr_w1", "Conflicting change here");
+    await engine.submit("thr_w1", { title: "Conflicting change here" });
     await engine.settle();
     const c = store.candidateByN(store.study(SLUG)!.id, 1)!;
     expect(c.verdict).toBe("conflict");
@@ -185,7 +185,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     host.prepareCandidate = async () => {
       throw new Error("host offline");
     };
-    await engine.submit("thr_w1", "Will hit host errors");
+    await engine.submit("thr_w1", { title: "Will hit host errors" });
     await engine.settle(4);
     expect(store.candidateByN(store.study(SLUG)!.id, 1)!.attempts).toBe(3);
     const s = store.study(SLUG)!;
@@ -222,7 +222,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     for (const [i, tree] of ["Ta", "Tb"].entries()) {
       host.nextSnapshot = { tree };
       host.metric.set(tree, 1100);
-      await engine.submit("thr_w1", `attempt number ${i}`);
+      await engine.submit("thr_w1", { title: `attempt number ${i}` });
       await engine.settle();
     }
     await engine.recordFinding("thr_w1", { outcome: "regressed", learned: "Both attempts made it bigger." });
@@ -234,7 +234,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     expect(port.spawned).toHaveLength(2);
     host.nextSnapshot = { tree: "Tc" };
     host.metric.set("Tc", 1100);
-    await engine.submit("thr_w2", "attempt number 3");
+    await engine.submit("thr_w2", { title: "attempt number 3" });
     await engine.settle();
     await engine.recordFinding("thr_w2", { outcome: "regressed", learned: "Bigger again." });
     await engine.finish("thr_w2");

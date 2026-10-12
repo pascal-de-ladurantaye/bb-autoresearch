@@ -24,8 +24,8 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
-    await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0, harvestPollMs: 5, harvestGroupGraceMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
+    await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0, harvestPollMs: 5 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     const r = await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec(spec) }, { threadId: "thr_study", projectId: "proj_1" });
     expect(text(r)).toContain("drafted with spec v1");
@@ -46,7 +46,7 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     await waitFor(() => port.threads.has("thr_w1") && port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", value);
-    expect(text(await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" }))).toContain("Submitted as c/1");
+    expect(text(await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" }))).toContain("Submitted as c/1");
     await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1"));
   }
 
@@ -89,12 +89,12 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     expect(await json(["pause", "toy-size"])).toMatchObject({ ok: true, study: { state: "paused" } });
     expect(await json(["resume", "toy-size"])).toMatchObject({ ok: true, study: { state: "running" } });
     expect(await envelope(["approve", "toy-size"])).toMatchObject({ message: "toy-size has no pending spec to approve", hint: expect.stringContaining("bb study show toy-size") });
-    expect((await envelope(["harvest", "toy-size", "--publish"])).message).toContain("no ready harvest");
+    expect(await envelope(["harvest", "toy-size", "--publish"])).toMatchObject({ code: "removed", message: expect.stringContaining("no longer drafts or publishes"), hint: expect.stringContaining("study-harvest skill") });
     const needs = await json(["needs", "toy-size"]);
     expect(needs).toEqual({ total: 0, studies: [{ slug: "toy-size", needs: [] }] });
     const harvest = await json(["harvest", "toy-size"]);
-    expect(harvest.message).toContain("harvesting (h1, dry run)");
-    for (const k of ["slug", "state", "promotions", "canStart", "harvest", "history"]) expect(harvest).toHaveProperty(k);
+    expect(harvest.message).toContain("harvesting (h1)");
+    for (const k of ["slug", "state", "promotions", "canStart", "harvest", "history", "runs", "guide"]) expect(harvest).toHaveProperty(k);
     await engine.waitForHarvest("toy-size", 10_000);
     expect(await json(["harvest", "toy-size"])).not.toHaveProperty("message");
     const archived = await json(["archive", "toy-size"]);
@@ -164,15 +164,20 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
   it("harvest --json: the harvest view plus the message when one was started", async () => {
     await setup();
     await win(800);
-    const started = await json(["harvest", "toy-size", "--one-per-promotion"]);
-    expect(started.message).toContain("harvesting (h1, dry run)");
+    const started = await json(["harvest", "toy-size"]);
+    expect(started.message).toContain("harvesting (h1)");
     for (const k of ["slug", "state", "promotions", "canStart", "harvest", "history"]) expect(started).toHaveProperty(k);
     expect(started.harvest.id).toBe(1);
-    await engine.waitForHarvest("toy-size", 10_000).catch(() => undefined);
-    // The fake host has no real git, so this harvest fails; text and JSON still say what to run next.
-    const again = await json(["harvest", "toy-size"]).catch(() => null);
-    if (again) expect(again).not.toHaveProperty("message");
-    expect((await cli(["needs", "toy-size"])).stdout).toContain("`bb study harvest toy-size --restart`");
+    await engine.waitForHarvest("toy-size", 10_000);
+    const again = await json(["harvest", "toy-size"]);
+    expect(again).not.toHaveProperty("message");
+    expect(again.harvest).toMatchObject({ state: "frozen", legacy: false, frozenRef: "refs/studies/toy-size/harvest/h1" });
+    expect(again.harvest.promotions.map((p: { n: number }) => p.n)).toEqual([1]);
+    // Needs you points at an agent, and the text output carries the prompt to give it.
+    expect((await cli(["needs", "toy-size"])).stdout).toContain("ask an agent to harvest it → `bb study evidence toy-size`");
+    const text = (await cli(["harvest", "toy-size"])).stdout;
+    expect(text).toContain("study-harvest skill");
+    expect(text).toContain("bb study measure toy-size <A> <B>");
   });
 
   it("JSON stays one bounded document: long arrays are trimmed, not the string", async () => {

@@ -9,9 +9,9 @@ import { clip } from "./prompts.ts";
 
 // Every tool carries the `study_` prefix so it can't collide with another plugin's tools.
 export const WORKER_TOOLS = ["study_submit_candidate", "study_record_finding", "study_propose_idea", "study_request_profile", "study_finish"] as const;
-export const STRATEGIST_TOOLS = ["study_queue_ideas", "study_retire_idea", "study_update_dossier", "study_search_findings", "study_propose_harvest"] as const;
+export const STRATEGIST_TOOLS = ["study_queue_ideas", "study_retire_idea", "study_update_dossier", "study_search_findings"] as const;
 export const CREATOR_TOOLS = ["study_propose"] as const;
-export const SKILLS = { create: "study-create", usage: "autoresearch" } as const;
+export const SKILLS = { create: "study-create", usage: "autoresearch", harvest: "study-harvest" } as const;
 
 const MAX_OUTPUT = 12_000;
 
@@ -31,9 +31,11 @@ export function toolsForRole(role: Role | null): string[] {
 export function skillsForRole(role: Role | null): string[] {
   switch (role) {
     case "strategist":
-      return [SKILLS.usage];
+      // The study thread is where the human most often asks for a harvest.
+      return [SKILLS.usage, SKILLS.harvest];
     case "creator":
-      return [SKILLS.create, SKILLS.usage];
+      // Ordinary threads: where studies are created, and where a human may ask for a harvest.
+      return [SKILLS.create, SKILLS.usage, SKILLS.harvest];
     default:
       return [];
   }
@@ -52,10 +54,21 @@ export function registerTools(bb: BbPluginApi, engine: Engine): void {
   bb.agents.registerTool({
     name: "study_submit_candidate",
     description:
-      "Submit your worktree as a candidate. The plugin commits it, checks scope, runs gates and measures it against best. Returns a ticket; the verdict arrives later as a message. End your turn after submitting.",
+      "Submit your worktree as a candidate. The plugin commits it with your title and body as the commit message (used verbatim, also for the commit on best if it wins), checks scope, runs gates and measures it against best. Returns a ticket; the verdict arrives later as a message. End your turn after submitting.",
     presentation: { label: { pending: "Submitting candidate", completed: "Submitted candidate" } },
-    parameters: z.object({ summary: z.string().min(10).max(4000).describe("What you changed and why you expect it to help.") }),
-    execute: ({ summary }, ctx) => run(() => engine.submit(ctx.threadId, summary)),
+    parameters: z.object({
+      title: z
+        .string()
+        .min(1)
+        .max(200)
+        .describe("Commit title: one line, at most 72 characters, saying what the change does (not the idea's name), in the repository's commit style."),
+      body: z
+        .string()
+        .max(4000)
+        .optional()
+        .describe("Commit body: why it should help, what you checked locally, trade-offs. Plain text; no Autoresearch-* trailers (the plugin adds them)."),
+    }),
+    execute: ({ title, body }, ctx) => run(() => engine.submit(ctx.threadId, { title, body: body ?? null })),
   });
   bb.agents.registerTool({
     name: "study_record_finding",
@@ -150,15 +163,6 @@ export function registerTools(bb: BbPluginApi, engine: Engine): void {
     }),
     execute: (args, ctx) => run(() => engine.searchFindings(ctx.threadId, args)),
   });
-  bb.agents.registerTool({
-    name: "study_propose_harvest",
-    description: "Group the promotions on best into reviewable changesets (one PR each) when a harvest asks for it. Every promoted candidate goes in exactly one group; invalid groupings are rejected with the reason.",
-    parameters: z.object({
-      groups: z.array(z.object({ title: z.string().min(3).max(200), candidates: z.array(z.number().int().positive()).min(1), rationale: z.string().max(2000) })).min(1).max(50),
-    }),
-    execute: ({ groups }, ctx) => run(() => engine.proposeHarvest(ctx.threadId, groups)),
-  });
-
   bb.agents.configure((context) => {
     if (context.origin.kind === "fork" && context.origin.pluginId === "side-chat") return { tools: [], skills: [] };
     let role: Role | null = null;

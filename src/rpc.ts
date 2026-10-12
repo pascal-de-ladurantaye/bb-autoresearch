@@ -8,7 +8,7 @@
 // Writes are therefore bounded to the approved spec (concurrency can only go
 // down, priorities are clamped), and every write is audited as an event and
 // a notice with whatever caller information exists (see the threat model in
-// docs/design.md). Approval (spec, calibration), publishing and archiving are
+// docs/design.md). Approval (spec, calibration), harvest and archiving are
 // deliberate steps: the call must carry `confirm: true`, which the page only
 // sends from a dialog that states exactly what will happen. In-app and CLI
 // approval are equivalent (BB can't tell an agent from a human on either
@@ -29,7 +29,6 @@ type CandidateDetail = NonNullable<Awaited<ReturnType<typeof candidateDetail>>>;
 type Summary = ReturnType<typeof studySummary>;
 type Badge = ReturnType<typeof threadBadge>;
 type Attention = ReturnType<typeof attentionView>;
-type PublishPlan = Awaited<ReturnType<Engine["publishPlan"]>>;
 
 const slug = z.string().regex(/^[a-z0-9][a-z0-9-]{1,47}$/u);
 const ok = z.object({ ok: z.boolean(), message: z.string() }).strict();
@@ -79,24 +78,19 @@ export const rpcContract = defineRpcContract({
   },
   "study.oracle": { input: z.object({ slug }).strict(), output: trusted<OracleView>() },
   "study.bench": { input: z.object({ slug }).strict(), output: trusted<BenchView>() },
-  "study.harvest": { input: z.object({ slug }).strict(), output: trusted<HarvestView>() },
+  /** The latest harvest, or an older one by id (read only). */
+  "study.harvest": { input: z.object({ slug, harvestId: z.number().int().positive().optional() }).strict(), output: trusted<HarvestView>() },
   "study.report": { input: z.object({ slug }).strict(), output: z.object({ markdown: z.string() }) },
   /** Needs-you counts across studies (the nav panel badge). */
   "studies.attention": { input: z.null(), output: trusted<Attention>() },
   /** The human looked at the study's notices (they stop counting as new). */
   "study.notices.seen": { input: z.object({ slug }).strict(), output: ok },
-  /** Human control: start a DRY-RUN harvest (local branches and files only). */
-  "study.harvest.start": { input: z.object({ slug, restart: z.boolean().optional(), onePerPromotion: z.boolean().optional() }).strict(), output: ok },
+  /** Human control: freeze best for harvest (no new workers, submissions closed). */
+  "study.harvest.start": { input: z.object({ slug }).strict(), output: ok },
   /** Human control (confirmed): approve the spec version the human reviewed. Draft: approve and calibrate; pending: apply, or recalibrate when the oracle changed. */
   "study.spec.approve": { input: z.object({ slug, version: z.number().int().positive(), confirm: z.boolean().optional() }).strict(), output: ok },
   /** Human control (confirmed): approve the finished calibration and start running. */
   "study.start": { input: z.object({ slug, confirm: z.boolean().optional() }).strict(), output: ok },
-  /** What publishing the ready harvest would push and open (read only). */
-  "study.harvest.plan": { input: z.object({ slug, harvestId: z.number().int().positive().optional() }).strict(), output: trusted<PublishPlan>() },
-  /** Human control (confirmed): push the ready harvest's branches and open DRAFT PRs on GitHub. */
-  "study.harvest.publish": { input: z.object({ slug, harvestId: z.number().int().positive(), confirm: z.boolean().optional() }).strict(), output: ok },
-  /** Human control: keep or drop a changeset when publishing. */
-  "study.harvest.choice": { input: z.object({ slug, harvestId: z.number().int().positive(), k: z.number().int().positive(), choice: z.enum(["keep", "drop"]).nullable() }).strict(), output: ok },
   /** Human control (confirmed): archive the study (stop workers, remove bench checkouts; refs are kept). */
   "study.archive": { input: z.object({ slug, confirm: z.boolean().optional(), archiveThread: z.boolean().optional() }).strict(), output: ok },
   "study.pause": { input: z.object({ slug }).strict(), output: ok },
@@ -153,7 +147,7 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
     "study.findings": ({ slug, ...q }) => findingsView(engine, engine.study(slug), q),
     "study.oracle": ({ slug }) => oracleView(engine, engine.study(slug)),
     "study.bench": ({ slug }) => benchView(engine, engine.study(slug)),
-    "study.harvest": ({ slug }) => harvestView(engine, engine.study(slug)),
+    "study.harvest": ({ slug, harvestId }) => harvestView(engine, engine.study(slug), harvestId),
     "study.report": ({ slug }) => {
       const s = engine.study(slug);
       return { markdown: studyReport(engine.ctx, s, store.spec(s), store.latestHarvest(s.id) ?? null) };
@@ -180,36 +174,16 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
       await engine.auditControl(slug, "start", caller, "calibration approved / study started");
       return { ok: true, message };
     },
-    "study.harvest.plan": async ({ slug, harvestId }) => engine.publishPlan(slug, harvestId),
-    "study.harvest.publish": async ({ slug, harvestId, confirm }, ctx) => {
-      const caller = humanOnly(ctx);
-      const plan = await engine.publishPlan(slug, harvestId);
-      requireConfirm(confirm, `pushes ${plan.prs.filter((p) => p.push).length} branch(es) of harvest h${plan.seq} to ${plan.remote} and opens draft PRs on GitHub`);
-      try {
-        const message = await engine.publishHarvest(slug, ACTOR, true, harvestId);
-        await engine.auditControl(slug, "publish", caller, `harvest h${plan.seq} published (GitHub draft PRs)`, { harvest: harvestId });
-        return { ok: true, message };
-      } catch (e) {
-        await engine.auditControl(slug, "publish", caller, `harvest h${plan.seq} publish attempted and failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`, { harvest: harvestId, failed: true });
-        throw e;
-      }
-    },
-    "study.harvest.choice": async ({ slug, harvestId, k, choice }, ctx) => {
-      const caller = humanOnly(ctx);
-      const message = engine.setChangesetChoice(slug, harvestId, k, choice, ACTOR);
-      await engine.auditControl(slug, "harvest_choice", caller, `harvest ${harvestLabel(engine, harvestId)} #${k}: ${choice ?? "choice cleared"}`, { harvest: harvestId, changeset: k, choice });
-      return { ok: true, message };
-    },
     "study.archive": async ({ slug, confirm, archiveThread }, ctx) => {
       const caller = humanOnly(ctx);
       requireConfirm(confirm, `archives ${slug}: live workers stop, their threads are archived, bench checkouts and clones are removed${archiveThread ? ", and the study thread is archived" : ""} (git refs and the best branch are kept)`);
       await engine.auditControl(slug, "archive", caller, `study archived${archiveThread ? " with its study thread" : ""}`, { archiveThread: Boolean(archiveThread) });
       return { ok: true, message: await engine.archiveStudy(slug, ACTOR, { archiveThread: Boolean(archiveThread) }) };
     },
-    "study.harvest.start": async ({ slug, restart, onePerPromotion }, ctx) => {
+    "study.harvest.start": async ({ slug }, ctx) => {
       const caller = humanOnly(ctx);
-      const r = engine.startHarvest(slug, ACTOR, { restart: restart ?? false, onePerPromotion: onePerPromotion ?? false });
-      await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.seq} started (dry run)`, { harvest: r.harvest.id });
+      const r = engine.startHarvest(slug, ACTOR);
+      if (r.started) await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.seq} started: best freezes for an agent to harvest`, { harvest: r.harvest.id });
       return { ok: true, message: r.text };
     },
     "study.pause": async ({ slug }, ctx) => {
@@ -257,10 +231,4 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
       return { ok: true, message: `Idea #${id} vetoed.` };
     },
   });
-}
-
-/** A harvest as people see it: h<seq> (the RPC's harvestId is the internal id). */
-function harvestLabel(engine: Engine, harvestId: number): string {
-  const h = engine.ctx.store.harvest(harvestId);
-  return h ? `h${h.seq}` : `id ${harvestId}`;
 }

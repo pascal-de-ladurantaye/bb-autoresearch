@@ -1,30 +1,33 @@
-// Harvest tab: turn the promotions on best into reviewable changesets.
-// Every contribution is shown as a share of the base→best gain (plus points
-// of the headline and metric units), with its CI; dependencies are spelled
-// out in words; publishing is a confirmed step whose dialog lists exactly
-// which branches go to which remote and which draft PRs open, and whose
-// results (URLs or errors) stay on the page.
-import { Markdown } from "@get-bb/plugin-sdk/app";
-import { useState } from "react";
+// Harvest tab. v1: harvest freezes best and closes submissions; an agent
+// turns the frozen best into PRs with the study-harvest skill, asking the
+// plugin for every number (`bb study measure`) and check (`bb study gate`).
+// The tab shows the freeze (base, best, the pinned ref, the promotions with
+// their commit messages), the measurements and gates agents asked for, and a
+// short guide with the prompt to give an agent. Harvests the plugin drafted
+// before v1 stay readable: changesets, contributions, stacks, PR previews and
+// publish results, without the old publish and keep/drop controls.
+import { experimental_NewThreadComposer as NewThreadComposer, Markdown, useBbNavigate, useSdk } from "@get-bb/plugin-sdk/app";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { HarvestView, OverviewResult } from "../views.ts";
 import { ArchiveDialog, HarvestDialog } from "./Actions.tsx";
 import { useLive, useStudyRpc, type Rpc } from "./data.ts";
 import { ago, duration, sharePct, shortSha } from "./format.ts";
-import { Callout, ConfirmDialog, EmptyState, ErrorLine, Help, Mono, Section, Skeleton, Stat, StatePill, TabState } from "./ui.tsx";
+import { Callout, EmptyState, ErrorLine, Help, Mono, Section, Skeleton, Stat, StatePill, TabState } from "./ui.tsx";
 
 type Harvest = NonNullable<HarvestView["harvest"]>;
 type Changeset = Harvest["changesets"][number];
-
-const PHASES = ["waiting", "grouping", "ablating", "checking", "drafting", "ready"] as const;
+type Run = HarvestView["runs"][number];
 
 export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: string; o: OverviewResult; onOpenCandidate: (n: number) => void; onChanged: () => void }) {
   const rpc = useStudyRpc();
-  const v = useLive((r) => r.call("study.harvest", { slug }), [slug], 5000);
-  const [dialog, setDialog] = useState<null | "start" | "restart" | "archive">(null);
+  const [selected, setSelected] = useState<number | null>(null);
+  const v = useLive((r) => r.call("study.harvest", { slug, ...(selected !== null ? { harvestId: selected } : {}) }), [slug, selected], 5000);
+  const [dialog, setDialog] = useState<null | "start" | "archive">(null);
   const d = v.data;
   if (!d) return <TabState loading={v.loading} error={v.error} retry={v.refetch} label="the harvest" />;
   const h = d.harvest;
@@ -32,23 +35,25 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
     v.refetch();
     onChanged();
   };
+  const latestId = d.history[0]?.id ?? null;
   return (
     <div className="space-y-5">
       {v.error ? <ErrorLine error={`Live updates failed (showing the last data): ${v.error}`} retry={v.refetch} /> : null}
       {!h ? (
-        <Section title="Harvest" help="ablation">
+        <Section title="Harvest">
           <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-3 text-sm">
-            <p>Harvest turns the {d.promotions} promotion{d.promotions === 1 ? "" : "s"} on <Mono>studies/{slug}/best</Mono> into reviewable changesets, one PR each:</p>
+            <p>
+              Harvest freezes <Mono>studies/{slug}/best</Mono> ({d.promotions} promotion{d.promotions === 1 ? "" : "s"}) so an agent can turn it into pull requests:
+            </p>
             <ol className="list-decimal space-y-0.5 pl-5 text-muted-foreground">
-              <li>New work stops; candidates in flight finish so best is final.</li>
-              <li>The strategist groups the promotions into changesets (or one per promotion).</li>
-              <li>Each changeset is reverted from best and measured: how much worse best gets is its contribution.</li>
-              <li>Each is checked alone on its PR base, then drafted as a local branch with a PR body.</li>
+              <li>New work stops; candidates in flight finish so best is final, and best is pinned.</li>
+              <li>You ask an agent (the study thread works) to harvest it with the study-harvest skill.</li>
+              <li>It reads the evidence, groups and splits the changes, builds the branches or stacks, and has the plugin measure and gate each one.</li>
+              <li>It writes the PR descriptions in your repository's style and publishes only when you ask, with your repository's own tools.</li>
             </ol>
-            <p className="text-muted-foreground">A dry run: nothing is pushed until you publish.</p>
             <div className="flex flex-wrap items-center gap-2">
               <Button size="sm" disabled={!d.canStart} aria-describedby={d.cannotStartReason ? "harvest-cannot" : undefined} onClick={() => setDialog("start")}>
-                Start harvest…
+                Freeze best for harvest…
               </Button>
               {d.cannotStartReason ? (
                 <span id="harvest-cannot" className="text-xs text-muted-foreground">
@@ -61,16 +66,28 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
             </div>
           </div>
         </Section>
+      ) : h.legacy ? (
+        <LegacyHarvest h={h} onOpenCandidate={onOpenCandidate} />
       ) : (
-        <HarvestDetail h={h} slug={slug} o={o} rpc={rpc} onOpenCandidate={onOpenCandidate} onChanged={done} onRestart={d.canStart && ["ready", "failed", "cancelled"].includes(h.state) ? () => setDialog("restart") : null} onArchive={() => setDialog("archive")} />
+        <FrozenHarvest h={h} o={o} guide={d.guide} onOpenCandidate={onOpenCandidate} />
       )}
+      {h && (o.state === "harvesting" || o.state !== "archived") ? <NextSteps h={h} d={d} o={o} slug={slug} rpc={rpc} onChanged={done} onStart={() => setDialog("start")} onArchive={() => setDialog("archive")} /> : null}
+      <Runs runs={d.runs} slug={slug} />
       {d.history.length > 1 ? (
         <Section title={`Harvest history (${d.history.length})`}>
           <ul className="divide-y divide-border rounded-lg border border-border bg-card text-sm">
             {d.history.map((x) => (
-              <li key={x.id} className="flex items-center gap-2 px-3 py-1.5">
-                <span className="font-mono text-xs">h{x.seq}</span>
+              <li key={x.id} className="flex flex-wrap items-center gap-2 px-3 py-1.5">
+                <button
+                  type="button"
+                  className={cn("rounded font-mono text-xs underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", (h?.id ?? latestId) === x.id && "font-semibold")}
+                  aria-current={(h?.id ?? latestId) === x.id ? "true" : undefined}
+                  onClick={() => setSelected(x.id === latestId ? null : x.id)}
+                >
+                  h{x.seq}
+                </button>
                 <StatePill state={x.state} />
+                {x.legacy ? <span className="text-xs text-muted-foreground">before v1</span> : null}
                 {x.publishState && x.publishState !== "dry-run" ? <span className="text-xs">publish: {x.publishState}</span> : null}
                 <span className="text-xs text-muted-foreground">
                   started {ago(x.startedAt)}
@@ -82,32 +99,157 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
         </Section>
       ) : null}
       <Report slug={slug} />
-      {dialog === "start" || dialog === "restart" ? <HarvestDialog slug={slug} promotions={d.promotions} restart={dialog === "restart"} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
+      {dialog === "start" ? <HarvestDialog slug={slug} promotions={d.promotions} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
       {dialog === "archive" ? <ArchiveDialog slug={slug} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
     </div>
   );
 }
 
-function Progress({ h }: { h: Harvest }) {
-  const at = PHASES.indexOf(h.state as (typeof PHASES)[number]);
-  if (at < 0) return null;
+/** A v1 harvest: the freeze and the promotions with their commit messages. */
+function FrozenHarvest({ h, o, guide, onOpenCandidate }: { h: Harvest; o: OverviewResult; guide: HarvestView["guide"]; onOpenCandidate: (n: number) => void }) {
   return (
-    <ol className="flex flex-wrap items-center gap-1 text-xs" aria-label="Harvest progress">
-      {PHASES.map((p, i) => (
-        <li key={p} className={cn("flex items-center gap-1", i < at ? "text-muted-foreground" : i === at ? "font-medium text-foreground" : "text-muted-foreground/70")} aria-current={i === at ? "step" : undefined}>
-          <span aria-hidden>{i < at ? "✓" : i === at ? "●" : "○"}</span>
-          {p}
-          {i < PHASES.length - 1 ? <Icon name="ChevronRight" className="size-3 text-muted-foreground" aria-hidden /> : null}
-        </li>
-      ))}
-    </ol>
+    <>
+      <Section title={`Harvest h${h.seq}`}>
+        <div className="space-y-1 rounded-lg border border-border bg-card px-3 py-2 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatePill state={h.state} />
+            <span className="text-xs text-muted-foreground">{h.state === "waiting" ? "in-flight candidates finish, then best freezes" : h.state === "frozen" ? "best is frozen: an agent harvests it" : null}</span>
+          </div>
+          {h.detail ? <p className="text-xs text-muted-foreground" aria-live="polite">{h.detail}</p> : null}
+          {h.error ? <ErrorLine error={h.error} /> : null}
+          {h.bestSha ? (
+            <p className="text-xs text-muted-foreground">
+              base <Mono>{shortSha(h.baseSha)}</Mono> → best <Mono>{shortSha(h.bestSha)}</Mono>
+              {h.frozenRef ? (
+                <>
+                  {" "}
+                  pinned as <Mono>{h.frozenRef}</Mono>
+                </>
+              ) : null}{" "}
+              · started {ago(h.startedAt)}
+              {h.finishedAt ? ` · frozen ${ago(h.finishedAt)}` : ""}
+            </p>
+          ) : null}
+        </div>
+      </Section>
+      {h.state === "frozen" && o.state === "harvesting" ? <AgentGuide guide={guide} o={o} /> : null}
+      {h.promotions.length ? (
+        <Section title={`Promotions on best (${h.promotions.length}, oldest first)`}>
+          <ul className="space-y-1.5" aria-label="Promotions">
+            {h.promotions.map((p) => (
+              <li key={p.sha} className="rounded-lg border border-border bg-card px-3 py-2 text-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Mono>{shortSha(p.sha)}</Mono>
+                  {p.n !== null ? (
+                    <button type="button" className="rounded font-mono text-xs underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => onOpenCandidate(p.n!)}>
+                      c/{p.n}
+                    </button>
+                  ) : null}
+                  <span className="min-w-0 flex-1 font-medium">{p.title}</span>
+                  {p.effectText ? <span className="text-xs text-muted-foreground">{p.effectText} when promoted</span> : null}
+                  <span className="text-xs text-muted-foreground">
+                    {p.files} file{p.files === 1 ? "" : "s"}
+                  </span>
+                </div>
+                {p.body ? (
+                  <details className="mt-1 text-xs">
+                    <summary className="cursor-pointer text-muted-foreground">Commit message</summary>
+                    <pre className="mt-1 whitespace-pre-wrap font-sans">{p.body}</pre>
+                  </details>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </Section>
+      ) : h.state === "frozen" ? (
+        <EmptyState>No promotions on best.</EmptyState>
+      ) : null}
+    </>
   );
 }
 
-function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart, onArchive }: { h: Harvest; slug: string; o: OverviewResult; rpc: Rpc; onOpenCandidate: (n: number) => void; onChanged: () => void; onRestart: (() => void) | null; onArchive: () => void }) {
-  const a = h.accounting;
-  const onlyMissing = a.missing.length > 0 && (a.gap === null || a.gapHalfWidth === null || Math.abs(a.gap) <= a.gapHalfWidth);
-  const [publishing, setPublishing] = useState(false);
+/** How to get an agent to do the harvest: the prompt, a new thread with it, or the study thread. */
+function AgentGuide({ guide, o }: { guide: HarvestView["guide"]; o: OverviewResult }) {
+  const nav = useBbNavigate();
+  const [composing, setComposing] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(guide.prompt);
+      toast.success("Copied the prompt.");
+    } catch {
+      toast.error("Couldn't copy; select the text instead.");
+    }
+  };
+  return (
+    <Callout
+      tone="action"
+      title="Ask an agent to harvest it"
+      actions={
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" onClick={() => setComposing(true)}>
+            Ask in a new thread…
+          </Button>
+          {o.studyThreadId ? (
+            <Button size="sm" variant="outline" onClick={() => nav.toThread(o.studyThreadId!)}>
+              Open the study thread
+            </Button>
+          ) : null}
+          <Button size="sm" variant="ghost" onClick={() => void copy()}>
+            Copy prompt
+          </Button>
+        </div>
+      }
+    >
+      <p className="text-sm">
+        The <Mono>study-harvest</Mono> skill tells it how: read the evidence, group and split the changes (by hunk when needed), build branches or stacks, have the plugin measure and gate each one, write the PR descriptions in this repository's style, and publish only when you say so.
+      </p>
+      <blockquote className="mt-2 border-l-2 border-border pl-2 text-xs text-muted-foreground" data-testid="harvest-prompt">
+        {guide.prompt}
+      </blockquote>
+      <ul className="mt-2 space-y-0.5 text-xs text-muted-foreground">
+        {guide.commands.map((c) => (
+          <li key={c.command}>
+            <Mono>{c.command}</Mono>: {c.what}
+          </li>
+        ))}
+      </ul>
+      {composing ? <HarvestComposer prompt={guide.prompt} projectId={o.projectId} onClose={() => setComposing(false)} /> : null}
+    </Callout>
+  );
+}
+
+function HarvestComposer({ prompt, projectId, onClose }: { prompt: string; projectId: string; onClose: () => void }) {
+  const sdk = useSdk();
+  const nav = useBbNavigate();
+  const [focus, setFocus] = useState(1);
+  useEffect(() => setFocus((f) => f + 1), []);
+  return (
+    <Dialog open onOpenChange={(x) => !x && onClose()}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Harvest with an agent</DialogTitle>
+          <DialogDescription>Starts a thread in this study's project with the prompt below. Edit it first if you like (for example, which review tool to publish with).</DialogDescription>
+        </DialogHeader>
+        <div className="min-h-40" data-testid="harvest-composer">
+          <NewThreadComposer
+            defaultProjectId={projectId}
+            initialPrompt={prompt}
+            focusRequest={focus}
+            layout="document"
+            draftKey="autoresearch:harvest"
+            onSubmit={async (request) => {
+              const thread = await sdk.threads.spawn(request);
+              onClose();
+              nav.toThread(thread.id);
+            }}
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function NextSteps({ h, d, o, slug, rpc, onChanged, onStart, onArchive }: { h: Harvest; d: HarvestView; o: OverviewResult; slug: string; rpc: Rpc; onChanged: () => void; onStart: () => void; onArchive: () => void }) {
   const resume = async () => {
     try {
       toast.success((await rpc.call("study.resume", { slug })).message);
@@ -116,23 +258,74 @@ function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart,
       toast.error(e instanceof Error ? e.message : String(e));
     }
   };
-  const running = !["ready", "failed", "cancelled"].includes(h.state);
+  const waiting = h.state === "waiting";
+  if (o.state === "archived") return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {d.canStart ? (
+        <Button size="sm" variant="outline" onClick={onStart}>
+          Freeze best for a new harvest…
+        </Button>
+      ) : null}
+      {o.state === "harvesting" && !waiting ? (
+        <Button size="sm" variant="outline" onClick={() => void resume()}>
+          Keep exploring (resume)
+        </Button>
+      ) : null}
+      {!waiting ? (
+        <Button size="sm" variant="ghost" onClick={onArchive}>
+          <Icon name="Archive" className="size-4" aria-hidden />
+          Archive…
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+/** `bb study measure` / `bb study gate` runs, newest first. */
+function Runs({ runs, slug }: { runs: Run[]; slug: string }) {
+  return (
+    <Section title={`Measurements and gates agents asked for (${runs.length})`}>
+      {runs.length ? (
+        <ul className="divide-y divide-border rounded-lg border border-border bg-card text-sm" aria-label="Measurements and gates">
+          {runs.map((r) => (
+            <li key={r.id} className="space-y-0.5 px-3 py-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-xs">r{r.seq}</span>
+                <StatePill state={r.state} />
+                <span className="text-xs">{r.kind === "measure" ? <>measure <Mono>{r.refB}</Mono> against <Mono>{r.refA ?? ""}</Mono></> : <>gate <Mono>{r.refB}</Mono></>}</span>
+                <span className="text-xs text-muted-foreground">
+                  {ago(r.requestedAt)}
+                  {r.benchSeconds > 0 ? ` · bench ${duration(r.benchSeconds)}` : ""}
+                </span>
+              </div>
+              <p className={cn("text-xs", r.state === "failed" ? "text-destructive" : "text-muted-foreground")}>
+                {r.state === "done" && r.result ? r.result.text : r.state === "failed" || r.state === "cancelled" ? r.error : (r.progress ?? r.state)}
+              </p>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          None yet. An agent asks with <Mono>bb study measure {slug} &lt;A&gt; &lt;B&gt;</Mono> and <Mono>bb study gate {slug} &lt;ref&gt;</Mono>; every number it reports comes from here.
+        </p>
+      )}
+    </Section>
+  );
+}
+
+/** A harvest the plugin ran before v1, read only. */
+function LegacyHarvest({ h, onOpenCandidate }: { h: Harvest; onOpenCandidate: (n: number) => void }) {
+  const a = h.accounting;
+  const onlyMissing = a.missing.length > 0 && (a.gap === null || a.gapHalfWidth === null || Math.abs(a.gap) <= a.gapHalfWidth);
+  const running = false;
   return (
     <>
-      <Section
-        title={`Harvest h${h.seq}`}
-        actions={
-          onRestart ? (
-            <Button size="sm" variant="outline" onClick={onRestart}>
-              Start a new harvest…
-            </Button>
-          ) : null
-        }
-      >
+      <Section title={`Harvest h${h.seq} (drafted before v1, read only)`}>
         <div className="space-y-1 rounded-lg border border-border bg-card px-3 py-2 text-sm">
           <div className="flex flex-wrap items-center gap-2">
             <StatePill state={h.state} />
-            <Progress h={h} />
+            <span className="text-xs text-muted-foreground">The plugin grouped, measured and drafted this harvest itself. Since v1 an agent does that; it can start from these changesets, branches and drafts.</span>
           </div>
           {h.detail ? <p className="text-xs text-muted-foreground" aria-live="polite">{h.detail}</p> : null}
           {h.error ? <ErrorLine error={h.error} /> : null}
@@ -186,7 +379,7 @@ function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart,
         {h.changesets.length ? (
           <ul className="space-y-2" aria-label="Changesets">
             {h.changesets.map((c) => (
-              <ChangesetItem key={c.id} c={c} h={h} slug={slug} rpc={rpc} onOpenCandidate={onOpenCandidate} onChanged={onChanged} />
+              <ChangesetItem key={c.id} c={c} onOpenCandidate={onOpenCandidate} />
             ))}
           </ul>
         ) : running ? (
@@ -212,46 +405,22 @@ function HarvestDetail({ h, slug, o, rpc, onOpenCandidate, onChanged, onRestart,
         </Section>
       ) : null}
 
-      <Section title="Publish and next steps">
-        <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-2 text-sm">
-          {h.published ? <PublishResults prs={h.published} /> : null}
-          {h.publishState === "failed" && !h.published && h.error ? <ErrorLine error={h.error} /> : null}
-          <p className="text-xs text-muted-foreground">
-            {h.publishState === "published" ? "Published as draft PRs on GitHub." : "Dry run so far: local branches only, nothing pushed."}
-            {h.exportDir ? (
-              <>
-                {" "}
-                PR bodies and the report: <Mono>{h.exportDir}</Mono>
-              </>
-            ) : null}
-          </p>
-          <div className="flex flex-wrap items-center gap-2">
-            {h.canPublish ? (
-              <Button size="sm" onClick={() => setPublishing(true)}>
-                <Icon name="GitPullRequest" className="size-4" aria-hidden />
-                Publish draft PRs…
-              </Button>
-            ) : null}
-            {o.state === "harvesting" && !running ? (
-              <Button size="sm" variant="outline" onClick={() => void resume()}>
-                Keep exploring (resume)
-              </Button>
-            ) : null}
-            {o.state !== "archived" && !running ? (
-              <Button size="sm" variant="ghost" onClick={onArchive}>
-                <Icon name="Archive" className="size-4" aria-hidden />
-                Archive…
-              </Button>
-            ) : null}
-            {h.publishCommand ? (
-              <span className="text-xs text-muted-foreground">
-                CLI <Mono>{h.publishCommand}</Mono>
-              </span>
-            ) : null}
+      {h.published || h.exportDir ? (
+        <Section title="Drafts and publishing (before v1)">
+          <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-2 text-sm">
+            {h.published ? <PublishResults prs={h.published} /> : null}
+            <p className="text-xs text-muted-foreground">
+              {h.publishState === "published" ? "Published as draft PRs." : "Local branches only; nothing was pushed."}
+              {h.exportDir ? (
+                <>
+                  {" "}
+                  PR bodies and the report: <Mono>{h.exportDir}</Mono>
+                </>
+              ) : null}
+            </p>
           </div>
-        </div>
-      </Section>
-      {publishing ? <PublishDialog slug={slug} harvestId={h.id} seq={h.seq} rpc={rpc} onClose={() => setPublishing(false)} onDone={onChanged} /> : null}
+        </Section>
+      ) : null}
     </>
   );
 }
@@ -294,85 +463,7 @@ function PublishResults({ prs }: { prs: NonNullable<Harvest["published"]> }) {
   );
 }
 
-function PublishDialog({ slug, harvestId, seq, rpc, onClose, onDone }: { slug: string; harvestId: number; seq: number; rpc: Rpc; onClose: () => void; onDone: () => void }) {
-  const plan = useLive((r) => r.call("study.harvest.plan", { slug, harvestId }), [slug, harvestId], 60_000);
-  const p = plan.data;
-  const pushing = p?.prs.filter((x) => x.push) ?? [];
-  return (
-    <ConfirmDialog
-      open
-      onOpenChange={(x) => !x && onClose()}
-      title={`Publish harvest h${seq} as draft PRs`}
-      description="This pushes branches to GitHub and opens draft PRs. It is a human control, recorded in the audit log, the same as the CLI command."
-      confirmLabel={p ? `Push ${pushing.length} branch${pushing.length === 1 ? "" : "es"} and open draft PRs` : "Publish"}
-      disabled={!p || !p.ok || !pushing.length}
-      onConfirm={async () => {
-        try {
-          const r = await rpc.call("study.harvest.publish", { slug, harvestId, confirm: true });
-          toast.success(r.message.split("\n")[0] ?? r.message);
-        } finally {
-          onDone();
-        }
-      }}
-    >
-      {!p ? (
-        plan.error ? <ErrorLine error={plan.error} retry={plan.refetch} /> : <Skeleton lines={3} label="Checking the remote…" />
-      ) : (
-        <>
-          <p>
-            Remote <Mono className="text-foreground">{p.remote}</Mono>
-            {p.remoteUrl ? (
-              <>
-                {" "}
-                (<Mono>{p.remoteUrl}</Mono>)
-              </>
-            ) : null}
-          </p>
-          {p.problem ? (
-            <Callout tone="alert" title="Publishing can't run yet">
-              {p.problem}
-            </Callout>
-          ) : null}
-          <ul className="space-y-1">
-            {p.prs.map((x) => (
-              <li key={x.k} className="rounded-md border border-border px-2 py-1 text-xs">
-                <div className="font-medium">
-                  #{x.k} {x.title}
-                </div>
-                {x.push ? (
-                  <div className="text-muted-foreground">
-                    push <Mono>{x.branch}</Mono> → draft PR into <Mono>{x.base}</Mono>
-                    {x.stacked ? " (stacked)" : ""}
-                  </div>
-                ) : (
-                  <div className="text-muted-foreground">skipped: {x.skip}</div>
-                )}
-              </li>
-            ))}
-          </ul>
-          <p className="text-xs text-muted-foreground">
-            CLI equivalent: <Mono>bb study harvest {slug} --publish</Mono>
-          </p>
-        </>
-      )}
-    </ConfirmDialog>
-  );
-}
-
-function ChangesetItem({ c, h, slug, rpc, onOpenCandidate, onChanged }: { c: Changeset; h: Harvest; slug: string; rpc: Rpc; onOpenCandidate: (n: number) => void; onChanged: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const choose = async (choice: "keep" | "drop" | null) => {
-    setBusy(true);
-    try {
-      toast.success((await rpc.call("study.harvest.choice", { slug, harvestId: h.id, k: c.k, choice })).message);
-      onChanged();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const editable = h.state === "ready" && h.publishState !== "published";
+function ChangesetItem({ c, onOpenCandidate }: { c: Changeset; onOpenCandidate: (n: number) => void }) {
   return (
     <li className={cn("space-y-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm", c.choice === "drop" && "opacity-70")}>
       <div className="flex flex-wrap items-center gap-2">
@@ -434,18 +525,6 @@ function ChangesetItem({ c, h, slug, rpc, onOpenCandidate, onChanged }: { c: Cha
         {c.pr.published && c.pr.published.status !== "opened" ? <span className="text-destructive">publish: {c.pr.published.status}{c.pr.published.detail ? ` (${c.pr.published.detail})` : ""}</span> : null}
       </div>
       {c.rationale ? <p className="whitespace-pre-wrap text-xs">{c.rationale}</p> : null}
-      {editable && c.droppable && c.canDrop ? (
-        <fieldset className="flex flex-wrap items-center gap-3 text-xs">
-          <legend className="sr-only">Publish #{c.k}?</legend>
-          <span className="text-muted-foreground">No measurable contribution. Publish it anyway?</span>
-          <label className="flex items-center gap-1">
-            <input type="radio" name={`choice-${c.id}`} disabled={busy} checked={c.choice !== "drop"} onChange={() => void choose("keep")} /> Keep (publish)
-          </label>
-          <label className="flex items-center gap-1">
-            <input type="radio" name={`choice-${c.id}`} disabled={busy} checked={c.choice === "drop"} onChange={() => void choose("drop")} /> Drop (skip when publishing)
-          </label>
-        </fieldset>
-      ) : null}
       {c.pr.body ? (
         <details className="text-xs">
           <summary className="cursor-pointer text-muted-foreground">PR preview{c.pr.title ? `: ${c.pr.title}` : ""}</summary>

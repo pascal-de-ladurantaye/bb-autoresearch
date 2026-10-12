@@ -2,9 +2,11 @@
 // Pure functions of the store (plus the engine's scheduler view), bounded.
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
-import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
-import type { StackRecord } from "./harvest.ts";
-import { dependencyReasons, prOrder, stackOrderText } from "./harvest-math.ts";
+import type { AdhocRunRow, CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
+import { frozenRef, type Promotion } from "./harvest.ts";
+import { dependencyReasons, prOrder, stackOrderText, type StackRecord } from "./harvest-legacy.ts";
+import { commitParts } from "./commit.ts";
+import { adhocLine, adhocResult } from "./primitives.ts";
 import { changeFrom, changeWords, checkLimit, headroomWords, rangeWords, type GuardrailCalibration, type Position, type StoredGuardrails } from "./guardrails.ts";
 import { BENCH_BOUND_STAGES, bestGuardrailPositions, evalTimes, studySingleMachine } from "./pipeline.ts";
 import { singleMachineText } from "./single-machine.ts";
@@ -509,6 +511,8 @@ export function candidateRow(engine: Engine, c: CandidateRow, ideaTitle: string 
     /** pass/fail only: holdout numbers never leave the plugin database. */
     holdout: c.holdout,
     summary: clip(c.summary.split("\n")[0] ?? "", 200),
+    /** The commit title: the worker's (v1), or for older candidates the idea title or the summary's first line. */
+    title: commitParts(c, ideaTitle).title,
     submittedAt: c.submitted_at,
     decidedAt: c.decided_at,
   };
@@ -548,6 +552,8 @@ export async function candidateDetail(engine: Engine, s: StudyRow, n: number) {
     /** Every recorded metric: primary, guardrails (limit and status), informational. */
     metricRows: metricsTable(spec, c.metrics_json),
     summaryFull: c.summary,
+    /** The commit message the worker wrote (used verbatim for the candidate and, if promoted, its commit on best), without the plugin's trailers. */
+    commit: { ...commitParts(c, idea?.title ?? null), fromWorker: c.commit_title !== null },
     sha: c.sha,
     preparedSha: c.prepared_sha,
     promotedSha: c.promoted_sha,
@@ -1002,9 +1008,8 @@ function changesetView(c: ChangesetRow, all: ChangesetRow[], ctx: { total: numbe
     /** The contribution as a share of the base→best gain, in points and units (null when not measured alone). */
     contribution: contributionView({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, ctx.total, ctx.vsBase, ctx.bestRaw, ctx.metric),
     droppable: c.droppable === 1,
-    /** The human's choice for this changeset; dropping is only possible when nothing builds on it. */
+    /** The human's keep/drop choice, when one was made before v1. */
     choice: c.human_choice,
-    canDrop: neededBy.length === 0 && c.folded_into === null && !all.some((x) => x.folded_into === c.id),
     dependsOn: (safeJson<number[]>(c.depends_on_json) ?? []).map(k).filter((x): x is number => x !== null),
     neededBy,
     dependencyReason: c.dependency_reason,
@@ -1058,17 +1063,64 @@ interface PublishedPrLite {
 function harvestSummary(engine: Engine, s: StudyRow) {
   const h = engine.ctx.store.latestHarvest(s.id);
   if (!h) return null;
-  return { id: h.id, seq: h.seq, state: h.state, detail: h.phase_detail, changesets: engine.ctx.store.changesets(h.id).length, startedAt: h.started_at, finishedAt: h.finished_at, publishState: h.publish_state };
+  return { id: h.id, seq: h.seq, state: h.state, detail: h.phase_detail, changesets: engine.ctx.store.changesets(h.id).length, startedAt: h.started_at, finishedAt: h.finished_at, publishState: h.publish_state, frozenRef: h.best_sha ? frozenRef(s.slug, h.seq) : null };
 }
 
-/** Harvest tab: the latest harvest's changesets, ablations, dependency stacks, PR drafts, accounting and publish state. */
-export function harvestView(engine: Engine, s: StudyRow) {
+/** A `bb study measure` / `bb study gate` run, for the Harvest tab and the CLI. */
+export function adhocRunView(r: AdhocRunRow) {
+  const result = adhocResult(r);
+  return {
+    id: r.id,
+    /** Shown as r<seq>. */
+    seq: r.seq,
+    kind: r.kind,
+    refA: r.ref_a,
+    refB: r.ref_b,
+    shaA: r.sha_a,
+    shaB: r.sha_b,
+    hostId: r.host_id,
+    pairs: r.pairs,
+    state: r.state,
+    progress: r.progress,
+    error: r.error,
+    actor: r.actor,
+    benchSeconds: r.bench_seconds,
+    requestedAt: r.requested_at,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    /** One line: what was asked and what came out. */
+    line: adhocLine(r),
+    result,
+  };
+}
+
+/** The agent-harvest guide: what to ask an agent, and the commands it uses. */
+export function harvestGuide(slug: string) {
+  return {
+    prompt: `Harvest the autoresearch study \`${slug}\` into pull requests with the study-harvest skill. Propose the grouping and stacks first; don't push or open PRs until I say so.`,
+    commands: [
+      { command: `bb study evidence ${slug} --json`, what: "every candidate, commit message, verdict, measurement, finding and the frozen best, as stable JSON" },
+      { command: `bb study measure ${slug} <A> <B>`, what: "B against A with the study's protocol, guardrails and bench hosts (counts as bench time)" },
+      { command: `bb study gate ${slug} <ref>`, what: "the study's gates on any commit" },
+      { command: `bb study results ${slug}`, what: "the measurements and gates asked for so far" },
+    ],
+  };
+}
+
+/**
+ * Harvest tab: the selected (default: latest) harvest. A v1 harvest is a
+ * freeze: base, best, the frozen ref and the promotions, plus the
+ * measurements and gates agents asked for. Harvests the plugin ran before v1
+ * show read-only: changesets, ablations, stacks, PR drafts, publish results.
+ */
+export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
   const { store } = engine.ctx;
   const spec = specOf(engine, s);
   const metric = metricOf(spec);
   const all = store.harvests(s.id);
-  const h: HarvestRow | undefined = all[0];
-  const canStartState = ["running", "paused"].includes(s.state) || (s.state === "harvesting" && (!h || ["ready", "failed", "cancelled"].includes(h.state)));
+  const latest: HarvestRow | undefined = all[0];
+  const h: HarvestRow | undefined = harvestId !== undefined ? all.find((x) => x.id === harvestId) : latest;
+  const canStartState = ["running", "paused"].includes(s.state) || (s.state === "harvesting" && (!latest || !["waiting", "frozen"].includes(latest.state)));
   const promotions = store.candidates(s.id, { stages: ["decided"] }).filter((c) => c.verdict === "win").length;
   const canStart = canStartState && promotions > 0;
   const cannotStartReason = canStart
@@ -1076,8 +1128,11 @@ export function harvestView(engine: Engine, s: StudyRow) {
     : promotions === 0
       ? "Nothing to harvest yet: no candidate has been promoted to best."
       : s.state === "harvesting"
-        ? "A harvest is still running; wait for it to finish (or resume the study to cancel it)."
+        ? latest?.state === "waiting"
+          ? "Best is about to freeze: in-flight candidates finish first."
+          : "Best is frozen for this harvest. Resume the study to keep exploring."
         : `Harvest starts from Running or Paused (the study is ${s.state}).`;
+  const runs = store.adhocRuns(s.id, { limit: 20 }).map(adhocRunView);
   const base = {
     slug: s.slug,
     state: s.state,
@@ -1085,9 +1140,17 @@ export function harvestView(engine: Engine, s: StudyRow) {
     canStart,
     cannotStartReason,
     startCommand: `bb study harvest ${s.slug}`,
-    history: all.map((x) => ({ id: x.id, seq: x.seq, state: x.state, startedAt: x.started_at, finishedAt: x.finished_at, publishState: x.publish_state })),
+    history: all.map((x) => ({ id: x.id, seq: x.seq, state: x.state, startedAt: x.started_at, finishedAt: x.finished_at, publishState: x.publish_state, legacy: isLegacyHarvest(engine, x) })),
+    /** Measurements and gates agents asked for (`bb study measure|gate`), newest first. */
+    runs,
+    guide: harvestGuide(s.slug),
   };
   if (!h) return { ...base, harvest: null };
+  const legacy = isLegacyHarvest(engine, h);
+  const frozenPromotions = (safeJson<Promotion[]>(h.promotions_json) ?? []).map((p) => {
+    const c = p.n !== null ? store.candidateByN(s.id, p.n) : undefined;
+    return { sha: p.sha, n: p.n, title: p.title, body: p.body ?? null, files: p.paths.length, paths: p.paths.slice(0, 50), effect: c?.effect ?? null, ciLo: c?.ci_lo ?? null, ciHi: c?.ci_hi ?? null, effectText: c?.effect !== null && c?.effect !== undefined ? improvementText(c.effect, metric, { factor: false }) : null };
+  });
   const cs = store.changesets(h.id);
   const stacks = safeJson<StackRecord[]>(h.stacks_json) ?? [];
   const acc = accountingFor(engine.ctx, h);
@@ -1113,6 +1176,12 @@ export function harvestView(engine: Engine, s: StudyRow) {
       /** Shown as h<seq>: the harvest's number within the study (id stays internal). */
       seq: h.seq,
       state: h.state,
+      /** Made by the plugin before v1 (grouping, ablation, PR drafts): read-only. */
+      legacy,
+      /** refs/studies/<slug>/harvest/h<seq>, pinning the frozen best (null before best froze). */
+      frozenRef: h.best_sha && !legacy ? frozenRef(s.slug, h.seq) : null,
+      /** The promotions on best at the freeze, oldest first, with each one's commit message and its effect when promoted. */
+      promotions: frozenPromotions,
       detail: h.phase_detail,
       error: h.error,
       fromState: h.from_state,
@@ -1164,15 +1233,18 @@ export function harvestView(engine: Engine, s: StudyRow) {
       publisher: h.publisher,
       publishState: h.publish_state,
       exportDir: h.export_dir,
-      /** GitHub publish results per PR (URLs or errors), once a publish ran. */
+      /** GitHub publish results per PR (URLs or errors) of a harvest published before v1. */
       published: githubPrs.length ? githubPrs : null,
-      canPublish: h.state === "ready" && h.publish_state !== "published" && h.publish_state !== "publishing",
-      publishCommand: h.state === "ready" && h.publish_state !== "published" ? `bb study harvest ${s.slug} --publish` : null,
       benchSeconds: h.bench_seconds,
       startedAt: h.started_at,
       finishedAt: h.finished_at,
     },
   };
+}
+
+/** A harvest the plugin ran before v1: it has changesets, or stopped in one of the old phases. */
+function isLegacyHarvest(engine: Engine, h: HarvestRow): boolean {
+  return ["grouping", "ablating", "checking", "drafting", "ready"].includes(h.state) || engine.ctx.store.changesets(h.id).length > 0 || h.grouping_source !== null;
 }
 
 export type FindingsView = ReturnType<typeof findingsView>;
@@ -1531,9 +1603,8 @@ export interface NeedsYouItem {
     | "bench_unhealthy"
     | "bench_offline"
     | "remote_bench"
-    | "harvest_ready"
-    | "harvest_failed"
-    | "publish_failed";
+    | "harvest_frozen"
+    | "harvest_failed";
   /** "alert": something is broken; "action": a decision waits for you. */
   tone: "alert" | "action";
   title: string;
@@ -1628,7 +1699,7 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
   if (s.state === "paused" && pause.system) {
     const reason = clip(s.pause_reason ?? "", 300);
     if (pause.kind === "budget") {
-      items.push({ id: "budget_exhausted", kind: "budget_exhausted", tone: "action", title: "Budget used up: harvest the wins", short: "harvest ready to start", detail: `${reason}. Harvest turns the promotions into reviewable PRs (a dry run: nothing is pushed).`, tab: "harvest", action: { kind: "harvest" }, command: `bb study harvest ${slug}`, at: pause.at });
+      items.push({ id: "budget_exhausted", kind: "budget_exhausted", tone: "action", title: "Budget used up: harvest the wins", short: "harvest ready to start", detail: `${reason}. Harvest freezes best so an agent can turn the promotions into PRs (nothing is pushed unless you ask).`, tab: "harvest", action: { kind: "harvest" }, command: `bb study harvest ${slug}`, at: pause.at });
     } else if (pause.kind === "drift" && /^automatic recalibration failed/u.test(reason)) {
       items.push({ id: "drift", kind: "drift", tone: "alert", title: "Paused: recalibrating on best's shorter runs failed", short: "recalibration failed", detail: `${reason}.`, tab: "oracle", action: { kind: "resume" }, command: `bb study resume ${slug}`, at: pause.at });
     } else if (pause.kind === "drift") {
@@ -1675,21 +1746,23 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
   }
   const h = store.latestHarvest(s.id);
   if (h && s.state === "harvesting") {
-    if (h.state === "ready" && h.publish_state !== "published") {
+    if (h.state === "frozen" || (h.state === "ready" && h.publish_state !== "published")) {
+      // Best is frozen: the harvest itself (grouping, PRs, publishing) is an agent's job now.
+      const legacy = h.state === "ready";
       items.push({
-        id: `harvest_ready:${h.id}`,
-        kind: h.publish_state === "failed" ? "publish_failed" : "harvest_ready",
-        tone: h.publish_state === "failed" ? "alert" : "action",
-        title: h.publish_state === "failed" ? `Publishing harvest h${h.seq} failed` : `Harvest h${h.seq} is ready for review`,
-        short: h.publish_state === "failed" ? "publish failed" : "harvest ready",
-        detail: h.publish_state === "failed" ? clip(h.error ?? "see the Harvest tab for each PR's result", 300) : `${store.changesets(h.id).length} changeset(s) with measured contributions. Review them, then publish draft PRs, keep exploring, or archive.`,
+        id: `harvest_frozen:${h.id}`,
+        kind: "harvest_frozen",
+        tone: "action",
+        title: legacy ? `Harvest h${h.seq} (drafted before v1): ask an agent to finish it` : `Best is frozen (harvest h${h.seq}): ask an agent to harvest it`,
+        short: "harvest with an agent",
+        detail: `${legacy ? `Its ${store.changesets(h.id).length} changeset(s) and PR drafts stay on the Harvest tab.` : `${(safeJson<Promotion[]>(h.promotions_json) ?? []).length} promotion(s) on best.`} Ask an agent (the study thread works) to harvest it with the study-harvest skill; it publishes only when you ask. Or keep exploring, or archive.`,
         tab: "harvest",
         action: { kind: "open_harvest" },
-        command: `bb study harvest ${slug}`,
+        command: `bb study evidence ${slug}`,
         at: h.finished_at,
       });
     } else if (h.state === "failed") {
-      items.push({ id: `harvest_failed:${h.id}`, kind: "harvest_failed", tone: "alert", title: `Harvest h${h.seq} failed`, short: "harvest failed", detail: clip(h.error ?? "", 300), tab: "harvest", action: { kind: "open_harvest" }, command: `bb study harvest ${slug} --restart`, at: h.finished_at });
+      items.push({ id: `harvest_failed:${h.id}`, kind: "harvest_failed", tone: "alert", title: `Harvest h${h.seq} failed`, short: "harvest failed", detail: clip(h.error ?? "", 300), tab: "harvest", action: { kind: "open_harvest" }, command: `bb study harvest ${slug}`, at: h.finished_at });
     }
   }
   const order = { alert: 0, action: 1 } as const;
@@ -1773,7 +1846,7 @@ export function noticeAction(
       return { label: "See budget", tab: "overview", command: `bb study show ${slug}` };
     case "budget.exhausted":
       // Offer to start a harvest only while one can start (paused on the budget); once it runs or is ready, open it.
-      if (s.state === "harvesting") return { label: harvest?.state === "ready" ? "Review harvest" : "Open Harvest", tab: "harvest", command: `bb study harvest ${slug}` };
+      if (s.state === "harvesting") return { label: "Open Harvest", tab: "harvest", command: `bb study harvest ${slug}` };
       if (s.state === "archived") return harvest ? { label: "Open Harvest", tab: "harvest", command: `bb study harvest ${slug}` } : null;
       if (known && s.state !== "paused") return { label: "See budget", tab: "overview", command: `bb study show ${slug}` };
       return { label: "Start harvest", tab: "harvest", command: `bb study harvest ${slug}` };
@@ -1787,6 +1860,7 @@ export function noticeAction(
       return { label: "Open Bench", tab: "bench", command: `bb study bench ${slug}` };
     case "stall":
       return { label: "Steer the ideas", tab: "ideas", command: `bb study ideas add ${slug} "<idea>"` };
+    case "harvest.frozen":
     case "harvest.ready":
     case "harvest.failed":
       return { label: "Open Harvest", tab: "harvest", command: `bb study harvest ${slug}` };

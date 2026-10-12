@@ -213,7 +213,8 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
       {o.harvest ? (
         <p className="text-sm">
           Harvest h{o.harvest.seq}: {o.harvest.state}
-          {o.harvest.detail ? ` (${o.harvest.detail})` : ""} · {o.harvest.changesets} changeset(s) · started {ago(o.harvest.startedAt)}{" "}
+          {o.harvest.detail ? ` (${o.harvest.detail})` : ""}
+          {o.harvest.changesets ? ` · ${o.harvest.changesets} changeset(s) (before v1)` : o.harvest.frozenRef ? " · best frozen for an agent to harvest" : ""} · started {ago(o.harvest.startedAt)}{" "}
           <button type="button" className="rounded underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => go("harvest")}>
             Open Harvest
           </button>
@@ -239,7 +240,7 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
         </ul>
       </details>
 
-      {dialog === "harvest" ? <HarvestDialog slug={o.slug} promotions={promotions} restart={false} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
+      {dialog === "harvest" ? <HarvestDialog slug={o.slug} promotions={promotions} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
       {dialog === "archive" ? <ArchiveDialog slug={o.slug} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
     </div>
   );

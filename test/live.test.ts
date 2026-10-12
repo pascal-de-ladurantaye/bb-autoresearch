@@ -271,7 +271,7 @@ describe("live recorder and view (fake host)", () => {
   async function submit(thread: string, tree: string, value: number) {
     host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     host.metric.set(tree, value);
-    return await engine.submit(thread, `change ${tree}`);
+    return await engine.submit(thread, { title: `change ${tree}` });
   }
 
   function events(studyId: string) {

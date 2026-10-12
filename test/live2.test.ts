@@ -250,7 +250,7 @@ describe("live view part 2 (fake host)", () => {
   async function submit(thread: string, tree: string, value: number) {
     host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     host.metric.set(tree, value);
-    return await engine.submit(thread, `change ${tree}`);
+    return await engine.submit(thread, { title: `change ${tree}` });
   }
   const actions = (id: string) => store.eventsAsc(id, { kinds: ["worker.action"] }).map((e) => ({ at: e.at, ...safeJson<{ worker: number; label: string }>(e.data_json)! }));
 
@@ -494,7 +494,7 @@ describe("replay at time t equals the live view at t", () => {
       clock.advance(700);
       host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
       host.metric.set(tree, value);
-      await engine.submit(thread, `change ${tree}`);
+      await engine.submit(thread, { title: `change ${tree}` });
       snap();
       await engine.settle();
       snap();
@@ -581,7 +581,7 @@ describe("plugin reload during a measurement", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     let first: Engine | null = null;
     await createAutoresearchPlugin({ port: () => port, seed: 1, onEngine: (e) => (first = e) })(fake.bb);
     const h = fake.harness;
@@ -601,7 +601,7 @@ describe("plugin reload during a measurement", () => {
     };
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await h.behavior.callAgentTool("study_submit_candidate", { summary: "smaller output" }, { threadId: "thr_w1" });
+    await h.behavior.callAgentTool("study_submit_candidate", { title: "smaller output" }, { threadId: "thr_w1" });
     expect(await waitFor(() => measuring)).toBe(true);
     const old = first! as Engine;
     const logsAt = port.logs.length;

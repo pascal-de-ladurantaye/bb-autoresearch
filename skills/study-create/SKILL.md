@@ -137,11 +137,6 @@ max_submissions_per_worker = 3
 max_rate_limit_retries = 3       # rate-limited turns retried at the window reset
 usage_tight_percent = 90         # a provider window at this % halves W
 
-[harvest]
-measure_standalone = true        # also measure each PR's effect on its base (bench time)
-group_timeout_minutes = 10       # wait this long for study_propose_harvest, then one changeset per win
-remote = "origin"                # the GitHub remote `--publish` pushes to
-
 [git]
 identity = "repo"                # optional: "repo" commits as the repo's git identity (falls back to the plugin's); "plugin" as autoresearch <autoresearch@bb.local>
 ```

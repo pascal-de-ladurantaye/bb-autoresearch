@@ -174,6 +174,9 @@ export interface CandidateRow {
   worker_id: number | null;
   /** Seconds its gates ran (single-machine mode: holding the bench lock). */
   gate_seconds: number;
+  /** The worker's commit title and body (v1); null for candidates submitted before v1 (their message came from the idea and summary). */
+  commit_title: string | null;
+  commit_body: string | null;
 }
 
 export interface FindingRow {
@@ -198,8 +201,12 @@ export interface EventRow {
   data_json: string;
 }
 
-/** What held the bench lock: a measurement, a profile, calibration, a drift check, a harvest measurement, or (single-machine mode) a gate. */
-export type BenchIntervalKind = "measure" | "profile" | "calibration" | "drift" | "harvest" | "gate";
+/**
+ * What held the bench lock: a measurement, a profile, calibration, a drift
+ * check, a harvest measurement (before v1), a measurement or gate an agent
+ * asked for (`bb study measure` / `bb study gate`), or (single-machine mode) a gate.
+ */
+export type BenchIntervalKind = "measure" | "profile" | "calibration" | "drift" | "harvest" | "adhoc" | "gate";
 
 export interface BenchIntervalRow {
   id: number;
@@ -365,7 +372,15 @@ export interface ResolvedBenchHost {
   mode: BenchMode;
 }
 
-export const HARVEST_STATES = ["waiting", "grouping", "ablating", "checking", "drafting", "ready", "failed", "cancelled"] as const;
+/**
+ * v1 harvests are `waiting` (in-flight candidates finish) then `frozen` (best
+ * is fixed; an agent harvests it with `bb study evidence|measure|gate`).
+ * `grouping` … `ready` are the states of harvests the plugin ran before v1;
+ * those records stay readable.
+ */
+export const HARVEST_STATES = ["waiting", "frozen", "grouping", "ablating", "checking", "drafting", "ready", "failed", "cancelled"] as const;
+/** Harvest states of the plugin-run harvests before v1 that were still in progress (they stop at the upgrade). */
+export const LEGACY_ACTIVE_HARVEST_STATES = ["grouping", "ablating", "checking", "drafting"] as const;
 export type HarvestState = (typeof HARVEST_STATES)[number];
 
 export interface HarvestRow {
@@ -382,7 +397,7 @@ export interface HarvestRow {
   segment: number | null;
   host_id: string | null;
   proposal_id: number | null;
-  /** Promotions on best (harvest-math Promotion[]), set once the bench drained. */
+  /** Promotions on best (harvest.ts Promotion[]), set when best froze. */
   promotions_json: string | null;
   grouping_source: "strategist" | "fallback" | null;
   grouping_notes: string | null;
@@ -460,6 +475,38 @@ export interface ChangesetRow {
   fold_reason: string | null;
   /** Position in its stack's PR order (1 = bottom); folded changesets share their host's. */
   layer: number | null;
+}
+
+export type AdhocKind = "measure" | "gate";
+export type AdhocState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/** A measurement (A/B) or gate run an agent or the human asked for. */
+export interface AdhocRunRow {
+  id: number;
+  study_id: string;
+  /** Its number within the study (shown as r<seq>). */
+  seq: number;
+  kind: AdhocKind;
+  /** The reference side as asked (measure only) and the commit it resolved to. */
+  ref_a: string | null;
+  ref_b: string;
+  sha_a: string | null;
+  sha_b: string;
+  /** The bench host it ran on (measure), or the edit host (gate). */
+  host_id: string | null;
+  /** Pairs asked for (measure; null: the study's n_max). */
+  pairs: number | null;
+  state: AdhocState;
+  progress: string | null;
+  /** primitives.ts MeasureResult / GateResult. */
+  result_json: string | null;
+  error: string | null;
+  /** Thread id of the caller, or "human". */
+  actor: string;
+  bench_seconds: number;
+  requested_at: number;
+  started_at: number | null;
+  finished_at: number | null;
 }
 
 export interface Budget {
@@ -786,13 +833,13 @@ export class Store {
   nextCandidateNumber(studyId: string): number {
     return ((this.db.prepare(`SELECT COALESCE(MAX(n), 0) AS n FROM candidates WHERE study_id = ?`).get(studyId) as { n: number }).n) + 1;
   }
-  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json"> & Partial<Pick<CandidateRow, "lines_added" | "lines_deleted" | "worker_id">>): CandidateRow {
+  insertCandidate(row: Pick<CandidateRow, "study_id" | "n" | "idea_id" | "thread_id" | "sha" | "parent_sha" | "summary" | "stage" | "changed_paths_json"> & Partial<Pick<CandidateRow, "lines_added" | "lines_deleted" | "worker_id" | "commit_title" | "commit_body">>): CandidateRow {
     const r = this.db
       .prepare(
-        `INSERT INTO candidates (study_id, n, idea_id, thread_id, worker_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at, lines_added, lines_deleted)
-         VALUES (@study_id, @n, @idea_id, @thread_id, @worker_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at, @lines_added, @lines_deleted)`,
+        `INSERT INTO candidates (study_id, n, idea_id, thread_id, worker_id, sha, parent_sha, summary, stage, changed_paths_json, submitted_at, lines_added, lines_deleted, commit_title, commit_body)
+         VALUES (@study_id, @n, @idea_id, @thread_id, @worker_id, @sha, @parent_sha, @summary, @stage, @changed_paths_json, @submitted_at, @lines_added, @lines_deleted, @commit_title, @commit_body)`,
       )
-      .run({ lines_added: 0, lines_deleted: 0, worker_id: null, ...row, submitted_at: this.now() });
+      .run({ lines_added: 0, lines_deleted: 0, worker_id: null, commit_title: null, commit_body: null, ...row, submitted_at: this.now() });
     const c = this.candidate(Number(r.lastInsertRowid))!;
     this.event(c.study_id, "candidate.stage", "plugin", { candidate: c.id, n: c.n, from: null, to: c.stage, worker: c.thread_id, ...(c.worker_id !== null ? { worker_row: c.worker_id } : {}) });
     return c;
@@ -990,27 +1037,45 @@ export class Store {
     });
   }
 
-  addHarvestProposal(studyId: string, proposal: unknown, authorThreadId: string, harvestId: number | null = null): number {
-    const r = this.db
-      .prepare(`INSERT INTO harvest_proposals (study_id, proposal_json, author_thread_id, created_at, harvest_id) VALUES (?, ?, ?, ?, ?)`)
-      .run(studyId, JSON.stringify(proposal), authorThreadId, this.now(), harvestId);
-    this.event(studyId, "harvest.proposed", authorThreadId, { proposal: Number(r.lastInsertRowid), harvest: harvestId });
-    return Number(r.lastInsertRowid);
-  }
-  harvestProposal(harvestId: number): { id: number; proposal_json: string; author_thread_id: string | null; created_at: number } | undefined {
-    return this.db.prepare(`SELECT id, proposal_json, author_thread_id, created_at FROM harvest_proposals WHERE harvest_id = ? ORDER BY id DESC LIMIT 1`).get(harvestId) as
-      | { id: number; proposal_json: string; author_thread_id: string | null; created_at: number }
-      | undefined;
-  }
-
-  // ---- harvests (M3) ----
-  insertHarvest(row: Pick<HarvestRow, "study_id" | "from_state" | "measure_standalone"> & { grouping_source?: "fallback" | null }, actor: string): HarvestRow {
+  // ---- measurements and gates agents ask for (v1) ----
+  insertAdhocRun(row: Pick<AdhocRunRow, "study_id" | "kind" | "ref_a" | "ref_b" | "sha_a" | "sha_b" | "host_id" | "pairs" | "actor">): AdhocRunRow {
     return this.tx(() => {
       const r = this.db
         .prepare(
-          `INSERT INTO harvests (study_id, seq, state, from_state, measure_standalone, started_at, grouping_source, grouping_notes) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM harvests WHERE study_id = ?), 'waiting', ?, ?, ?, ?, ?)`,
+          `INSERT INTO adhoc_runs (study_id, seq, kind, ref_a, ref_b, sha_a, sha_b, host_id, pairs, state, actor, requested_at)
+           VALUES (@study_id, (SELECT COALESCE(MAX(seq), 0) + 1 FROM adhoc_runs WHERE study_id = @study_id), @kind, @ref_a, @ref_b, @sha_a, @sha_b, @host_id, @pairs, 'queued', @actor, @requested_at)`,
         )
-        .run(row.study_id, row.study_id, row.from_state, row.measure_standalone, this.now(), row.grouping_source ?? null, row.grouping_source === "fallback" ? "one changeset per promotion, as you asked" : null);
+        .run({ ...row, requested_at: this.now() });
+      return this.adhocRun(Number(r.lastInsertRowid))!;
+    });
+  }
+  adhocRun(id: number): AdhocRunRow | undefined {
+    return this.db.prepare(`SELECT * FROM adhoc_runs WHERE id = ?`).get(id) as AdhocRunRow | undefined;
+  }
+  adhocRunBySeq(studyId: string, seq: number): AdhocRunRow | undefined {
+    return this.db.prepare(`SELECT * FROM adhoc_runs WHERE study_id = ? AND seq = ?`).get(studyId, seq) as AdhocRunRow | undefined;
+  }
+  /** Newest first. */
+  adhocRuns(studyId: string, opts: { limit?: number; states?: AdhocState[] } = {}): AdhocRunRow[] {
+    const states = opts.states?.length ? ` AND state IN (${opts.states.map(() => "?").join(",")})` : "";
+    return this.db.prepare(`SELECT * FROM adhoc_runs WHERE study_id = ?${states} ORDER BY id DESC LIMIT ?`).all(studyId, ...(opts.states ?? []), opts.limit ?? 50) as AdhocRunRow[];
+  }
+  /** Every queued or running one, all studies (reconciliation after a reload). */
+  unfinishedAdhocRuns(): AdhocRunRow[] {
+    return this.db.prepare(`SELECT * FROM adhoc_runs WHERE state IN ('queued','running') ORDER BY id`).all() as AdhocRunRow[];
+  }
+  updateAdhocRun(id: number, patch: Partial<Omit<AdhocRunRow, "id" | "study_id" | "seq">>): void {
+    const keys = Object.keys(patch);
+    if (!keys.length) return;
+    this.db.prepare(`UPDATE adhoc_runs SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE id = @__id`).run({ ...patch, __id: id });
+  }
+
+  // ---- harvests (M3) ----
+  insertHarvest(row: Pick<HarvestRow, "study_id" | "from_state">, actor: string): HarvestRow {
+    return this.tx(() => {
+      const r = this.db
+        .prepare(`INSERT INTO harvests (study_id, seq, state, from_state, started_at) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM harvests WHERE study_id = ?), 'waiting', ?, ?)`)
+        .run(row.study_id, row.study_id, row.from_state, this.now());
       const id = Number(r.lastInsertRowid);
       this.event(row.study_id, "harvest.started", actor, { harvest: id, seq: this.harvest(id)!.seq, from: row.from_state });
       return this.harvest(id)!;

@@ -140,12 +140,12 @@ describe("pipeline: the ignore list reaches the snapshot; the worker hears what 
     await engine.settle();
     host.metric.set("T1", 900);
     host.nextSnapshot = { tree: "T1", changedPaths: ["src/a.py"], addedPaths: [], ignoredPaths: ["src/__pycache__/a.cpython-312.pyc"] };
-    const ticket = await engine.submit("thr_w1", "first");
+    const ticket = await engine.submit("thr_w1", { title: "first" });
     expect(host.snapshotInputs.at(-1)!.ignore).toEqual([...DEFAULT_IGNORE]);
     expect(ticket).toContain("Left out 1 untracked build output(s) or cache file(s) matching [scope] ignore (e.g. src/__pycache__/a.cpython-312.pyc); they are never committed.");
     await engine.settle();
     host.nextSnapshot = { tree: "T2", changedPaths: ["src/a.py", "src/__pycache__/a.pyc"], addedPaths: ["src/__pycache__/a.pyc"] };
-    const rejected = await engine.submit("thr_w1", "second");
+    const rejected = await engine.submit("thr_w1", { title: "second" });
     expect(rejected).toContain("REJECTED (scope)");
     expect(rejected).toContain("adds files the study ignores as build outputs or caches");
   });

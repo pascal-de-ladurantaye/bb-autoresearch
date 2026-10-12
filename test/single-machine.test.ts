@@ -92,7 +92,7 @@ async function setup(toml: string, opts: { clock?: Clock; ideas?: number } = {})
   const submit = async (thread: string, tree: string, value: number) => {
     host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     host.metric.set(tree, value);
-    return await engine.submit(thread, `change ${tree} for speed`);
+    return await engine.submit(thread, { title: `change ${tree} for speed` });
   };
   return { host, engine, id, submit, ...made };
 }
