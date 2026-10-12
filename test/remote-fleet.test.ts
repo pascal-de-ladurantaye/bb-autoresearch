@@ -488,6 +488,8 @@ describe("remote bench hosts (example provider, real git)", () => {
     for (const r of rows.slice(1, 3)) expect(r.left_reason).toMatch(/^much noisier than the other bench hosts: noise floor/u);
     expect(store.events(sid, { kinds: ["bench.noisy_host"] }).map((e) => JSON.parse(e.data_json).action).reverse()).toEqual(["replaced", "replaced", "replaced", "kept"]);
     expect(store.notices(sid).some((n) => n.kind === "bench.noisy_host" && n.text.includes("after 2 replacement(s) in a row"))).toBe(true);
+    // From now on the entry's machines are kept (a recalibration keeps this one too).
+    expect(engine.fleet.acceptsNoisy(store.study(SLUG)!, rows[3]!.bench_host_id)).toBe(true);
     // The quiet edit host measures first; the kept machine measures with its own (larger) win threshold.
     const local = store.benchHosts(sid).find((h) => h.mode !== "remote")!;
     const remote = store.benchHosts(sid).find((h) => h.mode === "remote")!;

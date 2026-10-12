@@ -113,13 +113,21 @@ export function hostThresholdsText(hosts: ReadonlyArray<{ name: string; mde: num
 
 /** Why a host was taken out or replaced, in words. */
 export function noisyHostText(h: NoisyHost, limit: number, unit: string): string {
-  return `noise floor ${pct(h.noise)} ${unit}, ${h.ratio.toFixed(1)}× the ${pct(h.peers)} median of the other bench hosts (max_host_noise_ratio ${limit})`;
+  return `noise floor ${pct(h.noise)} ${unit}, ${h.ratio.toFixed(1)}× the ${pct(h.peers)} median of the other bench hosts, above max_host_noise_ratio ${limit}`;
 }
 
 /** A host above the ratio that chance could explain: it keeps measuring, and calibration says so. */
 export function unclearNoisyHostText(h: NoisyHost, limit: number, unit: string, samples: number, sampleWord: string): string {
   return `${h.name}'s noise floor (${pct(h.noise)} ${unit}) is ${h.ratio.toFixed(1)}× the ${pct(h.peers)} median of the other bench hosts, above max_host_noise_ratio ${limit}, but with ${samples} calibration ${sampleWord} two equal hosts differ that much by chance (it would take more than ${h.needed.toFixed(1)}×): it keeps measuring, with its own win threshold. More calibration ${sampleWord} would tell them apart`;
 }
+
+/**
+ * How many machines in a row an entry replaces for being much noisier than
+ * the other bench hosts; the next one is kept (it measures with its own win
+ * threshold, and dispatch prefers quieter hosts), so a provider whose
+ * machines are all noisier than the edit host doesn't churn forever.
+ */
+export const NOISY_REPLACEMENTS = 2;
 
 /** What `excluded_json` holds. */
 export interface ExcludedHost {

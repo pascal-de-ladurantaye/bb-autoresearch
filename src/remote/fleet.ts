@@ -29,7 +29,8 @@ import { BenchProviderError, LEAVING_STATES, type DescribeOutput, type HostState
 import { RemoteBenchRunner, RemoteHostLostError } from "../bench-provider/runner.ts";
 import { HealthError, calibrateHost } from "../calibration.ts";
 import { guardrailProblems } from "../guardrails.ts";
-import { chanceRatio, noisyAgainstPeers, noisyHostText } from "../host-choice.ts";
+import { chanceRatio, noisyAgainstPeers, noisyHostText, NOISY_REPLACEMENTS } from "../host-choice.ts";
+export { NOISY_REPLACEMENTS };
 import { DEFAULT_REMOTE_CONFIG, type Ctx, type RemoteFleetConfig } from "../context.ts";
 import { REMOTE_LIVE_STATES, type BenchHostRow, type RemoteArtifactRow, type RemoteHostRow, type StudyRow } from "../db/store.ts";
 import type { HostRunner } from "../host/runner.ts";
@@ -76,13 +77,6 @@ const KEEP_AFTER_CALIBRATION_MS = 30 * 60_000;
 /** How often the fleet lists each provider's machines for orphans. */
 const ORPHAN_SWEEP_MS = 10 * 60_000;
 
-/**
- * How many machines in a row an entry replaces for being much noisier than
- * the other bench hosts; the next one is kept (it measures with its own win
- * threshold, and dispatch prefers quieter hosts), so a provider whose
- * machines are all noisier than the edit host doesn't churn forever.
- */
-export const NOISY_REPLACEMENTS = 2;
 
 /** Machine states that are joining (not measuring yet). */
 const JOINING = ["creating", "joining", "calibrating"] as const;
@@ -671,7 +665,7 @@ export class RemoteFleet {
     const key = this.failureKey(study.id, row.entry);
     // Above the ratio but within what chance gives equal hosts: it measures (with its own threshold).
     if (!hit?.significant) {
-      this.noisyStreak.delete(key);
+      if (hit === null) this.noisyStreak.delete(key);
       return false;
     }
     const name = this.store.benchHost(study.id, row.bench_host_id)?.name ?? row.bench_host_id;
@@ -683,9 +677,21 @@ export class RemoteFleet {
       this.leave(row, `much noisier than the other bench hosts: ${why}`, { notify: true });
       return true;
     }
-    this.noisyStreak.delete(key);
-    void this.hooks.notify(study, "bench.noisy_host", `Remote bench host ${name} (${row.provider}) is much noisier than the other bench hosts (${why}), after ${streak} replacement(s) in a row that were too: it is kept and measures with its own win threshold; candidates go to quieter hosts first. Nothing to do, unless the provider can lend quieter machines.`, { quiet: true });
+    // From now on this entry's machines are kept as they come (and recalibrations keep them too): see acceptsNoisy.
+    // The notice goes out once, not on every rotation.
+    this.noisyStreak.set(key, NOISY_REPLACEMENTS + 1);
+    if (streak === NOISY_REPLACEMENTS) void this.hooks.notify(study, "bench.noisy_host", `Remote bench host ${name} (${row.provider}) is much noisier than the other bench hosts (${why}), after ${streak} replacement(s) in a row that were too: it is kept and measures with its own win threshold; candidates go to quieter hosts first. Nothing to do, unless the provider can lend quieter machines.`, { quiet: true });
     return false;
+  }
+
+  /**
+   * Whether a noisy machine of this entry is kept rather than replaced: the
+   * entry already replaced NOISY_REPLACEMENTS machines in a row for their
+   * noise (its provider's machines are all noisier than the other hosts).
+   */
+  acceptsNoisy(study: StudyRow, benchHostId: string): boolean {
+    const row = this.store.remoteHostByBench(study.id, benchHostId);
+    return row ? (this.noisyStreak.get(this.failureKey(study.id, row.entry)) ?? 0) >= NOISY_REPLACEMENTS : false;
   }
 
   /** The study's calibration found this machine much noisier than its peers: it leaves when the calibration ends, and is replaced. */

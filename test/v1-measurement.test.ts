@@ -240,7 +240,7 @@ describe("v1 measurement quality (fake hosts)", () => {
     const id = await running(v1Spec());
     const a = store.benchHost(id, "host_a")!;
     expect(a.excluded_json).not.toBeNull();
-    expect(JSON.parse(a.excluded_json!)).toMatchObject({ reason: expect.stringMatching(/^noise floor [\d.]+% per pair, [\d.]+× the [\d.]+% median of the other bench hosts \(max_host_noise_ratio 2\)$/u), segment: 1 });
+    expect(JSON.parse(a.excluded_json!)).toMatchObject({ reason: expect.stringMatching(/^noise floor [\d.]+% per pair, [\d.]+× the [\d.]+% median of the other bench hosts, above max_host_noise_ratio 2$/u), segment: 1 });
     expect(store.benchHost(id, "host_b")!.excluded_json).toBeNull();
     // The segment is the quiet host's: the noisy one's numbers don't count.
     const seg = store.segment(id, 1)!;

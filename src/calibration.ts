@@ -9,7 +9,7 @@ import { BenchTransferError } from "./bench.ts";
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, StudyRow } from "./db/store.ts";
 import { guardrailProblems, worstGuardrailCalibration, type GuardrailCalibration } from "./guardrails.ts";
-import { chanceRatio, hostThresholdsText, noisyHostText, noisyOutliers, unclearNoisyHostText, type ExcludedHost, type NoisyHost } from "./host-choice.ts";
+import { chanceRatio, hostThresholdsText, NOISY_REPLACEMENTS, noisyHostText, noisyOutliers, unclearNoisyHostText, type ExcludedHost, type NoisyHost } from "./host-choice.ts";
 import { checkHealth } from "./health.ts";
 import { parseMeasureOutput } from "./metrics.ts";
 import { strategyFor, BenchError, type CalibrationOutcome } from "./noise.ts";
@@ -186,7 +186,7 @@ export async function runCalibration(ctx: Ctx, pipeline: Pipeline, studyId: stri
   if (!done.length && !problems.length) problems.push("every bench host left during calibration");
   if (perHost.some((r) => r.problem) || !done.length) return finish({ baselineSha: baseSha, oracleHash: hash, gateSeconds, warnings: remoteWarnings });
   // Much noisier than its peers: a BB machine or the edit host leaves the dispatch set, a remote machine is replaced.
-  const { kept: ok, noisy, unclear } = splitNoisyHosts(done, spec);
+  const { kept: ok, noisy, unclear } = splitNoisyHosts(done, spec, (id) => pipeline.remote?.acceptsNoisy(study, id) ?? false);
   const noisyWarnings = [...applyNoisyHosts(ctx, pipeline, study, spec, done, noisy, "calibration"), ...unclear];
   for (const r of ok) if (r.h.mode === "remote") pipeline.remote?.markCalibrated(study, r.h.host_id, r.outcome, baseSha);
   for (const r of ok) problems.push(...r.outcome.problems.map((p) => (done.length > 1 ? `${r.h.name}: ${p}` : p)));
@@ -241,13 +241,16 @@ interface HostResult {
 type CalibratedResult = HostResult & { outcome: CalibrationOutcome };
 
 /** Calibrated hosts split into those that measure and those much noisier than their peers (`max_host_noise_ratio`). */
-export function splitNoisyHosts<T extends { h: Pick<BenchHostRow, "host_id" | "name">; outcome: Pick<CalibrationOutcome, "noiseFloor"> }>(results: readonly T[], spec: StudySpec): { kept: T[]; noisy: Array<{ r: T; host: NoisyHost }>; unclear: string[] } {
+export function splitNoisyHosts<T extends { h: Pick<BenchHostRow, "host_id" | "name">; outcome: Pick<CalibrationOutcome, "noiseFloor"> }>(results: readonly T[], spec: StudySpec, keep: (hostId: string) => boolean = () => false): { kept: T[]; noisy: Array<{ r: T; host: NoisyHost }>; unclear: string[] } {
   const ratio = spec.oracle.max_host_noise_ratio ?? 2;
   if (spec.oracle.noise === "deterministic" || !(ratio > 0) || results.length < 2) return { kept: [...results], noisy: [], unclear: [] };
   const samples = calibrationSamples(spec);
   const outliers = noisyOutliers(results.map((r) => ({ hostId: r.h.host_id, name: r.h.name, noiseFloor: r.outcome.noiseFloor })), ratio, chanceRatio(spec.oracle.noise, samples));
-  const byId = new Map(outliers.filter((o) => o.significant).map((o) => [o.hostId, o] as const));
-  const unclear = outliers.filter((o) => !o.significant).map((o) => unclearNoisyHostText(o, ratio, noiseUnit(spec), samples, spec.oracle.noise === "expensive" ? "runs" : "pairs"));
+  const byId = new Map(outliers.filter((o) => o.significant && !keep(o.hostId)).map((o) => [o.hostId, o] as const));
+  const unclear = [
+    ...outliers.filter((o) => !o.significant).map((o) => unclearNoisyHostText(o, ratio, noiseUnit(spec), samples, spec.oracle.noise === "expensive" ? "runs" : "pairs")),
+    ...outliers.filter((o) => o.significant && keep(o.hostId)).map((o) => `${o.name} is much noisier than the other bench hosts (${noisyHostText(o, ratio, noiseUnit(spec))}), but its remote bench entry already replaced ${NOISY_REPLACEMENTS} machines in a row that were too: it is kept, with its own win threshold`),
+  ];
   return {
     kept: results.filter((r) => !byId.has(r.h.host_id)),
     noisy: results.filter((r) => byId.has(r.h.host_id)).map((r) => ({ r, host: byId.get(r.h.host_id)! })),
@@ -558,7 +561,7 @@ export async function runAutoRecalibration(ctx: Ctx, pipeline: Pipeline, studyId
   }
   const done = results.filter((r): r is CalibratedResult => r.outcome !== null);
   // A host much noisier than its peers is left out (or replaced), so its problems don't count.
-  const { kept: ok, noisy, unclear } = problems.length ? { kept: done, noisy: [], unclear: [] } : splitNoisyHosts(done, spec);
+  const { kept: ok, noisy, unclear } = problems.length ? { kept: done, noisy: [], unclear: [] } : splitNoisyHosts(done, spec, (id) => pipeline.remote?.acceptsNoisy(study, id) ?? false);
   for (const r of ok) {
     for (const p of r.outcome.problems) {
       const text = results.length > 1 ? `${r.h.name}: ${p}` : p;
