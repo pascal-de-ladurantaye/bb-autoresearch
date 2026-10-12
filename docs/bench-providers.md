@@ -77,9 +77,18 @@ All JSON in, JSON out.
 bb-autoresearch treats `suspended`, `gone` and `failed` as the machine
 leaving, and never uses that machine again: a suspended machine may come back
 on different hardware, where its calibration would be wrong. It destroys
-machines it no longer needs; it calls `list` with its labels on load, pause,
-archive and unload (and every 10 minutes) and destroys what no live machine of
-a study uses.
+machines it no longer needs; it calls `list` with its labels on load, pause
+and archive (and every 10 minutes) and destroys what no live machine of a
+study uses.
+
+A reload of bb-autoresearch doesn't destroy calibrated machines. On load it
+re-adopts each one whose `status` is `ready` and whose files are still there
+(it runs a short probe with `execStart`), so a provider's machines must stay
+reachable by the same `hostId` across a reload of either plugin. Machines of a
+disabled bb-autoresearch are destroyed by nobody until their lifetime ends:
+enforce `lifetimeSeconds`. When a call fails because the provider plugin isn't
+loaded yet (BB's startup), bb-autoresearch waits for it instead of giving the
+machine up.
 
 ## What bb-autoresearch does on a machine
 

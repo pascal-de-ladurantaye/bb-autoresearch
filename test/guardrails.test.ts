@@ -1,7 +1,7 @@
 // Guardrails: per-step and cumulative limits, judged on a CI for every noise
 // class, calibrated noise, and the view model. See docs/design.md,
-// "Guardrails and holdout" and "Implementation notes: guardrails and
-// pre-release fixes".
+// "Guardrails and holdout", and docs/release-notes.md, "v0.1.0:
+// guardrails and pre-release fixes".
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";

@@ -2,7 +2,7 @@
 // report, notices, and agent messages (pure: no I/O, safe in the frontend
 // bundle).
 //
-// The convention (docs/design.md, "Implementation notes: human interface"):
+// The convention (docs/release-notes.md, "v0.1.0: human interface"):
 // an improvement is a fraction relative to a reference, POSITIVE = BETTER in
 // the metric's own direction. It is shown signed ("+74.7%") where space is
 // short, and in words where it is the headline ("74.7% fewer ops (3.9×)").

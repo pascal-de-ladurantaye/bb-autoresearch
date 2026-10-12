@@ -6,6 +6,7 @@
 //   host RPC is unavailable on a machine).
 import type { ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import type {
+  ArtifactReport,
   BaseBundle,
   BundleInfo,
   CommitInfo,
@@ -26,6 +27,7 @@ import type {
   SnapshotResult,
   hostSignals,
 } from "./contract.ts";
+import { artifactStore } from "./artifacts.ts";
 import { baseBundle } from "./base.ts";
 import { packSeed } from "./seed.ts";
 import * as bundle from "./bundle.ts";
@@ -153,6 +155,8 @@ export interface HostRunner {
   baseBundle(repoPath: string, sha: string): Promise<BaseBundle>;
   /** Remote bench: scan a seed for credentials and pack it (host/seed.ts). */
   seedPack(input: { source: string; cwd: string; allow: string[] }): Promise<SeedPack>;
+  /** Remote bench: the seeds and base bundles on this host; with `gc`, delete those not in `keep` (host/artifacts.ts). */
+  artifacts(input: { keep: string[]; gc: boolean }): Promise<ArtifactReport>;
 }
 
 const GIT_TIMEOUT = 5 * 60_000;
@@ -259,6 +263,9 @@ export class BbHostRunner implements HostRunner {
   }
   async seedPack(input: { source: string; cwd: string; allow: string[] }) {
     return await this.client.call("seedPack", input, this.opts(30 * 60_000 - 60_000));
+  }
+  async artifacts(input: { keep: string[]; gc: boolean }) {
+    return await this.client.call("artifacts", input, this.opts(5 * 60_000));
   }
 }
 
@@ -374,5 +381,8 @@ export class LocalHostRunner implements HostRunner {
   }
   seedPack(input: { source: string; cwd: string; allow: string[] }) {
     return packSeed({ dataDir: this.dataDir, ...input });
+  }
+  artifacts(input: { keep: string[]; gc: boolean }) {
+    return artifactStore(this.dataDir, input);
   }
 }

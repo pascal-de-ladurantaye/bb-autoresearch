@@ -107,7 +107,9 @@ export function remoteView(engine: Engine, s: StudyRow, spec: StudySpec | null):
     const m = measuring.find((c) => c.bench_host_id === r.bench_host_id);
     const g = gating.find((i) => i.host_id === r.bench_host_id);
     const stateText =
-      r.state === "ready"
+      r.state === "ready" && engine.fleet.isAdopting(r.id)
+        ? (r.phase ?? "re-adopting after a plugin reload")
+        : r.state === "ready"
         ? m
           ? `measuring c/${m.n}`
           : g

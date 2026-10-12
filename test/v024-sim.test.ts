@@ -3,7 +3,7 @@
 // same noise (common random numbers: each trial replays the same noise
 // stream under both rule sets). Effects are in units of the win threshold
 // (MDE) calibrated from a large A/A pool. Set SIM_TRIALS for a longer run
-// (the numbers in docs/design.md, "Implementation notes: v0.2.4").
+// (the numbers in docs/release-notes.md, "v0.2.4").
 import { describe, expect, it } from "vitest";
 import { noisyStrategy, type Bench, type Side } from "../src/noise.ts";
 import { confirmationSkip } from "../src/pipeline.ts";

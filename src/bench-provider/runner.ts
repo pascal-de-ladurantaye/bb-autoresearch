@@ -14,7 +14,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import type { BaseBundle, BundleInfo, CommitInfo, SeedPack, ComposeResult, DiffSummary, ExecInput, ExecResult, GitIdentity, HealthReport, JobInput, PrepareResult, SnapshotResult } from "../host/contract.ts";
+import type { ArtifactReport, BaseBundle, BundleInfo, CommitInfo, SeedPack, ComposeResult, DiffSummary, ExecInput, ExecResult, GitIdentity, HealthReport, JobInput, PrepareResult, SnapshotResult } from "../host/contract.ts";
 import { BASE_REF } from "../host/base.ts";
 import { RunAbortedError, type HostRunner, type RunOptions } from "../host/runner.ts";
 import type { BenchProviderClient } from "./client.ts";
@@ -558,6 +558,9 @@ export class RemoteBenchRunner implements HostRunner {
   }
   async seedPack(): Promise<SeedPack> {
     return this.unsupported("seedPack");
+  }
+  async artifacts(): Promise<ArtifactReport> {
+    return this.unsupported("artifacts");
   }
 }
 

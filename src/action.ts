@@ -3,7 +3,7 @@
 // built from its thread's tool items (kind, a command, a tool name, file
 // paths). Never from message text. Pure: shared by the engine and tests.
 //
-// Safety rules (docs/design.md, "Implementation notes: live view (part 2)"):
+// Safety rules (docs/release-notes.md, "v0.2.0: live view, part 2"):
 // - at most ACTION_MAX characters;
 // - paths are made relative to the worker's worktree, other absolute paths
 //   keep only their last two segments;

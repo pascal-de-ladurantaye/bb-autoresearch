@@ -3,8 +3,8 @@
 // the pipeline), projects those events into throttled realtime deltas, and
 // builds the view model the Live tab and the study thread's Live panel read.
 //
-// See live-model.ts for the shared model, and docs/design.md "Implementation
-// notes: live view (part 1)".
+// See live-model.ts for the shared model, and docs/release-notes.md
+// "v0.2.0: live view, part 1".
 import { remoteView, type RemoteMachineView } from "./remote/view.ts";
 import type { Ctx } from "./context.ts";
 import type { AppendedEvent, CandidateRow, EventRow, Store, StudyRow, ThreadRow } from "./db/store.ts";
