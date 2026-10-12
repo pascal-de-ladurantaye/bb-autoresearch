@@ -2,7 +2,7 @@
 // the frontend (applying realtime deltas). Pure: no I/O, no store, safe in
 // the frontend bundle.
 //
-// Contract (docs/design.md, "Implementation notes: live view (part 1)"):
+// Contract (docs/release-notes.md, "v0.2.0: live view, part 1"):
 // every state change the Live view shows is a timestamped row in `events`
 // (candidate.stage, worker.phase, measure.started/progress/finished,
 // candidate.verdict, best.promoted, idea.added/status). Realtime deltas are a

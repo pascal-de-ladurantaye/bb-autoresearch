@@ -6,7 +6,7 @@
 // reduced state) every KEYFRAME_EVERY events. A view at t restores the
 // nearest keyframe at or before t and applies at most KEYFRAME_EVERY events;
 // playing forward applies only the events since the last frame. See
-// docs/design.md, "Implementation notes: live view (part 2)".
+// docs/release-notes.md, "v0.2.0: live view, part 2".
 import { bandAt, type MeasureBand } from "./band.ts";
 import { feedItems } from "./live-feed.ts";
 import {

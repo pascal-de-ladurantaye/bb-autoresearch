@@ -10,8 +10,8 @@
 // the stored samples with the same seed and the same number of iterations
 // gives exactly the CI the decision saw, at every judged pair. Before n_min
 // the decision computes no CI; the band shows one for orientation, with at
-// most PREVIEW_ITERATIONS resamples. See docs/design.md, "Implementation
-// notes: live view (part 2)".
+// most PREVIEW_ITERATIONS resamples. See docs/release-notes.md,
+// "v0.2.0: live view, part 2".
 import { estimatePaired, judgeGuardrail, type GuardrailJudgement, type LimitCheck, type Position } from "./guardrails.ts";
 import type { Direction } from "./present.ts";
 import { bootstrapMedianCI, earlyLoseApplies, earlyLoseCI, improvement, median, seededRng, tQuantile, type Rng, type StopReason } from "./stats.ts";
