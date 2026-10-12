@@ -1859,3 +1859,7 @@ The same textkit-style toy as earlier releases (a Python pipeline, `METRIC wall_
 ## Credits
 
 Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch) and [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch).
+
+## Implementation notes: v0.3.1
+
+- **Large uploads travel in parts.** BB gives a plugin RPC 75 seconds, and a provider's `putFile` is one RPC: a 551 MB seed on a 7 MB/s link timed out on the first real study, so calibration failed on every remote machine. Files above `PUT_CHUNK_BYTES` (32 MiB; `RemoteRunnerOptions.chunkBytes` in tests) are copied part by part to the staging directory, each part is uploaded and its sha256 checked, then the parts are joined on the machine and the whole file's sha256 is compared with the local one. Smaller files still go in one call. The contract is unchanged.

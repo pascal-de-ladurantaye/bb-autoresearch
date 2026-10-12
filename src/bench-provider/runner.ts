@@ -12,7 +12,7 @@
 //   bb-autoresearch/seed/<sha256>     the unpacked seed
 //   bb-autoresearch/incoming/         uploads in transit
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { BaseBundle, BundleInfo, CommitInfo, SeedPack, ComposeResult, DiffSummary, ExecInput, ExecResult, GitIdentity, HealthReport, JobInput, PrepareResult, SnapshotResult } from "../host/contract.ts";
 import { BASE_REF } from "../host/base.ts";
@@ -50,7 +50,16 @@ export interface RemoteRunnerOptions {
    */
   onLost?: (reason: string) => void;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Largest file sent in one putFile call. BB gives a plugin RPC 75 seconds, so
+   * a seed of hundreds of MB would time out on a slow link: bigger files travel
+   * as parts of this size and are joined (and checksummed) on the machine.
+   */
+  chunkBytes?: number;
 }
+
+/** Default part size for uploads: 32 MiB takes about 5 s at the 6-16 MB/s seen in practice, and stays under BB's 75 s RPC limit down to about 0.5 MB/s. */
+export const PUT_CHUNK_BYTES = 32 * 1024 * 1024;
 
 /** Single-quote a string for a POSIX shell. */
 export function q(s: string): string {
@@ -251,11 +260,83 @@ export class RemoteBenchRunner implements HostRunner {
 
   async putFile(localPath: string, remotePath: string, mode?: number): Promise<{ bytes: number; sha256: string }> {
     if (this.lost) throw new RemoteHostLostError(`remote machine ${this.remoteId} left: ${this.lost}`);
+    const chunk = Math.max(1, this.opts.chunkBytes ?? PUT_CHUNK_BYTES);
+    const size = statSync(localPath).size;
+    if (size > chunk) return this.putFileInParts(localPath, remotePath, size, chunk, mode);
+    return this.putOne(localPath, remotePath, mode);
+  }
+
+  private async putOne(localPath: string, remotePath: string, mode?: number): Promise<{ bytes: number; sha256: string }> {
     try {
       return await this.client.call("benchProvider.putFile", { hostId: this.remoteId, localPath, remotePath, ...(mode !== undefined ? { mode } : {}) });
     } catch (e) {
       this.wrap(e);
     }
+  }
+
+  /**
+   * A file bigger than one RPC can carry: copy each part to the staging
+   * directory, upload it (checking its sha256), then join the parts on the
+   * machine and compare the whole file's sha256 with the local one.
+   */
+  private async putFileInParts(localPath: string, remotePath: string, size: number, chunk: number, mode?: number): Promise<{ bytes: number; sha256: string }> {
+    mkdirSync(this.opts.stagingDir, { recursive: true });
+    const tag = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const whole = createHash("sha256");
+    const parts: string[] = [];
+    const src = openSync(localPath, "r");
+    const buf = Buffer.allocUnsafe(Math.min(chunk, 4 * 1024 * 1024));
+    try {
+      for (let offset = 0, i = 0; offset < size; offset += chunk, i++) {
+        const partLocal = join(this.opts.stagingDir, `put-${tag}-${i}`);
+        const partRemote = `${remotePath}.part-${String(i).padStart(5, "0")}`;
+        const h = createHash("sha256");
+        const out = openSync(partLocal, "w");
+        try {
+          let left = Math.min(chunk, size - offset);
+          let pos = offset;
+          while (left > 0) {
+            const n = readSync(src, buf, 0, Math.min(buf.length, left), pos);
+            if (n <= 0) throw new Error(`${localPath} changed while it was uploaded (short read at ${pos})`);
+            const view = buf.subarray(0, n);
+            writeSync(out, view);
+            h.update(view);
+            whole.update(view);
+            left -= n;
+            pos += n;
+          }
+        } finally {
+          closeSync(out);
+        }
+        try {
+          const put = await this.putOne(partLocal, partRemote);
+          const want = h.digest("hex");
+          if (put.sha256 !== want) throw new Error(`upload of part ${i} of ${localPath} to ${this.remoteId} is corrupt (sha256 ${put.sha256.slice(0, 12)} != ${want.slice(0, 12)})`);
+        } finally {
+          rmSync(partLocal, { force: true });
+        }
+        parts.push(partRemote);
+      }
+    } finally {
+      closeSync(src);
+    }
+    const sha256 = whole.digest("hex");
+    const dst = q(remotePath);
+    const out = await this.must(
+      [
+        `rm -f ${q(`${remotePath}.joining`)}`,
+        `cat ${parts.map(q).join(" ")} > ${q(`${remotePath}.joining`)}`,
+        `rm -f ${parts.map(q).join(" ")}`,
+        `mv -f ${q(`${remotePath}.joining`)} ${dst}`,
+        ...(mode !== undefined ? [`chmod ${(mode & 0o7777).toString(8)} ${dst}`] : []),
+        `(sha256sum ${dst} 2>/dev/null || shasum -a 256 ${dst}) | cut -d' ' -f1`,
+      ].join("\n"),
+      "joining an upload",
+      10 * 60_000,
+    );
+    const got = out.trim().split(/\s+/u).pop() ?? "";
+    if (got !== sha256) throw new Error(`joined upload ${remotePath} on ${this.remoteId} is corrupt (sha256 ${got.slice(0, 12)} != ${sha256.slice(0, 12)})`);
+    return { bytes: size, sha256 };
   }
 
   // ---- joining (the fleet calls these once per machine) ----

@@ -3,7 +3,8 @@
 // ensureCommit, reused checkouts, runs with progress and cancellation,
 // seeds, health, and a machine that leaves mid-run.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -116,6 +117,28 @@ describe("RemoteBenchRunner (example provider, real git)", () => {
     await expect(p).rejects.toBeInstanceOf(RunAbortedError);
     const big = await runner.exec({ cwd: "/tmp", command: "head -c 600000 /dev/zero | tr '\\0' 'x'; echo; echo END", timeoutMs: 30_000, tailBytes: 1000 });
     expect(big.stdout.endsWith("END\n")).toBe(true);
+  });
+
+  it("uploads a file bigger than one RPC in parts and joins it on the machine", async () => {
+    const client = providerClient(provider);
+    const small = new RemoteBenchRunner(client, remoteId, "remote-1", { home: null, stagingDir: join(root, "staging-parts"), pollMs: 20, chunkBytes: 1000 });
+    await small.init();
+    const puts = () => client.calls.get("benchProvider.putFile") ?? 0;
+    const data = Buffer.alloc(10_500);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 7919 + 13) % 251;
+    const local = join(root, "big.bin");
+    writeFileSync(local, data);
+    const want = createHash("sha256").update(data).digest("hex");
+    const put = await small.putFile(local, `${small.root}/incoming/big.bin`, 0o640);
+    expect(put).toEqual({ bytes: 10_500, sha256: want });
+    expect(puts()).toBe(11);
+    const r = await small.exec({ cwd: small.root, command: `(sha256sum ${small.root}/incoming/big.bin 2>/dev/null || shasum -a 256 ${small.root}/incoming/big.bin) | cut -d' ' -f1; ls ${small.root}/incoming | grep -c part || true`, timeoutMs: 10_000 });
+    expect(r.stdout.trim().split("\n")).toEqual([want, "0"]);
+    expect(readdirSync(join(root, "staging-parts"))).toEqual([]);
+    // A file no bigger than one part still goes in one call.
+    writeFileSync(local, data.subarray(0, 1000));
+    await small.putFile(local, `${small.root}/incoming/one.bin`);
+    expect(puts()).toBe(12);
   });
 
   it("installs a seed once and reads health", async () => {
