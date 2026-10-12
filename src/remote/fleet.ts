@@ -1107,7 +1107,9 @@ export class RemoteFleet {
     if (!study.host_id) return null;
     let report: ArtifactReport;
     try {
-      report = await this.ctx.bb.hostRunner(study.host_id).artifacts({ keep: [], gc: false });
+      // A report for `bb study bench`: don't hold the command for long on a slow disk.
+      const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 15_000).unref?.());
+      report = await Promise.race([this.ctx.bb.hostRunner(study.host_id).artifacts({ keep: [], gc: false }), timeout]);
     } catch {
       return null;
     }
