@@ -20,7 +20,14 @@ export function BenchHostList({ hosts, queueDepth }: { hosts: BenchHostView[]; q
             <span className="text-xs text-muted-foreground">
               drift {h.driftStatus ?? "not run"} ({h.evalsSinceDrift}/{h.driftEvery || "off"})
             </span>
+            {h.threshold !== null && !h.excluded ? (
+              <span className="text-xs text-muted-foreground">
+                win threshold {(h.threshold * 100).toFixed(2)}%{h.noiseFloor !== null ? ` · noise ${(h.noiseFloor * 100).toFixed(2)}%` : ""}
+              </span>
+            ) : null}
+            {h.excluded ? <span className="text-xs font-medium text-warning-text">not used: much noisier than the other hosts</span> : null}
           </div>
+          {h.excluded ? <div className="text-xs text-warning-text">Measures nothing until the next calibration: {h.excluded}.</div> : null}
           <div className="text-xs text-muted-foreground">
             {h.measuring !== null ? `measuring c/${h.measuring}` : h.gating !== null ? `testing c/${h.gating} (${h.mode === "remote" ? "gates on this machine" : "single-machine mode: tests hold the bench"})` : "idle"}
             {h.progress ? ` · ${h.progress}` : ""} · queue {queueDepth} · best build {h.bestBuildSha ? shortSha(h.bestBuildSha) : "not cached"}

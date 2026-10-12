@@ -257,6 +257,8 @@ export interface BenchHostRow {
   side_runs: number | null;
   /** Median seconds of one run of the measure command at calibration. */
   run_seconds: number | null;
+  /** Taken out of the dispatch set: much noisier than its peers at calibration (JSON; null: measures). */
+  excluded_json: string | null;
 }
 
 export interface HealthCheckRow {

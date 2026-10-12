@@ -423,6 +423,8 @@ export const LIVE_VIEW_KINDS = [
   "worker.abandoned",
   "drift.started",
   "drift.checked",
+  "bench.noisy_host",
+  "recalibration.deferred",
   "study.state",
 ] as const;
 

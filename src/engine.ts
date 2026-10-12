@@ -15,7 +15,8 @@ import { LiveRecorder } from "./live.ts";
 import { classifyItem, type Activity } from "./live-model.ts";
 import { GithubPublisher, PublishRefused, type PrDraft } from "./publisher.ts";
 import { studyReport } from "./report.ts";
-import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, Pipeline, withBench } from "./pipeline.ts";
+import { BENCH_BOUND_STAGES, bestGuardrailPositions, errText, IN_FLIGHT_STAGES, measurementMde, Pipeline, withBench } from "./pipeline.ts";
+import { hostThresholdsText } from "./host-choice.ts";
 import { ciText, compound, improvementText, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, harvestRoundPrompt, nudgeMessage, safeJson, strategistDigest, workerBrief, type CodeInfo } from "./prompts.ts";
 import { actionLabel, itemLabel } from "./action.ts";
@@ -932,7 +933,7 @@ export class Engine {
       sha = c.prepared_sha;
       purpose = "candidate";
     }
-    const hosts = this.pipeline.benchHosts(study!).filter((h) => h.status !== "offline");
+    const hosts = this.pipeline.dispatchHosts(study!).filter((h) => h.status !== "offline");
     const host = hosts.find((h) => (h.deferred_until ?? 0) <= this.ctx.now()) ?? hosts[0];
     if (!host) return "No bench host is online right now; try again later.";
     this.store.updateThread(row!.id, { profiles: row!.profiles + 1 });
@@ -1519,6 +1520,7 @@ export class Engine {
       bestDiag: bestRun?.diag ?? [],
       relatedFindings: related,
       mde: this.store.segment(study.id, study.segment)?.mde ?? null,
+      thresholds: hostThresholdsText(this.pipeline.dispatchHosts(study, spec).filter((h) => h.mde !== null).map((h) => ({ name: h.name, mde: measurementMde(this.store, study, spec, h) }))),
       guardrailPositions: bestGuardrailPositions(this.store, study, spec),
     });
     try {
@@ -1800,10 +1802,37 @@ export class Engine {
     if (!study || study.state !== "running" || study.recalibrate_due === null || !study.best_sha) return null;
     const why = safeJson<{ reason?: string }>(study.recalibrate_due)?.reason ?? "best's runs got much shorter than at calibration";
     this.publish(studyId);
-    const r = await runAutoRecalibration(this.ctx, this.pipeline, studyId, why);
+    const r = await runAutoRecalibration(this.ctx, this.pipeline, studyId, why, (kind, text) => this.notify(studyId, kind, text));
     this.publish(studyId);
     this.kick();
     const fresh = this.store.study(studyId)!;
+    if (!r.ok && r.retry) {
+      // A bench host failed its health check (v1): nothing changed; try again in retry_seconds, a bounded number of times.
+      const spec = this.store.spec(fresh);
+      const due = safeJson<Record<string, unknown>>(fresh.recalibrate_due) ?? {};
+      const tries = (typeof due.health_retries === "number" ? due.health_retries : 0) + 1;
+      const max = spec.oracle.health.recalibration_retries ?? 30;
+      const waitMs = spec.oracle.health.retry_seconds * 1000;
+      if (tries <= max && fresh.recalibrate_due !== null) {
+        this.store.tx(() => {
+          this.store.updateStudy(studyId, { recalibrate_due: JSON.stringify({ ...due, health_retries: tries, retry_at: this.ctx.now() + waitMs }) });
+          this.store.event(studyId, "recalibration.deferred", "plugin", { tries, max, retry_seconds: spec.oracle.health.retry_seconds, problems: r.problems.slice(0, 5).map((p) => clip(p, 300)) });
+        });
+        this.pipeline.deferRecalibration(studyId, waitMs);
+        this.publish(studyId);
+        return r;
+      }
+      this.store.tx(() => {
+        // Still due: resuming recalibrates first, with a fresh count of retries.
+        this.store.updateStudy(studyId, { recalibrate_due: JSON.stringify({ ...due, health_retries: 0, retry_at: null }) });
+        this.store.event(studyId, "recalibration.failed", "plugin", { segment: fresh.segment, problems: r.problems.slice(0, 5), health: true, tries: tries - 1 });
+      });
+      await this.systemPause(
+        studyId,
+        `automatic recalibration failed (${why}): a bench host stayed unhealthy through ${tries - 1} retr${tries - 1 === 1 ? "y" : "ies"}, ${spec.oracle.health.retry_seconds} s apart: ${r.problems.map((p) => clip(p, 300)).join("; ")}. Quiet the machine or loosen [oracle.health] (recalibration_retries, retry_seconds), then resume: it recalibrates first`,
+      );
+      return r;
+    }
     if (!r.ok) {
       await this.systemPause(studyId, `automatic recalibration failed (${why}): ${r.problems.map((p) => clip(p, 300)).join("; ")}. Raise oracle.protocol side_runs or max_mde with a spec change, or resume to keep the old calibration`);
       return r;
@@ -2000,5 +2029,6 @@ export function recalibrationNotice(study: StudyRow, r: AutoRecalibration, why: 
     (h) =>
       `- ${h.name}: side runs ${h.before.sideRuns} → ${h.after?.sideRuns ?? "?"}, one run ${secs(h.before.runSeconds)} → ${secs(h.after?.runSeconds ?? null)}, noise floor ${pct(h.before.noiseFloor)} → ${pct(h.after?.noiseFloor ?? null)} per pair, win threshold ${pct(h.before.mde)} → ${pct(h.after?.mde ?? null)}`,
   );
-  return [`\`${study.slug}\` recalibrated itself on best (${why}): segment ${r.segment} started, same oracle. Shorter runs are noisier relative to themselves; that isn't drift, so the study kept running. Nothing to do.`, ...lines].join("\n");
+  const notes = (r.report?.warnings ?? []).map((w) => `- ${clip(w, 500)}`);
+  return [`\`${study.slug}\` recalibrated itself on best (${why}): segment ${r.segment} started, same oracle. Shorter runs are noisier relative to themselves; that isn't drift, so the study kept running. Nothing to do.`, ...lines, ...notes].join("\n");
 }

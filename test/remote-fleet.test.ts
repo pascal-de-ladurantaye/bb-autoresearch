@@ -35,6 +35,12 @@ const SEED = `rm -rf .seed; mkdir -p .seed/bin; echo 'echo tool' > .seed/bin/too
 if [ "$1" = bad ]; then printf 'machine example.com login me password hunter2\\n' > .seed/.netrc; fi
 echo "$PWD/.seed"
 `;
+// v1: the same metric with ±4% noise on remote machines and ±0.1% on the edit host.
+const NOISY_REMOTE_MEASURE = `v=$(head -1 src/a.txt | tr -dc 0-9)
+n=0.002; [ -n "$AUTORESEARCH_REMOTE" ] && n=0.08
+r=$(od -An -N2 -tu2 /dev/urandom | tr -dc 0-9)
+awk -v v="$v" -v n="$n" -v r="$r" 'BEGIN { printf "METRIC t=%.6f\\n", v * (1 + n * (r / 65535 - 0.5)) }'
+`;
 const SETUP = `test -f "$AUTORESEARCH_SEED/bin/tool.sh" && echo "$AUTORESEARCH_CORES" > "$HOME/setup-ran"`;
 
 function spec(opts: { benchHosts?: string; remote?: string; extra?: string } = {}): string {
@@ -106,7 +112,7 @@ describe("remote bench hosts (example provider, real git)", () => {
   /** Most live machines per slot seen at any tick (cost guard). */
   let maxPerSlot = 0;
 
-  function setup(maxHosts = 6) {
+  function setup(maxHosts = 6, measure = MEASURE) {
     n = 0;
     maxPerSlot = 0;
     root = mkdtempSync(join(tmpdir(), "ar-remote-fleet-"));
@@ -115,7 +121,7 @@ describe("remote bench hosts (example provider, real git)", () => {
     mkdirSync(join(repo, "bench"), { recursive: true });
     sh(repo, "init", "-q", "-b", "main");
     writeFileSync(join(repo, "src/a.txt"), "100\n");
-    writeFileSync(join(repo, "bench/measure.sh"), MEASURE);
+    writeFileSync(join(repo, "bench/measure.sh"), measure);
     writeFileSync(join(repo, "bench/gate.sh"), "exit 0\n");
     writeFileSync(join(repo, "bench/seed.sh"), SEED);
     writeFileSync(join(repo, "bench/setup.sh"), SETUP);
@@ -456,6 +462,38 @@ describe("remote bench hosts (example provider, real git)", () => {
     const started2 = store.events(sid, { kinds: ["gate.started"] }).map((e) => JSON.parse(e.data_json).host as string);
     expect(started2.length).toBeGreaterThanOrEqual(2);
     expect(started2.every((h) => h.startsWith("remote-"))).toBe(true);
+  });
+
+  it("v1: a remote machine much noisier than the other hosts is replaced, a bounded number of times in a row; then it is kept", async () => {
+    // Remote machines are ±4% noisy, the edit host ±0.1%: every machine is far beyond max_host_noise_ratio (and chance).
+    setup(6, NOISY_REMOTE_MEASURE);
+    await started(spec({ benchHosts: '"local"' }).replace("hosts = 2", "hosts = 1").replace("calibration_pairs = 4", "calibration_pairs = 12"));
+    const sid = studyId();
+    // The study's calibration: the machine is not used, and leaves when the calibration ends (its slot refills once running).
+    const report = JSON.parse(store.study(SLUG)!.calibration_json!) as { warnings: string[]; hosts: Array<{ mode: string; excluded?: string }> };
+    expect(report.warnings.some((w) => /is much noisier than the other bench hosts \(.*\): it is replaced by a new machine/u.test(w))).toBe(true);
+    expect(report.hosts.find((h) => h.mode === "remote")!.excluded).toMatch(/median of the other bench hosts/u);
+    const first = store.remoteHosts(sid)[0]!;
+    expect(first.state).toBe("gone");
+    expect(first.left_reason).toMatch(/^much noisier than the other bench hosts/u);
+    // Running: two replacements in a row calibrate on arrival and leave; the third is kept, with a notice.
+    const kept = await waitFor(() => {
+      void tick().catch(() => undefined);
+      return ready().length === 1;
+    }, 60_000, 20);
+    expect(kept).toBe(true);
+    const rows = store.remoteHosts(sid).sort((a, b) => a.id - b.id);
+    expect(rows).toHaveLength(4);
+    expect(rows.slice(1, 3).map((r) => r.state)).toEqual(["gone", "gone"]);
+    for (const r of rows.slice(1, 3)) expect(r.left_reason).toMatch(/^much noisier than the other bench hosts: noise floor/u);
+    expect(store.events(sid, { kinds: ["bench.noisy_host"] }).map((e) => JSON.parse(e.data_json).action).reverse()).toEqual(["replaced", "replaced", "replaced", "kept"]);
+    expect(store.notices(sid).some((n) => n.kind === "bench.noisy_host" && n.text.includes("after 2 replacement(s) in a row"))).toBe(true);
+    // The quiet edit host measures first; the kept machine measures with its own (larger) win threshold.
+    const local = store.benchHosts(sid).find((h) => h.mode !== "remote")!;
+    const remote = store.benchHosts(sid).find((h) => h.mode === "remote")!;
+    expect(remote.mde!).toBeGreaterThan(local.mde!);
+    const c = await decided(queue(50));
+    expect(c.bench_host_id).toBe(local.host_id);
   });
 
   it("measures on local and remote hosts together, each with its own calibration", async () => {

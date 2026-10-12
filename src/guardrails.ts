@@ -80,7 +80,7 @@ export interface GuardrailCalibration {
   halfWidth: number;
   limit: number;
   totalLimit: number;
-  /** False when the noise alone exceeds the limit: a candidate can never be shown within it. */
+  /** False when the CI half-width is not below the limit: a candidate can never be shown within it (calibration fails, v1). */
   judgeable: boolean;
   /** One line for the calibration report. */
   text: string;
@@ -353,7 +353,7 @@ export function positionsFromChain(spec: StudySpec, chain: ReadonlyArray<{ metri
 function calibrationText(c: Omit<GuardrailCalibration, "text">, how: string): string {
   const base = `${c.name}: noise ${pct(c.noise, 2)} ${how}, CI half-width ${pct(c.halfWidth, 2)}`;
   if (!c.judgeable) {
-    return `${base}, more than its ${pct(c.limit)} limit: it can never be shown within the limit (every win is flagged inconclusive on it), and only regressions beyond about ${pct(c.limit + c.halfWidth)} are rejected`;
+    return `${base}, not below its ${pct(c.limit)} limit: it can never be shown within the limit (every win would be flagged inconclusive on it)`;
   }
   return `${base}: rejected beyond about ${pct(c.limit + c.halfWidth)} worse, ok below about ${pct(c.limit - c.halfWidth)} worse, inconclusive in between (limit ${pct(c.limit)} per step, ${pct(c.totalLimit)} total)`;
 }
@@ -401,9 +401,44 @@ export function calibrateRepeatGuardrail(
   return finish({ name: g.name, noise: diff, halfWidth: Math.max(tolerance, diff), limit: g.max_regression, totalLimit: g.max_total_regression ?? g.max_regression }, `between two runs`);
 }
 
-/** Calibration warnings: a guardrail whose noise exceeds its limit can never be judged. */
-export function guardrailWarnings(list: readonly GuardrailCalibration[]): string[] {
-  return list.filter((c) => !c.judgeable).map((c) => `guardrail ${c.text}. Loosen its limit, make its measurement less noisy, or raise n_max.`);
+const up = (f: number) => `${(Math.ceil(f * 1000 - 1e-9) / 10).toFixed(1)}%`;
+
+/**
+ * Calibration problems (v1; before, warnings): a guardrail whose CI
+ * half-width at a full evaluation is not below its limit can never be judged
+ * (every win would be flagged inconclusive on it), so calibration fails and
+ * says how to fix the spec. The noisy class names the two fixes: loosen the
+ * limit, or raise `n_max` (the half-width shrinks with √n). With several
+ * hosts, each guardrail is reported once, on its worst host.
+ */
+export function guardrailProblems(perHost: ReadonlyArray<{ host: string; guardrails: readonly GuardrailCalibration[] }>, spec: Pick<StudySpec, "oracle">): string[] {
+  const worst = new Map<string, { host: string; c: GuardrailCalibration }>();
+  for (const { host, guardrails } of perHost) {
+    for (const c of guardrails) {
+      if (c.judgeable) continue;
+      const cur = worst.get(c.name);
+      if (!cur || c.halfWidth > cur.c.halfWidth) worst.set(c.name, { host, c });
+    }
+  }
+  const p = spec.oracle.protocol;
+  return [...worst.values()].map(({ host, c }) => {
+    const on = perHost.length > 1 ? ` on ${host}` : "";
+    // Loosen to a limit the half-width clears with some room (a quarter).
+    const loosen = `loosen its max_regression to at least ${up(c.halfWidth * 1.25)}`;
+    let fix: string;
+    if (spec.oracle.noise === "noisy") {
+      const pairs = Math.ceil(p.n_max * ((c.halfWidth * 1.25) / c.limit) ** 2);
+      fix =
+        pairs <= 1000
+          ? `${loosen}, or raise oracle.protocol n_max from ${p.n_max} to about ${pairs} (the CI narrows with the square root of the pairs; each evaluation then takes longer)`
+          : `${loosen} (raising oracle.protocol n_max can't do it: it would take about ${pairs} pairs)`;
+    } else if (spec.oracle.noise === "expensive") {
+      fix = `${loosen}, or raise oracle.protocol confirm_runs (now ${p.confirm_runs}) and calibration_runs (now ${p.calibration_runs})`;
+    } else {
+      fix = c.noise >= c.limit ? `${loosen}, or measure it with noise = "noisy" (two runs of the baseline differ by ${pct(c.noise, 2)})` : `${loosen}, or lower oracle.protocol tolerance below ${pct(c.limit)}`;
+    }
+    return `guardrail ${c.name} can't be judged${on}: its CI half-width at a full evaluation is ${pct(c.halfWidth, 2)} (noise ${pct(c.noise, 2)}), not below its ${pct(c.limit)} limit, so every win would be flagged inconclusive on it. Fix the spec: ${fix}.`;
+  });
 }
 
 /** Combine per-host guardrail calibrations: the worst host decides (as for the MDE). */

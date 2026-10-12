@@ -547,6 +547,7 @@ function benchLines(engine: Engine, s: StudyRow): string[] {
     (h) =>
       `  ${h.name} [${h.mode === "clone" ? "own clone via git bundles" : h.mode === "remote" ? `remote machine (${h.remote?.provider ?? "provider"})` : "local checkouts"}] ${h.status}` +
       ` · health ${h.healthOk === null ? "not checked" : h.healthOk ? "ok" : `FAILING (${h.problems.join("; ")})`}${h.deferredUntil ? ` · deferred until ${new Date(h.deferredUntil).toISOString().slice(11, 19)}` : ""}` +
+      `${h.excluded ? ` · NOT USED until the next calibration (${h.excluded})` : h.threshold !== null ? ` · win threshold ${magnitudePct(h.threshold)}${h.noiseFloor !== null ? `, noise ${magnitudePct(h.noiseFloor)}` : ""}` : ""}` +
       ` · ${h.measuring !== null ? `measuring c/${h.measuring}` : h.gating !== null ? `testing c/${h.gating} (gates hold the bench)` : "idle"} · drift ${h.driftStatus ?? "not run"} (${h.evalsSinceDrift}/${h.driftEvery} evals)` +
       `${h.sideRuns && h.sideRuns > 1 ? ` · ${h.sideRuns} runs a side` : ""}${h.runSeconds ? ` · one run ≈ ${h.runSeconds < 10 ? h.runSeconds.toFixed(2) : h.runSeconds.toFixed(1)} s at calibration` : ""}` +
       ` · cached best build ${h.bestBuildSha ? h.bestBuildSha.slice(0, 10) : "none"}${h.lastTransfer ? ` · last bundle ${h.lastTransfer}` : ""}${h.healthSummary ? `\n      ${h.healthSummary}` : ""}`,
@@ -662,7 +663,7 @@ export function showStudy(engine: Engine, slug: string, eventCount: number): str
   lines.push(
     ...section("Calibration", [
       ...kv([
-        ["MDE", cal.mde !== null ? magnitudePct(cal.mde) : null],
+        ["MDE", cal.thresholds ? `${cal.thresholds}${cal.thresholds.includes(" on ") ? " (each host decides with its own)" : ""}` : cal.mde !== null ? magnitudePct(cal.mde) : null],
         ["Noise floor", cal.noiseFloor !== null ? magnitudePct(cal.noiseFloor) : null],
         ["Eval", cal.evalSeconds !== null ? formatDuration(cal.evalSeconds) : null],
       ]),

@@ -189,6 +189,14 @@ export const specSchema = z
          * Not part of the oracle hash.
          */
         quiet_bench: z.boolean().default(false),
+        /**
+         * A bench host whose calibrated noise floor is more than this many times
+         * the median of its peers' (the other bench hosts') is not used: a BB
+         * machine or the edit host is taken out of the dispatch set, a remote
+         * machine is replaced. 0 turns it off. Which hosts measure, not how a
+         * commit is judged: not part of the oracle hash.
+         */
+        max_host_noise_ratio: z.union([z.literal(0), z.number().min(1).max(100)]).default(2),
         /** Hidden workload on the bench host, run only on candidates about to be promoted. Agents see pass/fail only. */
         holdout: z
           .object({
@@ -224,6 +232,11 @@ export const specSchema = z
             retry_seconds: z.number().min(1).max(3600).default(60),
             /** Notify the human when a host stays unhealthy this long. */
             notify_after_minutes: z.number().min(0).max(24 * 60).default(15),
+            /**
+             * An automatic recalibration whose health check fails tries again every
+             * `retry_seconds`, at most this many times, before it pauses the study.
+             */
+            recalibration_retries: z.number().int().min(0).max(1000).default(30),
           })
           .strict()
           .prefault({}),
@@ -436,6 +449,8 @@ export function normalizeSpec(spec: StudySpec): StudySpec {
     ...spec.oracle,
     single_machine: spec.oracle.single_machine ?? "auto",
     quiet_bench: spec.oracle.quiet_bench ?? false,
+    max_host_noise_ratio: spec.oracle.max_host_noise_ratio ?? 2,
+    health: spec.oracle.health ? { ...spec.oracle.health, recalibration_retries: spec.oracle.health.recalibration_retries ?? 30 } : spec.oracle.health,
     remote_bench: spec.oracle.remote_bench ?? [],
     protocol: { ...PROTOCOL_V024_DEFAULTS, ...spec.oracle.protocol } as StudySpec["oracle"]["protocol"],
     drift: { ...spec.oracle.drift, recalibrate_below: spec.oracle.drift?.recalibrate_below ?? 0.6 },
@@ -475,9 +490,9 @@ function canonical(value: unknown): string {
  */
 export function oracleHash(spec: StudySpec, protectedContentHash = ""): string {
   // Bench operations (health thresholds, drift schedule, transfer cap, offline
-  // grace) and scheduling (single-machine mode, quiet bench) don't change how a
-  // commit is judged, so tuning them is not a new segment.
-  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, remote_bench: remoteRaw, ...rest } = spec.oracle;
+  // grace) and scheduling (single-machine mode, quiet bench, which hosts measure)
+  // don't change how a commit is judged, so tuning them is not a new segment.
+  const { health: _health, drift: _drift, max_bundle_mib: _mib, offline_grace_minutes: _grace, single_machine: _single, quiet_bench: _quiet, max_host_noise_ratio: _ratio, remote_bench: remoteRaw, ...rest } = spec.oracle;
   const protocol: Record<string, unknown> = { ...rest.protocol };
   for (const [k, v] of Object.entries(PROTOCOL_V024_DEFAULTS)) if (protocol[k] === undefined || protocol[k] === v) delete protocol[k];
   // Remote machines: what they are and how they are prepared judges a commit (provider, shape,

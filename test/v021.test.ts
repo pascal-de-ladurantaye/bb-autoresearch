@@ -72,7 +72,9 @@ const GUARDRAIL_LOSS = [
 
 describe("formatting (pure)", () => {
   it("says the noise per noise class, and 'not measured' without a floor (never 0.00% from a missing floor)", () => {
-    expect(noiseFloorText("noisy", [0.0123, 0.0362])).toBe("Run-to-run noise is 3.62% per pair.");
+    expect(noiseFloorText("noisy", [0.0362])).toBe("Run-to-run noise is 3.62% per pair.");
+    // Several bench hosts (v1): each decides with its own threshold, so the range is shown.
+    expect(noiseFloorText("noisy", [0.0123, 0.0362])).toBe("Run-to-run noise is 1.23% to 3.62% per pair, depending on the bench host.");
     expect(noiseFloorText("noisy", [null])).toBe("Run-to-run noise: not measured.");
     expect(noiseFloorText("noisy", [])).toBe("Run-to-run noise: not measured.");
     expect(noiseFloorText("expensive", [0.021])).toBe("Run-to-run noise is 2.10% (σ of one run).");

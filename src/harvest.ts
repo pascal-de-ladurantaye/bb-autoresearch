@@ -49,7 +49,7 @@ import {
 import { checkHealth } from "./health.ts";
 import { BenchError, strategyFor } from "./noise.ts";
 import type { GuardrailEstimate } from "./guardrails.ts";
-import { errText, gitId, IN_FLIGHT_STAGES, segmentGuardrailCalibration, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
+import { errText, gitId, hostGuardrailCalibration, IN_FLIGHT_STAGES, measurementMde, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
 import type { ComposeInput, ComposeResult } from "./host/contract.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { DryRunPublisher, type PrDraft } from "./publisher.ts";
@@ -325,8 +325,9 @@ export class Harvester {
 
   // ---- bench measurement of two commits (ref = "best" side) ----
   private benchHost(study: StudyRow): BenchHostRow {
-    const hosts = this.pipeline.benchHosts(study).filter((x) => x.status !== "offline");
-    const host = hosts.find((x) => (x.deferred_until ?? 0) <= this.ctx.now()) ?? hosts[0] ?? this.pipeline.benchHosts(study)[0];
+    // The quietest host first (dispatchHosts), like the pipeline's measurements.
+    const hosts = this.pipeline.dispatchHosts(study).filter((x) => x.status !== "offline");
+    const host = hosts.find((x) => (x.deferred_until ?? 0) <= this.ctx.now()) ?? hosts[0] ?? this.pipeline.dispatchHosts(study)[0] ?? this.pipeline.benchHosts(study)[0];
     if (!host) throw new Error("the study has no bench host");
     return host;
   }
@@ -367,13 +368,13 @@ export class Harvester {
           const outcome = await strategy.measure({
             bench: site.bench(fixed, { best: refDir, candidate: dir }, { signal, label }),
             spec: fixed,
-            mde: Math.max(segment?.mde ?? spec.oracle.protocol.min_effect, row.mde ?? 0),
+            mde: measurementMde(this.store, study, spec, row),
             rng: this.ctx.rng,
             record: () => undefined,
             bestCache: null,
             baseline: baseline?.sha === refSha ? baseline.runs : null,
             noiseFloor: row.noise_floor ?? segment?.noise_floor ?? null,
-            guardrailNoise: Object.fromEntries(segmentGuardrailCalibration(this.store, study).map((g) => [g.name, g.noise])),
+            guardrailNoise: Object.fromEntries(hostGuardrailCalibration(this.store, study, host.host_id).map((g) => [g.name, g.noise])),
             signal,
           });
           const seconds = (this.ctx.now() - started) / 1000;

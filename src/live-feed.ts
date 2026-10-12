@@ -152,6 +152,15 @@ export function feedItems(
       case "remote.left":
         push(`${typeof d.host === "string" ? ctx.hostName(d.host) : "A remote machine"} left: ${clip(String(d.reason ?? ""), 80)}`, d.expected ? "info" : "warn", null);
         break;
+      case "bench.noisy_host": {
+        const h = typeof d.host === "string" ? ctx.hostName(d.host) : "A bench host";
+        const ratio = typeof d.ratio === "number" ? `${d.ratio.toFixed(1)}× the other hosts' noise` : "much noisier than the other hosts";
+        push(d.action === "kept" ? `${h} is ${ratio}, kept after replacements that were too: quieter hosts go first` : d.action === "replaced" ? `${h} is ${ratio}: replaced` : `${h} is ${ratio}: it measures nothing until the next calibration`, "warn", null);
+        break;
+      }
+      case "recalibration.deferred":
+        push(`Recalibration waits for a healthy bench (retry ${String(d.tries ?? "?")} of ${String(d.max ?? "?")} in ${String(d.retry_seconds ?? "?")} s)`, "warn", null);
+        break;
       case "drift.checked":
         push(`Drift check on ${typeof d.host === "string" ? ctx.hostName(d.host) : "the bench"}: ${d.ok ? "noise as calibrated" : "noise drifted"}`, d.ok ? "info" : "warn", null);
         break;

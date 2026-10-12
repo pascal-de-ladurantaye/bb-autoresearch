@@ -10,7 +10,8 @@
 //   ready → upload the seed → unpack the repository → send best → setup.
 // - Calibration on arrival: A/A on best on that machine alone, under its own
 //   bench lock; it then measures with its own noise floor and win threshold
-//   (never below the segment's). During the study's own calibration the
+//   (never below min_effect). One much noisier than the study's other hosts
+//   is replaced (a bounded number of times in a row). During the study's own calibration the
 //   study calibrates its machines with every other bench host instead.
 // - Rotation: a replacement starts `rotate_before_minutes` before a
 //   machine's lifetime ends; once it has calibrated, the old machine takes no
@@ -27,6 +28,8 @@ import { BenchProviderClient } from "../bench-provider/client.ts";
 import { BenchProviderError, LEAVING_STATES, type DescribeOutput, type HostState } from "../bench-provider/contract.ts";
 import { RemoteBenchRunner, RemoteHostLostError } from "../bench-provider/runner.ts";
 import { HealthError, calibrateHost } from "../calibration.ts";
+import { guardrailProblems } from "../guardrails.ts";
+import { chanceRatio, noisyAgainstPeers, noisyHostText } from "../host-choice.ts";
 import { DEFAULT_REMOTE_CONFIG, type Ctx, type RemoteFleetConfig } from "../context.ts";
 import { REMOTE_LIVE_STATES, type BenchHostRow, type RemoteArtifactRow, type RemoteHostRow, type StudyRow } from "../db/store.ts";
 import type { HostRunner } from "../host/runner.ts";
@@ -73,6 +76,14 @@ const KEEP_AFTER_CALIBRATION_MS = 30 * 60_000;
 /** How often the fleet lists each provider's machines for orphans. */
 const ORPHAN_SWEEP_MS = 10 * 60_000;
 
+/**
+ * How many machines in a row an entry replaces for being much noisier than
+ * the other bench hosts; the next one is kept (it measures with its own win
+ * threshold, and dispatch prefers quieter hosts), so a provider whose
+ * machines are all noisier than the edit host doesn't churn forever.
+ */
+export const NOISY_REPLACEMENTS = 2;
+
 /** Machine states that are joining (not measuring yet). */
 const JOINING = ["creating", "joining", "calibrating"] as const;
 
@@ -89,6 +100,10 @@ export class RemoteFleet {
   private calibrating = new Map<string, string>();
   /** Machines that joined and wait for the study's calibration to calibrate them. */
   private joined = new Set<number>();
+  /** Machines the study's calibration found much noisier than their peers: they leave when it ends, with this reason. */
+  private noisy = new Map<number, string>();
+  /** Machines replaced in a row for being much noisier than their peers, per study and entry (bounded: NOISY_REPLACEMENTS). */
+  private noisyStreak = new Map<string, number>();
   private polledAt = new Map<number, number>();
   private sweptAt = 0;
   /** When each row learned its machine's id (real time): a list started before that can't judge it. */
@@ -621,6 +636,12 @@ export class RemoteFleet {
           this.leave(row, `too noisy: its win threshold would be ${(outcome.mde * 100).toFixed(2)}%, above max_mde ${(spec.oracle.protocol.max_mde * 100).toFixed(2)}%`, { notify: true });
           return;
         }
+        const unjudged = guardrailProblems([{ host: benchRow.name, guardrails: outcome.guardrails ?? [] }], spec);
+        if (unjudged.length) {
+          this.leave(row, `too noisy for a guardrail: ${clip(unjudged[0]!, 300)}`, { notify: true });
+          return;
+        }
+        if (this.noisyOnArrival(study, spec, row, outcome)) return;
         this.markCalibrated(study, row.bench_host_id, outcome, study.best_sha);
         return;
       } catch (e) {
@@ -635,12 +656,50 @@ export class RemoteFleet {
     }
   }
 
+  /**
+   * A machine that calibrated on arrival much noisier than the study's other
+   * bench hosts (`max_host_noise_ratio` times their median noise floor) is
+   * replaced, at most NOISY_REPLACEMENTS times in a row per entry; then it is
+   * kept, with a notice. Returns whether it left.
+   */
+  private noisyOnArrival(study: StudyRow, spec: StudySpec, row: RemoteHostRow, outcome: CalibrationOutcome): boolean {
+    const limit = spec.oracle.max_host_noise_ratio ?? 2;
+    if (spec.oracle.noise === "deterministic" || !(limit > 0)) return false;
+    const peers = this.pipeline.dispatchHosts(study, spec).filter((h) => h.host_id !== row.bench_host_id).map((h) => h.noise_floor);
+    const samples = spec.oracle.noise === "expensive" ? spec.oracle.protocol.calibration_runs : spec.oracle.protocol.calibration_pairs;
+    const hit = noisyAgainstPeers(outcome.noiseFloor, peers, limit, chanceRatio(spec.oracle.noise, samples));
+    const key = this.failureKey(study.id, row.entry);
+    // Above the ratio but within what chance gives equal hosts: it measures (with its own threshold).
+    if (!hit?.significant) {
+      this.noisyStreak.delete(key);
+      return false;
+    }
+    const name = this.store.benchHost(study.id, row.bench_host_id)?.name ?? row.bench_host_id;
+    const why = noisyHostText({ hostId: row.bench_host_id, name, noise: outcome.noiseFloor, ...hit }, limit, spec.oracle.noise === "expensive" ? "per run" : "per pair");
+    const streak = this.noisyStreak.get(key) ?? 0;
+    this.store.event(study.id, "bench.noisy_host", "plugin", { host: row.bench_host_id, mode: "remote", noise: outcome.noiseFloor, peers: hit.peers, ratio: Math.round(hit.ratio * 100) / 100, limit, action: streak < NOISY_REPLACEMENTS ? "replaced" : "kept", when: "arrival" });
+    if (streak < NOISY_REPLACEMENTS) {
+      this.noisyStreak.set(key, streak + 1);
+      this.leave(row, `much noisier than the other bench hosts: ${why}`, { notify: true });
+      return true;
+    }
+    this.noisyStreak.delete(key);
+    void this.hooks.notify(study, "bench.noisy_host", `Remote bench host ${name} (${row.provider}) is much noisier than the other bench hosts (${why}), after ${streak} replacement(s) in a row that were too: it is kept and measures with its own win threshold; candidates go to quieter hosts first. Nothing to do, unless the provider can lend quieter machines.`, { quiet: true });
+    return false;
+  }
+
+  /** The study's calibration found this machine much noisier than its peers: it leaves when the calibration ends, and is replaced. */
+  markNoisy(study: StudyRow, benchHostId: string, reason: string): void {
+    const row = this.store.remoteHostByBench(study.id, benchHostId);
+    if (row && row.state !== "gone") this.noisy.set(row.id, reason);
+  }
+
   /** A machine calibrated (on arrival, or with the study's calibration): it measures from now on. */
   markCalibrated(study: StudyRow, benchHostId: string, outcome: CalibrationOutcome, sha: string): void {
     const row = this.store.remoteHostByBench(study.id, benchHostId);
     if (!row || row.state === "gone") return;
     this.joined.delete(row.id);
-    const cal = { sha, noiseFloor: outcome.noiseFloor, mde: outcome.mde, evalSeconds: outcome.evalSeconds, sideRuns: outcome.sideRuns ?? null, runSeconds: outcome.runSeconds ?? null, problems: outcome.problems.slice(0, 5), report: clip(outcome.report, 2000), at: this.ctx.now() };
+    const cal = { sha, noiseFloor: outcome.noiseFloor, mde: outcome.mde, evalSeconds: outcome.evalSeconds, sideRuns: outcome.sideRuns ?? null, runSeconds: outcome.runSeconds ?? null, guardrails: outcome.guardrails ?? [], problems: outcome.problems.slice(0, 5), report: clip(outcome.report, 2000), at: this.ctx.now() };
     const wasReady = row.state === "ready";
     this.store.tx(() => {
       this.store.updateRemoteHost(row.id, { state: "ready", phase: null, ready_at: row.ready_at ?? this.ctx.now(), calibration_json: JSON.stringify(cal) });
@@ -800,7 +859,13 @@ export class RemoteFleet {
   endCalibration(study: StudyRow): void {
     this.calibrating.delete(study.id);
     for (const r of this.store.remoteHosts(study.id, { live: true })) {
-      if (this.joined.has(r.id)) {
+      const noisy = this.noisy.get(r.id);
+      this.noisy.delete(r.id);
+      // A machine much noisier than its peers is replaced (the calibration report says so); its slot fills once the study runs.
+      if (noisy) {
+        this.joined.delete(r.id);
+        this.leave(r, noisy, { expected: true });
+      } else if (this.joined.has(r.id)) {
         this.joined.delete(r.id);
         this.leave(r, "not calibrated with the study", { expected: true });
       }

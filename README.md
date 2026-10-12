@@ -59,9 +59,10 @@ wait.
    works.
 2. **Approve and calibrate.** Needs you → *Approve spec v1 and calibrate*
    (review the spec on the Oracle tab first). Calibration runs the gates on the
-   base commit and A/A measurements on every bench host, and reports the
-   smallest win it can detect (MDE), each guardrail's noise (with a warning
-   when it exceeds the limit), and the cost per evaluation. If it fails,
+   base commit and A/A measurements on every bench host, and reports each
+   host's win threshold (the smallest win it can detect, MDE), each
+   guardrail's noise, and the cost per evaluation. It fails when a guardrail
+   can't be judged (its CI is wider than its limit), with the fixes. If it fails,
    the page says why; ask the study thread for a revised spec and approve that.
    CLI: `bb study calibrate <slug> [--wait]`.
 3. **Start.** Seed ideas on the Ideas tab, then Needs you → *Approve and
@@ -159,10 +160,15 @@ gates = true                        # run the gates there too
   base (built once), best as a delta bundle, and `setup`. Each candidate then
   travels as a delta bundle (a few KiB) into a reused checkout.
 - **Calibration per host.** The study's calibration waits for its machines
-  and calibrates them with every other bench host (the segment takes the
-  worst). A machine that joins later (a replacement) runs an A/A on best on
-  its own; it measures with its own noise floor and win threshold, never
-  below the segment's. A machine noisier than `max_mde` is replaced.
+  and calibrates them with every other bench host. A machine that joins later
+  (a replacement) runs an A/A on best on its own. Every bench host decides
+  with its own win threshold (never below `min_effect`), and a candidate goes
+  to the quietest free host. A machine noisier than `max_mde`, or much
+  noisier than the other hosts (`[oracle] max_host_noise_ratio`, default 2×
+  their median noise floor, beyond chance; not hashed, `0` turns it off), is
+  replaced, and a BB machine or the edit host that is measures nothing until
+  the next calibration; see
+  [docs/notes/v1-measurement.md](docs/notes/v1-measurement.md).
 - **Leaving.** A machine whose lifetime ends, or that the provider reports
   suspended, gone or failed, leaves at once and is never reused (it may come
   back on different hardware); a measurement on it restarts from scratch on
@@ -200,7 +206,7 @@ is a provider for local temp directories, for tests and trying it out.
 | `confirm`, `skip_confirm_factor` | `true`, 3 | Wins are re-measured with fresh pairs, unless the CI's lower bound is at least 3× the win threshold (the verdict says it skipped). `0` always confirms. |
 | `side_runs`, `min_side_seconds` | `"auto"`, 5 | Runs of `measure` per side of a pair, keeping each metric's best value. `"auto"` picks the count at calibration so a side lasts at least 5 s. |
 
-`[oracle.drift] recalibrate_below = 0.6` (not hashed): when best's runs take less than 60% of their calibrated time (code that got several times faster is noisier relative to itself), the plugin recalibrates on best at the next free bench slot, in a new segment with the same oracle, instead of letting a drift check pause the study. Noise that grows at the same run time still pauses it, and nothing more is measured on that machine until you resume. Best vs base compounds every segment ("81.8% lower time (5.5×) across 3 segments · this segment 3.62 → 2.04 s"). Simulated error rates and bench savings are in the design notes ("Implementation notes: v0.2.4").
+`[oracle.drift] recalibrate_below = 0.6` (not hashed): when best's runs take less than 60% of their calibrated time (code that got several times faster is noisier relative to itself), the plugin recalibrates on best at the next free bench slot, in a new segment with the same oracle, instead of letting a drift check pause the study. Noise that grows at the same run time still pauses it, and nothing more is measured on that machine until you resume. A recalibration whose health check fails tries again every `[oracle.health] retry_seconds`, up to `recalibration_retries` (30) times, before it pauses the study. Best vs base compounds every segment ("81.8% lower time (5.5×) across 3 segments · this segment 3.62 → 2.04 s"). Simulated error rates and bench savings are in the design notes ("Implementation notes: v0.2.4").
 
 ### Commit identity
 
