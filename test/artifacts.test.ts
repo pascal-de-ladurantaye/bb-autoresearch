@@ -74,3 +74,12 @@ describe("artifact store", () => {
     expect(r).toEqual({ files: [], seeds: { files: 0, bytes: 0 }, bases: { files: 0, bytes: 0 }, deleted: { files: 0, bytes: 0 }, scratch: 0 });
   });
 });
+
+describe("artifact size line (bb study bench)", () => {
+  it("says a cleanup deleted nothing instead of a size", async () => {
+    const { artifactLine } = await import("../src/cli.ts");
+    const base = { seeds: { files: 1, bytes: 2048 }, bases: { files: 1, bytes: 2048 }, study: { files: 2, bytes: 4096 } };
+    expect(artifactLine({ ...base, lastCleanup: { at: 0, reason: "study archived", files: 0, bytes: 0 } })).toMatch(/last cleanup \(study archived\) deleted nothing$/u);
+    expect(artifactLine({ ...base, lastCleanup: { at: 0, reason: "plugin loaded", files: 2, bytes: 3 * 1024 * 1024 } })).toMatch(/deleted 2 file\(s\), 3\.0 MiB$/u);
+  });
+});

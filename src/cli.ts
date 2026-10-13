@@ -736,7 +736,7 @@ function hasRemoteBench(engine: Engine, s: StudyRow): boolean {
 /** The edit host's seeds and base bundles for remote bench hosts, in one line. */
 export function artifactLine(a: ArtifactUsage): string {
   const total = a.seeds.bytes + a.bases.bytes;
-  const last = a.lastCleanup ? ` · last cleanup (${a.lastCleanup.reason}) deleted ${a.lastCleanup.files} file(s), ${mib(a.lastCleanup.bytes)}` : "";
+  const last = a.lastCleanup ? ` · last cleanup (${a.lastCleanup.reason}) deleted ${a.lastCleanup.files ? `${a.lastCleanup.files} file(s), ${mib(a.lastCleanup.bytes)}` : "nothing"}` : "";
   return `${a.seeds.files} seed(s) and ${a.bases.files} base bundle(s) on the edit host, ${mib(total)} · this study uses ${a.study.files} (${mib(a.study.bytes)}); the rest is deleted at the next load or archive unless another study uses it${last}`;
 }
 

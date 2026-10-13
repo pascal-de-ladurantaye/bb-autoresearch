@@ -1231,7 +1231,7 @@ export interface ArtifactUsage {
 }
 
 export function mib(bytes: number): string {
-  return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return bytes < 1024 * 1024 ? `${bytes > 0 ? Math.max(1, Math.round(bytes / 1024)) : 0} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 /** What a refused seed matched, for notices and errors. */
