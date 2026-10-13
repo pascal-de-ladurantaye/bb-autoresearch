@@ -550,4 +550,7 @@ export const MIGRATIONS: string[] = [
     UNIQUE (study_id, seq)
   )`,
   `CREATE INDEX adhoc_runs_study ON adhoc_runs (study_id, id)`,
+  // ---- 1.0 integration ----
+  /** Consecutive noisy replacements per remote entry (RemoteFleet.noisyOnArrival), kept across a plugin reload. */
+  `ALTER TABLE studies ADD COLUMN remote_noisy_json TEXT`,
 ];

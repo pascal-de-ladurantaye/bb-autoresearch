@@ -15,6 +15,7 @@ import type { Ctx } from "./context.ts";
 import type { CandidateRow, StudyRow } from "./db/store.ts";
 import { candidateFromMessage } from "./commit.ts";
 import { frozenRef, type Promotion } from "./harvest.ts";
+import { measurementMde } from "./pipeline.ts";
 import { adhocResult } from "./primitives.ts";
 import { safeJson } from "./prompts.ts";
 import { bestBranch, candidateRef, type StudySpec } from "./spec.ts";
@@ -173,7 +174,8 @@ export async function studyEvidence(ctx: Ctx, study: StudyRow, spec: StudySpec, 
       startedAt: g.created_at,
       auto: Boolean(safeJson<{ auto?: boolean }>(g.details_json)?.auto),
     })),
-    benchHosts: benchHosts.map((h) => ({ id: h.host_id, name: h.name, mode: h.mode, active: h.active === 1, noiseFloor: h.noise_floor, threshold: h.mde, sideRuns: h.side_runs })),
+    /** Each host decides with its own win threshold (never below min_effect); `excluded` is why a host much noisier than its peers measures nothing until the next calibration. */
+    benchHosts: benchHosts.map((h) => ({ id: h.host_id, name: h.name, mode: h.mode, active: h.active === 1, noiseFloor: h.noise_floor, threshold: h.mde === null ? null : measurementMde(store, study, spec, h), sideRuns: h.side_runs, excluded: safeJson<{ reason?: string }>(h.excluded_json)?.reason ?? null })),
     candidates: candidates.map((c) => candidateOut(ctx, study, c, ideas, findingsBy.get(c.id) ?? [], Boolean(opts.samples))),
     findings: findings.map((f) => ({ id: f.id, candidate: f.candidate_id !== null ? (store.candidate(f.candidate_id)?.n ?? null) : null, idea: f.idea_id, outcome: f.outcome, learned: f.learned, revisitIf: f.revisit_if || null, evidence: f.evidence || null, at: f.created_at })),
     ideas: ideaRows.map((i) => ({ id: i.id, title: i.title, theme: i.theme, status: i.status, source: i.source })),

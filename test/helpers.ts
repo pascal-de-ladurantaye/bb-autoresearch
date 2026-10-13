@@ -614,7 +614,7 @@ export class FakePort implements BbPort {
 export function makeCtx(host: HostRunner = new FakeHost(), clock = new Clock()): { ctx: Ctx; store: Store; port: FakePort; clock: Clock } {
   const store = new Store(makeDb(), clock.now);
   const port = new FakePort(host);
-  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, adhocHealthTries: 2, usagePollMs: 0, tokenPollMs: 0, liveDwellMs: 0 } };
+  const ctx: Ctx = { store, bb: port, now: clock.now, rng: seededRng(42), benchLock: new HostMutex(), config: { workerCeiling: 64, tickMs: 1000, retryDelayMs: 0, finishingTimeoutMs: 3 * 60_000, hostStatusTtlMs: 0, harvestPollMs: 5, adhocHealthTries: 2, adhocHostWaitMs: 5_000, usagePollMs: 0, tokenPollMs: 0, liveDwellMs: 0 } };
   return { ctx, store, port, clock };
 }
 

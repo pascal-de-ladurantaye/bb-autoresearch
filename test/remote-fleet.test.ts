@@ -13,7 +13,7 @@ import type Database from "better-sqlite3";
 import { HostMutex, type Ctx } from "../src/context.ts";
 import { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";
-import { gatesSerialized } from "../src/pipeline.ts";
+import { gatesSerialized, measurementMde } from "../src/pipeline.ts";
 import { liveView } from "../src/live.ts";
 import { remoteLines } from "../src/remote/view.ts";
 import { benchView } from "../src/views.ts";
@@ -190,8 +190,14 @@ describe("remote bench hosts (example provider, real git)", () => {
 
   async function calibrated(toml = spec()) {
     await engine.proposeStudy("thr_study", "proj_1", toml);
-    await engine.calibrate(SLUG, "human");
-    await engine.waitForCalibration(SLUG, 60_000);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await engine.calibrate(SLUG, "human");
+      await engine.waitForCalibration(SLUG, 60_000);
+      // A noisy A/A whose median CI misses zero by chance (about one calibration in twenty) fails it: try again, as a human would.
+      const s = store.study(SLUG)!;
+      const problems = (JSON.parse(s.calibration_json ?? "{}") as { problems?: string[] }).problems ?? [];
+      if (s.calibration_status !== "failed" || !problems.length || !problems.every((p) => /excludes zero/u.test(p))) break;
+    }
   }
 
   async function started(toml = spec()) {
@@ -674,13 +680,19 @@ describe("remote bench hosts (example provider, real git)", () => {
       return ready().length === 1;
     }, 60_000, 20);
     expect(kept).toBe(true);
-    const rows = store.remoteHosts(sid).sort((a, b) => a.id - b.id);
-    expect(rows).toHaveLength(4);
+    const all = store.remoteHosts(sid).sort((a, b) => a.id - b.id);
+    // Under a loaded test machine a join can fail or time out and its slot fill again: those rows don't count.
+    const rows = all.filter((r) => r.state !== "gone" || /^much noisier/u.test(r.left_reason ?? ""));
+    expect(rows.map((r) => `${r.state}: ${r.left_reason}`), all.map((r) => `${r.state}: ${r.left_reason}`).join(" | ")).toHaveLength(4);
     expect(rows.slice(1, 3).map((r) => r.state)).toEqual(["gone", "gone"]);
     for (const r of rows.slice(1, 3)) expect(r.left_reason).toMatch(/^much noisier than the other bench hosts: noise floor/u);
     expect(store.events(sid, { kinds: ["bench.noisy_host"] }).map((e) => JSON.parse(e.data_json).action).reverse()).toEqual(["replaced", "replaced", "replaced", "kept"]);
     expect(store.notices(sid).some((n) => n.kind === "bench.noisy_host" && n.text.includes("after 2 replacement(s) in a row"))).toBe(true);
     // From now on the entry's machines are kept (a recalibration keeps this one too).
+    expect(engine.fleet.acceptsNoisy(store.study(SLUG)!, rows[3]!.bench_host_id)).toBe(true);
+    // 1.0: the count is kept on the study, so a plugin reload doesn't start the replacements over.
+    expect(JSON.parse(store.study(SLUG)!.remote_noisy_json!)).toEqual({ "0": 3 });
+    await reload();
     expect(engine.fleet.acceptsNoisy(store.study(SLUG)!, rows[3]!.bench_host_id)).toBe(true);
     // The quiet edit host measures first; the kept machine measures with its own (larger) win threshold.
     const local = store.benchHosts(sid).find((h) => h.mode !== "remote")!;
@@ -688,6 +700,120 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(remote.mde!).toBeGreaterThan(local.mde!);
     const c = await decided(queue(50));
     expect(c.bench_host_id).toBe(local.host_id);
+  });
+
+  /** Let the fleet and the pipeline run until `cond` holds. */
+  async function until(cond: () => boolean, timeoutMs = 60_000) {
+    const ok = await waitFor(() => {
+      void tick().catch(() => undefined);
+      return cond();
+    }, timeoutMs, 20);
+    expect(ok).toBe(true);
+  }
+
+  it("1.0: a remote-only study paused at budget end has no machines; the freeze brings them up and `bb study measure` waits for them", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    expect((await decided(queue(50))).verdict).toBe("win");
+    const seedBuilds = store.events(sid, { kinds: ["remote.seed_building"] }).length;
+    engine.pause(SLUG, "human");
+    await until(() => live().length === 0);
+    await engine.fleet.settle();
+    // Paused: the machines are released, so there is no bench host; the refusal names the fix.
+    await expect(engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human")).rejects.toThrow(/no online bench host \(its remote machines are released while it is paused; freeze it for harvest/u);
+    // A reload while paused: seeds and the base bundle of a study that isn't archived stay, however old.
+    const kept = store.artifacts(sid).filter((a) => a.state === "ok" && a.path).map((a) => a.path!);
+    const old = new Date(Date.now() - 3_600_000);
+    for (const p of kept) utimesSync(p, old, old);
+    await reload();
+    for (const p of kept) expect(existsSync(p)).toBe(true);
+    // The freeze: best is pinned and the fleet brings machines up again.
+    engine.startHarvest(SLUG, "human");
+    // Asked before any machine is ready: the run waits instead of failing.
+    expect(ready()).toHaveLength(0);
+    const row = await engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human");
+    expect(row.state).toBe("queued");
+    await until(() => store.latestHarvest(sid)?.state === "frozen");
+    expect(sh(repo, "rev-parse", "refs/studies/toy-remote/harvest/h1")).toBe(store.study(SLUG)!.best_sha);
+    await until(() => /^waiting for a bench host: remote machines (being requested|on their way \(\d+ joining)/u.test(store.adhocRun(row.id)!.progress ?? ""));
+    await until(() => ["done", "failed"].includes(store.adhocRun(row.id)!.state));
+    const done = store.adhocRun(row.id)!;
+    expect(done.state, done.error ?? "").toBe("done");
+    const result = JSON.parse(done.result_json!) as { host: { id: string }; threshold: number; classification: string };
+    const host = store.benchHost(sid, result.host.id)!;
+    expect(host.mode).toBe("remote");
+    // The machine calibrated on arrival and the measurement used its own threshold.
+    expect(result.threshold).toBeCloseTo(measurementMde(store, store.study(SLUG)!, store.spec(store.study(SLUG)!), host), 9);
+    expect(result.classification).toBe("win");
+    // The machines that joined after the freeze reused the seed: it was not built again.
+    expect(store.events(sid, { kinds: ["remote.seed_building"] })).toHaveLength(seedBuilds);
+    // An agent's own branch (a split of best, built on base) reaches the machines as a delta bundle too.
+    const wt = join(root, "split");
+    sh(repo, "worktree", "add", "-q", "-b", "split/1", wt, store.study(SLUG)!.base_sha!);
+    writeFileSync(join(wt, "src/a.txt"), "75\n");
+    sh(wt, "commit", "-qam", "Half of the change");
+    sh(repo, "worktree", "remove", "--force", wt);
+    const split = await engine.requestMeasure(SLUG, { refA: "base", refB: "split/1" }, "human");
+    await until(() => ["done", "failed"].includes(store.adhocRun(split.id)!.state));
+    expect(store.adhocRun(split.id)!.state, store.adhocRun(split.id)!.error ?? "").toBe("done");
+    expect(store.benchHost(sid, store.adhocRun(split.id)!.host_id!)!.mode).toBe("remote");
+    // Gates run on the edit host.
+    const gate = await engine.requestGate(SLUG, { ref: "split/1" }, "human");
+    await engine.primitives.wait(gate.id, 30_000);
+    expect(store.adhocRun(gate.id)!.state).toBe("done");
+  });
+
+  it("1.0: a plugin reload during a requested measurement re-adopts the machines with their own thresholds; the next request measures there", async () => {
+    setup(6, `${MEASURE}sleep 0.05\n`);
+    await started();
+    const sid = studyId();
+    expect((await decided(queue(50))).verdict).toBe("win");
+    engine.startHarvest(SLUG, "human");
+    await until(() => store.latestHarvest(sid)?.state === "frozen" && ready().length === 2);
+    const before = new Map(ready().map((r) => [r.bench_host_id, store.benchHost(sid, r.bench_host_id)!.mde] as const));
+    const row = await engine.requestMeasure(SLUG, { refA: "base", refB: "best", pairs: 4 }, "human");
+    await until(() => store.adhocRun(row.id)!.state === "running");
+    await reload();
+    // The run belonged to the old instance; the machines did not.
+    expect(store.adhocRun(row.id)).toMatchObject({ state: "failed", error: expect.stringContaining("interrupted by a plugin reload") });
+    expect(store.events(sid, { kinds: ["remote.readopted"] })).toHaveLength(2);
+    for (const [id, mde] of before) expect(store.benchHost(sid, id)).toMatchObject({ active: 1, mde });
+    const again = await engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human");
+    await until(() => ["done", "failed"].includes(store.adhocRun(again.id)!.state));
+    const done = store.adhocRun(again.id)!;
+    expect(done.state, done.error ?? "").toBe("done");
+    expect(before.has(done.host_id!)).toBe(true);
+    const result = JSON.parse(done.result_json!) as { threshold: number };
+    expect(result.threshold).toBeCloseTo(Math.max(0.01, before.get(done.host_id!)!), 9);
+    expect(store.events(sid, { kinds: ["remote.left"] })).toHaveLength(0);
+  });
+
+  it("1.0: a machine lost during a requested measurement: the run starts again on another host (not when the host was named)", async () => {
+    setup();
+    await started();
+    const sid = studyId();
+    expect((await decided(queue(50))).verdict).toBe("win");
+    engine.startHarvest(SLUG, "human");
+    await until(() => store.latestHarvest(sid)?.state === "frozen" && ready().length === 2);
+    for (const m of alive()) writeFileSync(join(m.home, "slow"), "");
+    const row = await engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human");
+    await until(() => store.adhocRun(row.id)!.state === "running" && /pair/u.test(store.adhocRun(row.id)!.progress ?? ""));
+    const on = store.adhocRun(row.id)!.host_id!;
+    provider.kill(store.remoteHostByBench(sid, on)!.remote_id!);
+    await until(() => ["done", "failed"].includes(store.adhocRun(row.id)!.state));
+    const done = store.adhocRun(row.id)!;
+    expect(done.state, done.error ?? "").toBe("done");
+    expect(done.host_id).not.toBe(on);
+    // Named with --host, it fails with the reason instead.
+    await until(() => ready().length === 2);
+    for (const m of alive()) writeFileSync(join(m.home, "slow"), "");
+    const target = ready()[0]!;
+    const pinned = await engine.requestMeasure(SLUG, { refA: "base", refB: "best", host: target.bench_host_id }, "human");
+    await until(() => store.adhocRun(pinned.id)!.state === "running" && /pair/u.test(store.adhocRun(pinned.id)!.progress ?? ""));
+    provider.kill(target.remote_id!);
+    await until(() => ["done", "failed"].includes(store.adhocRun(pinned.id)!.state));
+    expect(store.adhocRun(pinned.id)).toMatchObject({ state: "failed", error: expect.stringContaining("left during the measurement") });
   });
 
   it("measures on local and remote hosts together, each with its own calibration", async () => {

@@ -46,7 +46,7 @@ import type { HostRunner } from "../host/runner.ts";
 import { seedFindingsText } from "../host/seed.ts";
 import type { CalibrationOutcome } from "../noise.ts";
 import { benchLockKey, errText, type Pipeline } from "../pipeline.ts";
-import { clip, formatDuration } from "../prompts.ts";
+import { clip, formatDuration, safeJson } from "../prompts.ts";
 import type { RemoteBenchSpec, StudySpec } from "../spec.ts";
 
 /** Label every machine carries, so `list` finds this plugin's machines (and orphans). */
@@ -111,8 +111,6 @@ export class RemoteFleet {
   private joined = new Set<number>();
   /** Machines the study's calibration found much noisier than their peers: they leave when it ends, with this reason. */
   private noisy = new Map<number, string>();
-  /** Machines replaced in a row for being much noisier than their peers, per study and entry (bounded: NOISY_REPLACEMENTS). */
-  private noisyStreak = new Map<string, number>();
   private polledAt = new Map<number, number>();
   private sweptAt = 0;
   /** When each row learned its machine's id (real time): a list started before that can't judge it. */
@@ -701,24 +699,23 @@ export class RemoteFleet {
     const peers = this.pipeline.dispatchHosts(study, spec).filter((h) => h.host_id !== row.bench_host_id).map((h) => h.noise_floor);
     const samples = spec.oracle.noise === "expensive" ? spec.oracle.protocol.calibration_runs : spec.oracle.protocol.calibration_pairs;
     const hit = noisyAgainstPeers(outcome.noiseFloor, peers, limit, chanceRatio(spec.oracle.noise, samples));
-    const key = this.failureKey(study.id, row.entry);
     // Above the ratio but within what chance gives equal hosts: it measures (with its own threshold).
     if (!hit?.significant) {
-      if (hit === null) this.noisyStreak.delete(key);
+      if (hit === null) this.setNoisyStreak(study.id, row.entry, 0);
       return false;
     }
     const name = this.store.benchHost(study.id, row.bench_host_id)?.name ?? row.bench_host_id;
     const why = noisyHostText({ hostId: row.bench_host_id, name, noise: outcome.noiseFloor, ...hit }, limit, spec.oracle.noise === "expensive" ? "per run" : "per pair");
-    const streak = this.noisyStreak.get(key) ?? 0;
+    const streak = this.noisyStreak(study.id, row.entry);
     this.store.event(study.id, "bench.noisy_host", "plugin", { host: row.bench_host_id, mode: "remote", noise: outcome.noiseFloor, peers: hit.peers, ratio: Math.round(hit.ratio * 100) / 100, limit, action: streak < NOISY_REPLACEMENTS ? "replaced" : "kept", when: "arrival" });
     if (streak < NOISY_REPLACEMENTS) {
-      this.noisyStreak.set(key, streak + 1);
+      this.setNoisyStreak(study.id, row.entry, streak + 1);
       this.leave(row, `much noisier than the other bench hosts: ${why}`, { notify: true });
       return true;
     }
     // From now on this entry's machines are kept as they come (and recalibrations keep them too): see acceptsNoisy.
     // The notice goes out once, not on every rotation.
-    this.noisyStreak.set(key, NOISY_REPLACEMENTS + 1);
+    this.setNoisyStreak(study.id, row.entry, NOISY_REPLACEMENTS + 1);
     if (streak === NOISY_REPLACEMENTS) void this.hooks.notify(study, "bench.noisy_host", `Remote bench host ${name} (${row.provider}) is much noisier than the other bench hosts (${why}), after ${streak} replacement(s) in a row that were too: it is kept and measures with its own win threshold; candidates go to quieter hosts first. Nothing to do, unless the provider can lend quieter machines.`, { quiet: true });
     return false;
   }
@@ -730,7 +727,23 @@ export class RemoteFleet {
    */
   acceptsNoisy(study: StudyRow, benchHostId: string): boolean {
     const row = this.store.remoteHostByBench(study.id, benchHostId);
-    return row ? (this.noisyStreak.get(this.failureKey(study.id, row.entry)) ?? 0) >= NOISY_REPLACEMENTS : false;
+    return row ? this.noisyStreak(study.id, row.entry) >= NOISY_REPLACEMENTS : false;
+  }
+
+  /** Machines of an entry replaced in a row for their noise (persisted on the study: a plugin reload keeps the count). */
+  private noisyStreak(studyId: string, entry: number): number {
+    const map = safeJson<Record<string, number>>(this.store.study(studyId)?.remote_noisy_json ?? null) ?? {};
+    return map[String(entry)] ?? 0;
+  }
+
+  private setNoisyStreak(studyId: string, entry: number, n: number): void {
+    const study = this.store.study(studyId);
+    if (!study) return;
+    const map = safeJson<Record<string, number>>(study.remote_noisy_json) ?? {};
+    if ((map[String(entry)] ?? 0) === n) return;
+    if (n > 0) map[String(entry)] = n;
+    else delete map[String(entry)];
+    this.store.updateStudy(studyId, { remote_noisy_json: Object.keys(map).length ? JSON.stringify(map) : null });
   }
 
   /** The study's calibration found this machine much noisier than its peers: it leaves when the calibration ends, and is replaced. */

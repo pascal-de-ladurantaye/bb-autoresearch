@@ -15,7 +15,7 @@ import type { Ctx } from "./context.ts";
 import type { AdhocRunRow, BenchHostRow, StudyRow } from "./db/store.ts";
 import { checkHealth } from "./health.ts";
 import { BenchError, strategyFor, type Sample } from "./noise.ts";
-import { BENCH_BOUND_STAGES, benchLockKey, errText, gatesSerialized, measurementMde, segmentGuardrailCalibration, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
+import { BENCH_BOUND_STAGES, benchLockKey, errText, gatesSerialized, hostGuardrailCalibration, measurementMde, withBench, withGateLock, type Pipeline } from "./pipeline.ts";
 import { clip, safeJson } from "./prompts.ts";
 import { ciText, improvementText, magnitudePct } from "./present.ts";
 import { candidateRef, type StudySpec } from "./spec.ts";
@@ -90,6 +90,9 @@ const sleep = (ms: number, signal?: AbortSignal) =>
     }, { once: true });
   });
 
+/** Restarts on another host when a remote machine leaves during a requested measurement. */
+const MAX_LOST_RESTARTS = 3;
+
 export class PrimitiveRefused extends Error {
   constructor(message: string) {
     super(message);
@@ -148,22 +151,70 @@ export class Primitives {
     return sha;
   }
 
-  /** The bench host a measurement runs on: the one named, else the first online, healthy and idle one (then any online one). */
-  pickHost(study: StudyRow, name?: string | null): BenchHostRow {
-    const hosts = this.pipeline.benchHosts(study);
+  /**
+   * The bench host a measurement runs on: the one named, else the quietest
+   * online, healthy and idle one (Pipeline.dispatchHosts: each host's own win
+   * threshold, then its noise floor; hosts left out for being much noisier
+   * than their peers are skipped), then any healthy one, then any online one.
+   * Null when none is online now.
+   */
+  pickHost(study: StudyRow, name?: string | null): BenchHostRow | null {
+    const spec = this.store.spec(study);
     if (name) {
+      const hosts = this.pipeline.benchHosts(study);
       const h = hosts.find((x) => x.name === name || x.host_id === name);
       if (!h) throw new PrimitiveRefused(`${study.slug} has no active bench host ${JSON.stringify(name)}; its bench hosts: ${hosts.map(hostLabel).join(", ") || "none"}`);
       if (h.status === "offline") throw new PrimitiveRefused(`bench host ${h.name} is offline`);
+      if (h.excluded_json) throw new PrimitiveRefused(`bench host ${h.name} is not used until the next calibration (${clip(safeJson<{ reason?: string }>(h.excluded_json)?.reason ?? "much noisier than the other bench hosts", 300)}); leave out --host, or name another host`);
       return h;
     }
-    const spec = this.store.spec(study);
-    const online = hosts.filter((x) => x.status !== "offline");
+    const online = this.pipeline.dispatchHosts(study, spec).filter((x) => x.status !== "offline");
     const healthy = online.filter((x) => (x.deferred_until ?? 0) <= this.ctx.now() && x.drift_status !== "drift");
     const idle = healthy.filter((x) => !this.ctx.benchLock.busy(benchLockKey(study, spec, x.host_id)));
-    const h = idle[0] ?? healthy[0] ?? online[0];
-    if (!h) throw new PrimitiveRefused(`${study.slug} has no online bench host${spec.oracle.remote_bench?.length && study.state === "paused" ? " (its remote machines are released while it is paused; freeze it for harvest with `bb study harvest`, which keeps them)" : ""}`);
-    return h;
+    return idle[0] ?? healthy[0] ?? online[0] ?? null;
+  }
+
+  /**
+   * Remote machines on their way, when no bench host is online: the study
+   * keeps its machines (Running, or frozen for harvest) and has remote
+   * entries, so the fleet is bringing them up (after a pause destroyed them,
+   * or a plugin reload is re-adopting them). Null: none will come.
+   */
+  remoteComing(study: StudyRow): string | null {
+    if (study.state !== "harvesting" && study.state !== "running") return null;
+    const spec = this.store.spec(study);
+    if (!spec.oracle.remote_bench?.length) return null;
+    const live = this.store.remoteHosts(study.id, { live: true });
+    const count = (states: string[]) => live.filter((r) => states.includes(r.state)).length;
+    const adopting = live.filter((r) => r.state === "ready" && r.phase?.startsWith("re-adopting")).length;
+    const parts = [
+      count(["creating", "joining"]) ? `${count(["creating", "joining"])} joining` : "",
+      count(["calibrating"]) ? `${count(["calibrating"])} calibrating on arrival` : "",
+      adopting ? `${adopting} being re-adopted after a plugin reload` : "",
+    ].filter(Boolean);
+    return `waiting for a bench host: remote machines ${parts.length ? `on their way (${parts.join(", ")})` : "being requested"}`;
+  }
+
+  private noHostText(study: StudyRow): string {
+    const spec = this.store.spec(study);
+    return `${study.slug} has no online bench host${spec.oracle.remote_bench?.length && study.state === "paused" ? " (its remote machines are released while it is paused; freeze it for harvest with `bb study harvest`, which brings them up and keeps them)" : ""}`;
+  }
+
+  /** Wait until a bench host is online (remote machines joining), up to adhocHostWaitMs. */
+  private async waitForHost(row: AdhocRunRow, signal: AbortSignal): Promise<BenchHostRow> {
+    const since = this.ctx.now();
+    for (;;) {
+      if (signal.aborted) throw new Error("cancelled");
+      const study = this.store.study(row.study_id)!;
+      const h = this.pickHost(study, null);
+      if (h) return h;
+      const coming = this.remoteComing(study);
+      if (!coming) throw new Error(this.noHostText(study));
+      const waited = this.ctx.now() - since;
+      if (waited >= this.ctx.config.adhocHostWaitMs) throw new Error(`no bench host came online within ${Math.round(this.ctx.config.adhocHostWaitMs / 60_000)} min (${coming}); see \`bb study bench ${study.slug}\` and run it again`);
+      this.progress(row, coming);
+      await sleep(this.ctx.config.harvestPollMs, signal);
+    }
   }
 
   async requestMeasure(study: StudyRow, input: { refA: string; refB: string; pairs?: number | null; host?: string | null }, actor: string, liveWorkers: number): Promise<AdhocRunRow> {
@@ -172,9 +223,11 @@ export class Primitives {
     const spec = this.store.spec(study);
     if (input.pairs !== undefined && input.pairs !== null && spec.oracle.noise !== "noisy") throw new PrimitiveRefused(`--pairs applies to noisy oracles; ${study.slug}'s is ${spec.oracle.noise}`);
     const [shaA, shaB] = [await this.resolve(study, input.refA), await this.resolve(study, input.refB)];
-    const host = this.pickHost(study, input.host);
-    const row = this.store.insertAdhocRun({ study_id: study.id, kind: "measure", ref_a: input.refA, ref_b: input.refB, sha_a: shaA, sha_b: shaB, host_id: host.host_id, pairs: input.pairs ?? null, actor });
-    this.store.event(study.id, "control.measure", actor, { run: row.id, seq: row.seq, a: input.refA, b: input.refB, sha_a: shaA, sha_b: shaB, host: host.host_id, pairs: input.pairs ?? null });
+    // A named host is pinned; otherwise the host is chosen when the run starts (and again if a remote machine leaves mid-run).
+    const pinned = input.host ? this.pickHost(study, input.host) : null;
+    if (!pinned && !this.pickHost(study, null) && !this.remoteComing(study)) throw new PrimitiveRefused(this.noHostText(study));
+    const row = this.store.insertAdhocRun({ study_id: study.id, kind: "measure", ref_a: input.refA, ref_b: input.refB, sha_a: shaA, sha_b: shaB, host_id: pinned?.host_id ?? null, pairs: input.pairs ?? null, actor });
+    this.store.event(study.id, "control.measure", actor, { run: row.id, seq: row.seq, a: input.refA, b: input.refB, sha_a: shaA, sha_b: shaB, host: pinned?.host_id ?? null, pairs: input.pairs ?? null });
     this.start(row.id);
     return row;
   }
@@ -263,14 +316,17 @@ export class Primitives {
   private async runMeasure(row0: AdhocRunRow, signal: AbortSignal): Promise<void> {
     const study0 = this.store.study(row0.study_id)!;
     const spec = this.store.spec(study0);
-    const host0 = this.store.benchHost(study0.id, row0.host_id!);
-    if (!host0) throw new Error(`bench host ${row0.host_id} is no longer one of the study's`);
+    const pinned = row0.host_id;
+    if (pinned && !this.store.benchHost(study0.id, pinned)) throw new Error(`bench host ${pinned} is no longer one of the study's`);
     const label = `r${row0.seq}`;
     let benchSeconds = 0;
-    for (let attempt = 0; ; attempt++) {
+    let deferrals = 0;
+    let lost = 0;
+    for (;;) {
       if (signal.aborted) throw new Error("cancelled");
+      const host = pinned ? this.store.benchHost(study0.id, pinned)! : await this.waitForHost(row0, signal);
+      if (!pinned) this.store.updateAdhocRun(row0.id, { host_id: host.host_id });
       const study = this.store.study(row0.study_id)!;
-      const host = this.store.benchHost(study.id, host0.host_id) ?? host0;
       this.progress(row0, `waiting for the bench lock on ${host.name}`);
       const started = this.ctx.now();
       let out: MeasureResult | "deferred";
@@ -282,7 +338,15 @@ export class Primitives {
           return await this.measureOn(study, spec, host, row0, label, signal);
         });
       } catch (e) {
-        if (e instanceof RemoteHostLostError) throw new Error(`bench host ${host.name} left during the measurement (a remote machine ends its lifetime or was lost); run it again`);
+        if (e instanceof RemoteHostLostError) {
+          // A remote machine left (lifetime, provider): start again on another host, unless the caller pinned this one.
+          if (!pinned && lost < MAX_LOST_RESTARTS && !signal.aborted) {
+            lost += 1;
+            this.progress(row0, `${host.name} left during the measurement; starting again on another bench host (${lost} of ${MAX_LOST_RESTARTS})`);
+            continue;
+          }
+          throw new Error(`bench host ${host.name} left during the measurement (a remote machine ends its lifetime or was lost); run it again`);
+        }
         if (e instanceof BenchError) throw new Error(`measure failed on side ${e.side === "best" ? "A" : "B"}: ${e.message}${e.output ? `\n${clip(e.output, 600)}` : ""}`);
         if (e instanceof BenchTransferError) throw new Error(`could not send ${e.purpose === "best" ? "A" : "B"} to ${host.name}: ${e.message}`);
         throw e;
@@ -295,7 +359,8 @@ export class Primitives {
         this.finish(row0, out, benchSeconds);
         return;
       }
-      if (attempt >= this.ctx.config.adhocHealthTries) throw new Error(`bench host ${host.name} stayed unhealthy; the measurement could not run`);
+      if (deferrals >= this.ctx.config.adhocHealthTries) throw new Error(`bench host ${host.name} stayed unhealthy; the measurement could not run`);
+      deferrals += 1;
       this.progress(row0, `${host.name} failed its health check; retrying in ${spec.oracle.health.retry_seconds} s`);
       await sleep(spec.oracle.health.retry_seconds * 1000, signal);
     }
@@ -344,7 +409,8 @@ export class Primitives {
       bestCache: null,
       baseline: baseline?.sha === shaA ? baseline.runs : null,
       noiseFloor: hostRow.noise_floor ?? segment?.noise_floor ?? null,
-      guardrailNoise: Object.fromEntries(segmentGuardrailCalibration(this.store, study).map((g) => [g.name, g.noise])),
+      // The measuring host's own guardrail noise, as for a candidate measured there.
+      guardrailNoise: Object.fromEntries(hostGuardrailCalibration(this.store, study, host.host_id).map((g) => [g.name, g.noise])),
       signal,
     });
     const verdict = decideVerdict(outcome, spec, { mde: threshold });

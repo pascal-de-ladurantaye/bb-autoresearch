@@ -7,7 +7,9 @@ import { showStudy } from "../src/cli.ts";
 import type { Store } from "../src/db/store.ts";
 import { Engine } from "../src/engine.ts";
 import { chanceRatio, hostThresholdsText, noisyAgainstPeers, noisyOutliers, quietestFirst } from "../src/host-choice.ts";
+import { studyEvidence } from "../src/evidence.ts";
 import { measurementMde } from "../src/pipeline.ts";
+import type { MeasureResult } from "../src/primitives.ts";
 import { oracleHash, parseSpec } from "../src/spec.ts";
 import { seededRng } from "../src/stats.ts";
 import { benchHostsView, oracleView, overview, statusLine } from "../src/views.ts";
@@ -267,6 +269,37 @@ describe("v1 measurement quality (fake hosts)", () => {
     await engine.waitForCalibration(SLUG, 10_000);
     expect(store.study(id)!.calibration_status).toBe("ready");
     expect(store.benchHost(id, "host_a")!.excluded_json).toBeNull();
+  });
+
+  it("1.0: `bb study measure` goes to the quietest host with that host's own threshold, and never to a host left out for its noise", async () => {
+    benchA.noise = uniform(3, 0.2);
+    benchB.noise = uniform(4, 0.01);
+    const id = await running(v1Spec());
+    await submit("thr_w1", "TA", 800);
+    await engine.settle();
+    expect(store.candidateByN(id, 1)!.verdict).toBe("win");
+    const s = store.study(id)!;
+    const spec = store.spec(s);
+    expect(store.benchHost(id, "host_a")!.excluded_json).not.toBeNull();
+    const row = await engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human");
+    // The host is chosen when the run starts, not pinned at the request.
+    expect(row.host_id).toBeNull();
+    await engine.primitives.wait(row.id, 10_000);
+    const done = store.adhocRun(row.id)!;
+    expect(done.state, done.error ?? "").toBe("done");
+    expect(done.host_id).toBe("host_b");
+    const result = JSON.parse(done.result_json!) as MeasureResult;
+    expect(result.host.id).toBe("host_b");
+    expect(result.threshold).toBeCloseTo(measurementMde(store, s, spec, store.benchHost(id, "host_b")!), 9);
+    expect(result.threshold).toBeLessThan(measurementMde(store, s, spec, store.benchHost(id, "host_a")!));
+    expect(result.classification).toBe("win");
+    // The noisy host measured nothing beyond its calibration, and naming it is refused with the reason.
+    expect(benchA.commands.filter((c) => c.startsWith("measure")).length).toBe(24);
+    await expect(engine.requestMeasure(SLUG, { refA: "base", refB: "best", host: "bench-a" }, "human")).rejects.toThrow(/bench-a is not used until the next calibration \(noise floor/u);
+    // The evidence gives each host's own threshold and the exclusion.
+    const ev = await studyEvidence(engine.ctx, s, spec);
+    expect(ev.benchHosts.find((h) => h.id === "host_a")).toMatchObject({ excluded: expect.stringContaining("median of the other bench hosts") });
+    expect(ev.benchHosts.find((h) => h.id === "host_b")!.threshold).toBeCloseTo(result.threshold, 9);
   });
 
   it("a host above the ratio but within chance keeps measuring, and calibration says why", async () => {

@@ -47,6 +47,8 @@ export interface StudyRow {
   notices_seen_at: number | null;
   /** An automatic recalibration waits for the next free bench slot (JSON `{ reason, at, ratio }`), or null. */
   recalibrate_due: string | null;
+  /** Remote machines replaced in a row for being much noisier than their peers, per `[[oracle.remote_bench]]` entry (JSON `{ "<entry>": n }`), so a plugin reload keeps the count. */
+  remote_noisy_json: string | null;
 }
 
 export interface SpecVersionRow {

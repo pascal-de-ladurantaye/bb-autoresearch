@@ -44,6 +44,8 @@ export interface EngineConfig {
   harvestPollMs: number;
   /** Health deferrals a requested measurement (`bb study measure`) waits through before failing. */
   adhocHealthTries: number;
+  /** How long a requested measurement waits for a bench host when none is online yet (remote machines joining after a freeze or a reload). */
+  adhocHostWaitMs: number;
   /** How often provider usage windows are read (bb.sdk.system.usageLimits). */
   usagePollMs: number;
   /** How often a live thread's token usage is read. */
@@ -105,6 +107,7 @@ export const DEFAULT_CONFIG: EngineConfig = {
   hostStatusTtlMs: 15_000,
   harvestPollMs: 2_000,
   adhocHealthTries: 30,
+  adhocHostWaitMs: 30 * 60_000,
   usagePollMs: 120_000,
   tokenPollMs: 60_000,
 };
