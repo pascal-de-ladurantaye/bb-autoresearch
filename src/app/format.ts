@@ -68,7 +68,7 @@ export const STATE_TONE: Record<string, string> = {
   draft: "bg-muted text-muted-foreground",
   harvesting: "bg-muted text-foreground",
   archived: "bg-muted text-muted-foreground",
-  // Harvest states (ready: harvests before v1).
+  // Harvest states (ready: harvests before 1.0).
   waiting: "bg-muted text-foreground",
   frozen: "bg-success/15 text-success",
   ready: "bg-success/15 text-success",

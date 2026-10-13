@@ -1,7 +1,7 @@
 // Markdown for humans: the study report (trajectory, wins, notable losses,
 // dossier, calibration and segments, harvest). Pure functions of the store.
 // PR descriptions are an agent's (skills/study-harvest); harvests the plugin
-// drafted before v1 are reported as they were. Nothing here reads holdout
+// drafted before 1.0 are reported as they were. Nothing here reads holdout
 // numbers or the holdout command (only pass/fail on candidates).
 import type { Ctx } from "./context.ts";
 import type { ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";

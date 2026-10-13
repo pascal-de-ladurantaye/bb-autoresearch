@@ -1,4 +1,4 @@
-// Harvest records made by the plugin before v1 (grouping, ablation, stacks,
+// Harvest records made by the plugin before 1.0 (grouping, ablation, stacks,
 // PR drafts, publishing). v1 no longer makes them: agents harvest with
 // `bb study evidence`, `measure` and `gate` (skills/study-harvest). These are
 // the pure helpers the Harvest tab, `bb study harvest` and the report still

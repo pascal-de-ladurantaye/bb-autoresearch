@@ -1,7 +1,7 @@
 // v1, agents own commits, harvest and publishing: worker-written commit
 // messages; harvest as a freeze; `bb study measure`, `gate`, `results` and
 // `evidence` (the plugin's trust-boundary primitives); reconciliation of
-// interrupted runs and of harvests the plugin was still running before v1.
+// interrupted runs and of harvests the plugin was still running before 1.0.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,7 +37,7 @@ describe("commit messages are the worker's", () => {
     expect(checkCommitMessage("ok", "y".repeat(4001))).toMatchObject({ ok: false });
   });
 
-  it("builds the message verbatim plus trailers, maps it back to the candidate, and falls back for candidates from before v1", () => {
+  it("builds the message verbatim plus trailers, maps it back to the candidate, and falls back for candidates from before 1.0", () => {
     const msg = candidateCommitMessage("toy", { n: 4, commit_title: "Skip the second parse", commit_body: "It ran twice per request.", summary: "ignored" });
     expect(msg).toBe("Skip the second parse\n\nIt ran twice per request.\n\nAutoresearch-Study: toy\nAutoresearch-Candidate: c/4");
     expect(candidateCommitMessage("toy", { n: 5, commit_title: "Title only", commit_body: null, summary: "" })).toBe("Title only\n\nAutoresearch-Study: toy\nAutoresearch-Candidate: c/5");
@@ -262,7 +262,7 @@ describe("primitives and evidence through the CLI (fake host)", () => {
     expect(JSON.parse(file.content).findings).toHaveLength(80);
   });
 
-  it("a reload fails interrupted runs and stops a harvest the plugin was running before v1, keeping it readable", async () => {
+  it("a reload fails interrupted runs and stops a harvest the plugin was running before 1.0, keeping it readable", async () => {
     await setup();
     await win();
     const s = study();

@@ -1866,7 +1866,7 @@ export class Engine {
     for (const h of this.store.activeHarvests()) {
       const s = this.store.study(h.study_id);
       if (h.state !== "waiting") {
-        // A harvest the plugin ran before v1, stopped mid-way by the upgrade: frozen on its best, readable as it is.
+        // A harvest the plugin ran before 1.0, stopped mid-way by the upgrade: frozen on its best, readable as it is.
         if (h.best_sha && s?.state === "harvesting") this.harvester.stopLegacy(h);
         else this.store.updateHarvest(h.id, { state: "cancelled", finished_at: this.ctx.now() });
         continue;

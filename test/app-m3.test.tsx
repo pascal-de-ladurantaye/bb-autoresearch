@@ -176,7 +176,7 @@ describe("frontend: M3 study tabs", () => {
     expect(page.queryByRole("button", { name: /Publish/u })).toBeNull();
   });
 
-  it("harvest: a harvest from before v1 stays readable: changesets, contribution, dependency, interaction warning, PR body", async () => {
+  it("harvest: a harvest from before 1.0 stays readable: changesets, contribution, dependency, interaction warning, PR body", async () => {
     const s = study();
     const { store } = engine.ctx;
     store.setStudyState(s.id, "harvesting", "test");
@@ -212,7 +212,7 @@ describe("frontend: M3 study tabs", () => {
     fireEvent.click(page.getByText(/PR preview: Drop trailing whitespace/u));
     expect(page.getByText(/Whitespace-body-marker/u)).toBeTruthy();
     expect(page.getByText("/exports/h1")).toBeTruthy();
-    expect(page.getByText(/drafted before v1, read only/u)).toBeTruthy();
+    expect(page.getByText(/drafted before 1.0, read only/u)).toBeTruthy();
     // Read only: no publish and no keep/drop controls.
     expect(page.queryByRole("button", { name: /Publish/u })).toBeNull();
     expect(page.queryByRole("radio")).toBeNull();
@@ -245,7 +245,7 @@ describe("frontend: M3 study tabs", () => {
     store.updateHarvest(h.id, { state: "ready", finished_at: Date.now(), grouping_source: "strategist", total_effect: 0.2, total_ci_lo: 0.19, total_ci_hi: 0.21, total_n: 5, stacks_json: JSON.stringify([{ stack: 1, members: [cs1.id, cs2.id], layers: [{ host: cs1.id, members: [cs1.id, cs2.id] }], status: "not_needed", estimate: null, n: null, detail: null }]), publish_state: "dry-run" });
     const page = await open("toy-size/harvest");
     const list = await page.findByLabelText("Changesets");
-    expect(page.getByText(/^Harvest h1 \(drafted before v1/u)).toBeTruthy();
+    expect(page.getByText(/^Harvest h1 \(drafted before 1.0/u)).toBeTruthy();
     expect(page.queryByText(/^Harvest h2/u)).toBeNull();
     expect(list.textContent).toContain("#2 ships inside #1's PR: #2 needs src/x.ts, which #1 adds or changes, so it doesn't apply on `main` alone.");
     expect(list.textContent).toContain("Its PR also ships #2");

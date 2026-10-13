@@ -500,7 +500,7 @@ export function studyCli(engine: Engine): PluginCliRegistration {
         positionals: slugArg,
         options: {
           ...jsonOpt,
-          publish: { type: "boolean", description: "Removed in v1: an agent publishes with the repository's own tools (study-harvest skill)" },
+          publish: { type: "boolean", description: "Removed in 1.0: an agent publishes with the repository's own tools (study-harvest skill)" },
           harvest: { type: "integer", min: 1, max: 1_000_000, description: "Show harvest h<N> instead of the latest (read only)" },
           wait: { type: "boolean", description: "Wait for best to freeze (in-flight candidates finish first; up to --timeout)" },
           timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait with --wait (default 25m, max 30m)" },
@@ -509,7 +509,7 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           wrap(engine, input.positionals.slug, async () => {
             const slug = input.positionals.slug;
             if (input.options.publish) {
-              throw new PluginCliError("the plugin no longer drafts or publishes PRs (v1): an agent does, with the repository's own tools", {
+              throw new PluginCliError("the plugin no longer drafts or publishes PRs (1.0): an agent does, with the repository's own tools", {
                 code: "removed",
                 hint: `Ask an agent to harvest ${slug} with the study-harvest skill and to publish when you say so. It starts from \`bb study evidence ${slug} --json\`.`,
               });
@@ -549,7 +549,7 @@ export function studyCli(engine: Engine): PluginCliRegistration {
         options: {
           ...jsonOpt,
           pairs: { type: "integer", min: 2, max: 200, description: "Pairs to measure (noisy oracles; default: the study's n_max)" },
-          host: { type: "string", description: "Bench host name or id (default: the first online, healthy, idle one)" },
+          host: { type: "string", description: "Bench host name or id (default: the quietest free host when the run starts, each judged with its own win threshold; a remote-only study frozen for harvest waits for its machines)" },
           detach: { type: "boolean", description: "Return at once with the run id; read it later with `bb study results <slug> <id>`" },
           timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait (default 25m, max 30m); the run continues after it" },
         },
@@ -902,7 +902,7 @@ export function harvestText(engine: Engine, slug: string, harvestId?: number): s
   }
   const acc = h.accounting;
   const lines = [
-    `Harvest h${h.seq} of ${s.slug} · ${h.state} (before v1)${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
+    `Harvest h${h.seq} of ${s.slug} · ${h.state} (before 1.0)${h.detail ? ` (${h.detail})` : ""} · study ${s.state}`,
     ...kv([
       ["Error", h.error ? clip(h.error, 300) : null],
       ["Base → best", `${h.baseSha?.slice(0, 10) ?? "?"} → ${h.bestSha?.slice(0, 10) ?? "?"} · grouping ${h.groupingSource ?? "pending"}${h.groupingNotes ? ` (${clip(h.groupingNotes, 200)})` : ""} · bench ${formatDuration(h.benchSeconds)}`],
@@ -937,7 +937,7 @@ export function harvestText(engine: Engine, slug: string, harvestId?: number): s
     lines.push(...section("Stacks (PR order)", h.stacks.map((st) => `  stack ${st.stack}: ${st.order}${st.contribution ? ` · together ${st.contribution.text}` : ` · ${st.status}`}`)));
   }
   const next = [
-    "Drafted by the plugin before v1; read only.",
+    "Drafted by the plugin before 1.0; read only.",
     h.exportDir ? `Dry-run export (report.md, prs/*.md, manifest.json): ${h.exportDir}` : "",
     h.published ? `Published: ${h.published.map((p) => `#${p.k} ${p.url ?? p.status}`).join(" · ")}` : "",
     s.state === "harvesting" && h.publishState !== "published" ? `Next: ask an agent to finish it with the study-harvest skill (it can reuse these branches and drafts) · \`bb study resume ${slug}\` · \`bb study archive ${slug}\`` : "",

@@ -112,7 +112,7 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(needsYou(engine, study())[0]!.detail).toContain("Ask the study thread to revise the spec");
   });
 
-  it("a harvest the plugin drafted before v1 stays readable; publishing and keep/drop are gone", async () => {
+  it("a harvest the plugin drafted before 1.0 stays readable; publishing and keep/drop are gone", async () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["start", "toy-size"]);
     const s = study();
@@ -128,7 +128,7 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(v.harvest).not.toHaveProperty("canPublish");
     // It asks for an agent to finish it, never for the plugin to publish.
     expect(kinds()).toEqual(["harvest_frozen"]);
-    expect(needsYou(engine, study())[0]!.title).toContain("drafted before v1");
+    expect(needsYou(engine, study())[0]!.title).toContain("drafted before 1.0");
     for (const method of ["study.harvest.plan", "study.harvest.publish", "study.harvest.choice"]) await expect(call(method, { slug: "toy-size", harvestId: h.id })).rejects.toThrow(/no rpc method/u);
     // A new harvest from here is a freeze; the old one stays in the history and readable by id.
     expect((await call("study.harvest.start", { slug: "toy-size" })).ok).toBe(true);

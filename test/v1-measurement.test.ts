@@ -1,4 +1,4 @@
-// v1, measurement quality (docs/notes/v1-measurement.md), against fake hosts:
+// v1, measurement quality (docs/release-notes.md, 1.0), against fake hosts:
 // per-host win thresholds, dispatch to the quietest free host, hosts much
 // noisier than their peers left out, and an automatic recalibration that
 // waits for a healthy bench instead of pausing.
@@ -134,7 +134,7 @@ describe("host choice (pure)", () => {
     expect(base.oracle.health.recalibration_retries).toBe(30);
     expect(oracleHash(parsed("max_host_noise_ratio = 0|recalibration_retries = 3"))).toBe(oracleHash(base));
     expect(oracleHash(parsed("max_host_noise_ratio = 5"))).toBe(oracleHash(base));
-    // A spec stored before v1 (no such keys at all) hashes the same.
+    // A spec stored before 1.0 (no such keys at all) hashes the same.
     const { max_host_noise_ratio: _r, ...oracle } = base.oracle;
     const { recalibration_retries: _h, ...health } = base.oracle.health;
     expect(oracleHash({ ...base, oracle: { ...oracle, health } as never })).toBe(oracleHash(base));

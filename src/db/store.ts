@@ -176,7 +176,7 @@ export interface CandidateRow {
   worker_id: number | null;
   /** Seconds its gates ran (single-machine mode: holding the bench lock). */
   gate_seconds: number;
-  /** The worker's commit title and body (v1); null for candidates submitted before v1 (their message came from the idea and summary). */
+  /** The worker's commit title and body (v1); null for candidates submitted before 1.0 (their message came from the idea and summary). */
   commit_title: string | null;
   commit_body: string | null;
 }
@@ -205,7 +205,7 @@ export interface EventRow {
 
 /**
  * What held the bench lock: a measurement, a profile, calibration, a drift
- * check, a harvest measurement (before v1), a measurement or gate an agent
+ * check, a harvest measurement (before 1.0), a measurement or gate an agent
  * asked for (`bb study measure` / `bb study gate`), or (single-machine mode) a gate.
  */
 export type BenchIntervalKind = "measure" | "profile" | "calibration" | "drift" | "harvest" | "adhoc" | "gate";
@@ -379,11 +379,11 @@ export interface ResolvedBenchHost {
 /**
  * v1 harvests are `waiting` (in-flight candidates finish) then `frozen` (best
  * is fixed; an agent harvests it with `bb study evidence|measure|gate`).
- * `grouping` … `ready` are the states of harvests the plugin ran before v1;
+ * `grouping` … `ready` are the states of harvests the plugin ran before 1.0;
  * those records stay readable.
  */
 export const HARVEST_STATES = ["waiting", "frozen", "grouping", "ablating", "checking", "drafting", "ready", "failed", "cancelled"] as const;
-/** Harvest states of the plugin-run harvests before v1 that were still in progress (they stop at the upgrade). */
+/** Harvest states of the plugin-run harvests before 1.0 that were still in progress (they stop at the upgrade). */
 export const LEGACY_ACTIVE_HARVEST_STATES = ["grouping", "ablating", "checking", "drafting"] as const;
 export type HarvestState = (typeof HARVEST_STATES)[number];
 

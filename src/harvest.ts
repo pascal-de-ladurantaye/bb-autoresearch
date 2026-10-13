@@ -9,7 +9,7 @@
 //             list are recorded, and refs/studies/<slug>/harvest/h<N> pins best
 //
 // `bb study resume` keeps exploring (best moves on; the frozen ref stays) and
-// `bb study archive` ends the study. Harvests the plugin ran before v1
+// `bb study archive` ends the study. Harvests the plugin ran before 1.0
 // (states grouping … ready) stay readable; one still in progress at the
 // upgrade stops where it was and becomes frozen (see `stopLegacy`).
 import type { Ctx } from "./context.ts";
@@ -25,7 +25,7 @@ export interface Promotion {
   sha: string;
   /** Candidate number from the commit's Autoresearch-Candidate trailer (null for a commit the plugin didn't make). */
   n: number | null;
-  /** The commit's subject (v1: the worker's title; before v1: the idea title). */
+  /** The commit's subject (v1: the worker's title; before 1.0: the idea title). */
   title: string;
   /** The commit's body without the plugin's trailers (v1 freezes only). */
   body?: string | null;
@@ -184,7 +184,7 @@ export class Harvester {
   }
 
   /**
-   * A harvest the plugin was running before v1 (grouping, ablating, checking
+   * A harvest the plugin was running before 1.0 (grouping, ablating, checking
    * or drafting) can't continue: that machinery is gone. It stops where it
    * is, frozen on the best it froze; what it measured and drafted so far
    * stays readable, and an agent takes it from there.
@@ -194,7 +194,7 @@ export class Harvester {
     const was = harvest.state;
     this.store.updateHarvest(harvest.id, {
       state: "frozen",
-      phase_detail: `stopped while ${was} when the plugin moved to agent-run harvests (v1); what it measured and drafted so far stays on this page`,
+      phase_detail: `stopped while ${was} when the plugin moved to agent-run harvests (1.0); what it measured and drafted so far stays on this page`,
       finished_at: this.ctx.now(),
     });
     this.store.event(harvest.study_id, "harvest.frozen", "plugin", { harvest: harvest.id, seq: harvest.seq, base: harvest.base_sha, best: harvest.best_sha, legacy: was });

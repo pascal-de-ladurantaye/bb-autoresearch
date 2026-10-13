@@ -8,7 +8,7 @@
 // (verdicts carry pass/fail only).
 //
 // Stability: fields are only ever added within a version. A field that
-// changes meaning or goes away bumps `version`. docs/notes/v1-agent-harvest.md
+// changes meaning or goes away bumps `version`. docs/stability.md
 // documents every field.
 import { commitParts } from "./commit.ts";
 import type { Ctx } from "./context.ts";
@@ -74,7 +74,7 @@ function candidateOut(ctx: Ctx, study: StudyRow, c: CandidateRow, ideas: Map<num
     againstSha: c.against_sha,
     promotedSha: c.promoted_sha,
     idea: idea ? { id: idea.id, title: idea.title, theme: idea.theme } : null,
-    /** The commit message: the worker's own title and body (`fromWorker`), or for candidates from before v1 the idea title and summary. */
+    /** The commit message: the worker's own title and body (`fromWorker`), or for candidates from before 1.0 the idea title and summary. */
     commit: { title: parts.title, body: parts.body, fromWorker: c.commit_title !== null },
     summary: c.summary,
     stats: { files: (safeJson<string[]>(c.changed_paths_json) ?? []).length, linesAdded: c.lines_added, linesDeleted: c.lines_deleted, paths: safeJson<string[]>(c.changed_paths_json) ?? [] },

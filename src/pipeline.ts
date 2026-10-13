@@ -1108,7 +1108,7 @@ export class Pipeline {
         await this.hooks.systemPause(study, `oracle broken: ${h.reason} on ${host.name} (details stay on the bench host)`);
         return;
       }
-      // Keep the guardrail judgement: it was dropped here before v1, so wins checked against a holdout had none recorded.
+      // Keep the guardrail judgement: it was dropped here before 1.0, so wins checked against a holdout had none recorded.
       result = h.pass ? { ...result, verdict: "win", reasons: [...result.reasons, h.reason] } : { ...result, verdict: "lose", reasons: [...result.reasons, HOLDOUT_FAIL] };
     }
     stillMine();

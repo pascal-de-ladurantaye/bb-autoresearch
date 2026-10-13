@@ -4,7 +4,7 @@
 // threshold (the noisier host's); v1 judges each against the threshold of the
 // host that measured it. Common random numbers: each trial replays the same
 // noise stream and pair order under both rules. Set SIM_TRIALS for a longer
-// run (the numbers in docs/notes/v1-measurement.md).
+// run (the numbers in docs/release-notes.md, 1.0).
 import { describe, expect, it } from "vitest";
 import { ciRngFor } from "../src/band.ts";
 import { noisyStrategy, type Bench, type Side } from "../src/noise.ts";

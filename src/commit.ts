@@ -40,7 +40,7 @@ export interface MessageSource {
   summary: string;
 }
 
-/** Title and body of a candidate's commits: the worker's, or for candidates from before v1 the idea title and summary. */
+/** Title and body of a candidate's commits: the worker's, or for candidates from before 1.0 the idea title and summary. */
 export function commitParts(c: MessageSource, ideaTitle?: string | null): { title: string; body: string | null } {
   if (c.commit_title) return { title: c.commit_title, body: c.commit_body };
   return { title: clip(ideaTitle ?? c.summary.split("\n")[0] ?? `candidate c/${c.n}`, COMMIT_TITLE_MAX), body: clip(c.summary, 2000) || null };

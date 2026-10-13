@@ -4,7 +4,7 @@
 // The tab shows the freeze (base, best, the pinned ref, the promotions with
 // their commit messages), the measurements and gates agents asked for, and a
 // short guide with the prompt to give an agent. Harvests the plugin drafted
-// before v1 stay readable: changesets, contributions, stacks, PR previews and
+// before 1.0 stay readable: changesets, contributions, stacks, PR previews and
 // publish results, without the old publish and keep/drop controls.
 import { experimental_NewThreadComposer as NewThreadComposer, Markdown, useBbNavigate, useSdk } from "@get-bb/plugin-sdk/app";
 import { useEffect, useState } from "react";
@@ -87,7 +87,7 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
                   h{x.seq}
                 </button>
                 <StatePill state={x.state} />
-                {x.legacy ? <span className="text-xs text-muted-foreground">before v1</span> : null}
+                {x.legacy ? <span className="text-xs text-muted-foreground">before 1.0</span> : null}
                 {x.publishState && x.publishState !== "dry-run" ? <span className="text-xs">publish: {x.publishState}</span> : null}
                 <span className="text-xs text-muted-foreground">
                   started {ago(x.startedAt)}
@@ -314,14 +314,14 @@ function Runs({ runs, slug }: { runs: Run[]; slug: string }) {
   );
 }
 
-/** A harvest the plugin ran before v1, read only. */
+/** A harvest the plugin ran before 1.0, read only. */
 function LegacyHarvest({ h, onOpenCandidate }: { h: Harvest; onOpenCandidate: (n: number) => void }) {
   const a = h.accounting;
   const onlyMissing = a.missing.length > 0 && (a.gap === null || a.gapHalfWidth === null || Math.abs(a.gap) <= a.gapHalfWidth);
   const running = false;
   return (
     <>
-      <Section title={`Harvest h${h.seq} (drafted before v1, read only)`}>
+      <Section title={`Harvest h${h.seq} (drafted before 1.0, read only)`}>
         <div className="space-y-1 rounded-lg border border-border bg-card px-3 py-2 text-sm">
           <div className="flex flex-wrap items-center gap-2">
             <StatePill state={h.state} />
@@ -406,7 +406,7 @@ function LegacyHarvest({ h, onOpenCandidate }: { h: Harvest; onOpenCandidate: (n
       ) : null}
 
       {h.published || h.exportDir ? (
-        <Section title="Drafts and publishing (before v1)">
+        <Section title="Drafts and publishing (before 1.0)">
           <div className="space-y-2 rounded-lg border border-border bg-card px-3 py-2 text-sm">
             {h.published ? <PublishResults prs={h.published} /> : null}
             <p className="text-xs text-muted-foreground">

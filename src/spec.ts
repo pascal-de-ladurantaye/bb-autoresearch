@@ -343,7 +343,7 @@ export const specSchema = z
       .strict()
       .prefault({}),
     /**
-     * Harvest settings of the plugin-run harvest before v1. Since v1 an agent
+     * Harvest settings of the plugin-run harvest before 1.0. Since v1 an agent
      * harvests (skills/study-harvest), so these keys are still accepted (stored
      * specs keep parsing) but have no effect. Not part of the oracle hash.
      */

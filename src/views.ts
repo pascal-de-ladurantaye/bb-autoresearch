@@ -1047,7 +1047,7 @@ function changesetView(c: ChangesetRow, all: ChangesetRow[], ctx: { total: numbe
     /** The contribution as a share of the base→best gain, in points and units (null when not measured alone). */
     contribution: contributionView({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, ctx.total, ctx.vsBase, ctx.bestRaw, ctx.metric),
     droppable: c.droppable === 1,
-    /** The human's keep/drop choice, when one was made before v1. */
+    /** The human's keep/drop choice, when one was made before 1.0. */
     choice: c.human_choice,
     dependsOn: (safeJson<number[]>(c.depends_on_json) ?? []).map(k).filter((x): x is number => x !== null),
     neededBy,
@@ -1149,7 +1149,7 @@ export function harvestGuide(slug: string) {
 /**
  * Harvest tab: the selected (default: latest) harvest. A v1 harvest is a
  * freeze: base, best, the frozen ref and the promotions, plus the
- * measurements and gates agents asked for. Harvests the plugin ran before v1
+ * measurements and gates agents asked for. Harvests the plugin ran before 1.0
  * show read-only: changesets, ablations, stacks, PR drafts, publish results.
  */
 export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
@@ -1215,7 +1215,7 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
       /** Shown as h<seq>: the harvest's number within the study (id stays internal). */
       seq: h.seq,
       state: h.state,
-      /** Made by the plugin before v1 (grouping, ablation, PR drafts): read-only. */
+      /** Made by the plugin before 1.0 (grouping, ablation, PR drafts): read-only. */
       legacy,
       /** refs/studies/<slug>/harvest/h<seq>, pinning the frozen best (null before best froze). */
       frozenRef: h.best_sha && !legacy ? frozenRef(s.slug, h.seq) : null,
@@ -1272,7 +1272,7 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
       publisher: h.publisher,
       publishState: h.publish_state,
       exportDir: h.export_dir,
-      /** GitHub publish results per PR (URLs or errors) of a harvest published before v1. */
+      /** GitHub publish results per PR (URLs or errors) of a harvest published before 1.0. */
       published: githubPrs.length ? githubPrs : null,
       benchSeconds: h.bench_seconds,
       startedAt: h.started_at,
@@ -1281,7 +1281,7 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
   };
 }
 
-/** A harvest the plugin ran before v1: it has changesets, or stopped in one of the old phases. */
+/** A harvest the plugin ran before 1.0: it has changesets, or stopped in one of the old phases. */
 function isLegacyHarvest(engine: Engine, h: HarvestRow): boolean {
   return ["grouping", "ablating", "checking", "drafting", "ready"].includes(h.state) || engine.ctx.store.changesets(h.id).length > 0 || h.grouping_source !== null;
 }
@@ -1792,7 +1792,7 @@ export function needsYou(engine: Engine, s: StudyRow): NeedsYouItem[] {
         id: `harvest_frozen:${h.id}`,
         kind: "harvest_frozen",
         tone: "action",
-        title: legacy ? `Harvest h${h.seq} (drafted before v1): ask an agent to finish it` : `Best is frozen (harvest h${h.seq}): ask an agent to harvest it`,
+        title: legacy ? `Harvest h${h.seq} (drafted before 1.0): ask an agent to finish it` : `Best is frozen (harvest h${h.seq}): ask an agent to harvest it`,
         short: "harvest with an agent",
         detail: `${legacy ? `Its ${store.changesets(h.id).length} changeset(s) and PR drafts stay on the Harvest tab.` : `${(safeJson<Promotion[]>(h.promotions_json) ?? []).length} promotion(s) on best.`} Ask an agent (the study thread works) to harvest it with the study-harvest skill; it publishes only when you ask. Or keep exploring, or archive.`,
         tab: "harvest",

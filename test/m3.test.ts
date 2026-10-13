@@ -12,7 +12,7 @@ import { budgetShares, newBudgetThresholds, rateLimitedTarget } from "../src/sch
 import { benchView, findingsView, harvestView, oracleView, redactedSpecToml, usageView } from "../src/views.ts";
 import { FakeHost, FakePort, fakeHostSpec, makeCtx, waitFor, type Clock } from "./helpers.ts";
 
-describe("harvest accounting (harvests from before v1)", () => {
+describe("harvest accounting (harvests from before 1.0)", () => {
   it("accounting: sum vs total, joint stack ablation stands in, interaction warning when the gap exceeds its CI", () => {
     const changesets = [
       { id: 1, k: 1, title: "a", estimate: { value: 0.1, lo: 0.09, hi: 0.11 } },
