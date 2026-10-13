@@ -54,7 +54,7 @@ Steer from the Ideas tab (add, pin, reorder, veto) and the Overview (pause, resu
 
 ## 4. Harvest with your agent
 
-When the study has done its work, freeze it: *Freeze best for harvest…* on the Harvest tab or the Overview (Needs you offers it when the budget runs out), or `bb study harvest <slug>`. Best stops moving, no more candidates are taken, in-flight ones finish, and best is pinned as `refs/studies/<slug>/harvest/h<N>`.
+When the study has done its work, freeze it: *Freeze best for harvest…* on the Harvest tab or the Overview (Needs you offers it when the budget runs out), or `bb study harvest <slug>`. Best stops moving, no more candidates are taken, in-flight ones finish, and best is pinned as `refs/studies/<slug>/harvest/h<N>`. Asking again on a frozen study shows that freeze and changes nothing; *Freeze best again as a new harvest…* on the Harvest tab, or `bb study harvest <slug> --refreeze`, freezes again as h<N+1>, only when best has moved since (or when the freeze is a pre-1.0 harvest, which no frozen ref pins).
 
 Turning best into pull requests is an agent's job, not the plugin's: ask your agent (the study thread, or any thread in the project) to harvest the study. The `study-harvest` skill guides it. It reads the study's evidence (`bb study evidence <slug> --json`), groups and splits the changes into reviewable PRs or stacks, and checks each one with the plugin: `bb study measure` for an A/B on the study's bench hosts, `bb study gate` for the study's gates on any commit. The numbers in the PR descriptions are the plugin's measurements, not the agent's. It writes descriptions in your repository's conventions and publishes only when you ask, with your repository's own tools. The plugin never pushes.
 

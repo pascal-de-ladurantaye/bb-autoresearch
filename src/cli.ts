@@ -32,6 +32,7 @@ import {
 import type { StudyRow } from "./db/store.ts";
 import { studyReport } from "./report.ts";
 import { studyEvidence } from "./evidence.ts";
+import { currentHarvest } from "./harvest.ts";
 
 /** Text output bound (characters). */
 const MAX = 60_000;
@@ -496,13 +497,14 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       harvest: cliCommand({
-        summary: "Freeze best for harvest (no new workers, submissions closed), or show the current harvest; an agent then harvests it with the study-harvest skill",
+        summary: "Freeze best for harvest (no new workers, submissions closed), or show the current harvest when it is already frozen (changes nothing); an agent then harvests it with the study-harvest skill",
         positionals: slugArg,
         options: {
           ...jsonOpt,
           publish: { type: "boolean", description: "Removed in 1.0: an agent publishes with the repository's own tools (study-harvest skill)" },
           harvest: { type: "integer", min: 1, max: 1_000_000, description: "Show harvest h<N> instead of the latest (read only)" },
           wait: { type: "boolean", description: "Wait for best to freeze (in-flight candidates finish first; up to --timeout)" },
+          refreeze: { type: "boolean", description: "On a study already frozen for harvest, freeze best again as a new harvest h<N+1>: only when best moved since the freeze (or the freeze is from before 1.0, with no frozen ref)" },
           timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait with --wait (default 25m, max 30m)" },
         },
         run: (input, ctx) =>
@@ -525,11 +527,12 @@ export function studyCli(engine: Engine): PluginCliRegistration {
             const before = store.latestHarvest(s0.id);
             // An archived study can't harvest again, but its last harvest stays readable.
             if (s0.state === "archived") return respond(input.options.json, () => harvestText(engine, slug), () => view());
-            // Showing a harvest that is waiting or frozen is a read; starting one is a human control.
-            const showing = s0.state === "harvesting" && before && ["waiting", "frozen"].includes(before.state);
+            // Showing the current harvest (waiting or frozen) is a read and changes nothing; starting or refreezing one is a human control.
+            const showing = currentHarvest(s0, before) !== null && !input.options.refreeze;
             const actor = showing ? (ctx.threadId ?? "human") : guardHuman(engine, ctx);
-            const r = engine.startHarvest(slug, actor);
-            if (r.started) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.seq} started: best freezes for an agent to harvest`, { harvest: r.harvest.id });
+            const r = engine.startHarvest(slug, actor, { refreeze: Boolean(input.options.refreeze) });
+            const refrozen = r.started && before && input.options.refreeze && s0.state === "harvesting" ? before : null;
+            if (r.started) await engine.auditControl(slug, "harvest", caller(ctx), `harvest h${r.harvest.seq} started${refrozen ? ` (refreeze after h${refrozen.seq})` : ""}: best freezes for an agent to harvest`, { harvest: r.harvest.id, ...(refrozen ? { refreeze: refrozen.id } : {}) });
             if (input.options.wait) await engine.waitForHarvest(slug, input.options.timeout ?? 25 * 60_000);
             const started = r.started && r.harvest.id !== before?.id;
             return respond(

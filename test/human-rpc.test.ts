@@ -130,9 +130,20 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(kinds()).toEqual(["harvest_frozen"]);
     expect(needsYou(engine, study())[0]!.title).toContain("drafted before 1.0");
     for (const method of ["study.harvest.plan", "study.harvest.publish", "study.harvest.choice"]) await expect(call(method, { slug: "toy-size", harvestId: h.id })).rejects.toThrow(/no rpc method/u);
-    // A new harvest from here is a freeze; the old one stays in the history and readable by id.
-    expect((await call("study.harvest.start", { slug: "toy-size" })).ok).toBe(true);
-    await engine.waitForHarvest("toy-size", 10_000);
+    // Its best is frozen: the Harvest tab offers no new freeze, and starting one shows it and changes nothing.
+    expect(v).toMatchObject({ canStart: false, canRefreeze: true });
+    const shown = await call("study.harvest.start", { slug: "toy-size" });
+    expect(shown).toMatchObject({ ok: true, message: expect.stringContaining("harvest h1 (from before 1.0) froze best") });
+    expect(store.harvests(s.id)).toHaveLength(1);
+    expect(events("control.harvest")).toHaveLength(0);
+    // `bb study harvest` (here from the study thread: a read) shows it too, the bug 1.0.0 had: it started h2.
+    const cliShown = await harness.behavior.runCli(["harvest", "toy-size"], { threadId: "thr_study" });
+    expect(cliShown.exitCode, cliShown.stderr).toBe(0);
+    expect(cliShown.stdout).toContain("Harvest h1 of toy-size");
+    expect(store.harvests(s.id)).toHaveLength(1);
+    // `--refreeze` is the way to a v1 freeze with a pinned ref; the old one stays in the history and readable by id.
+    const refrozen = await harness.behavior.runCli(["harvest", "toy-size", "--refreeze", "--wait"]);
+    expect(refrozen.exitCode, refrozen.stderr).toBe(0);
     const now = await call("study.harvest", { slug: "toy-size" });
     expect(now.harvest).toMatchObject({ seq: 2, state: "frozen", legacy: false });
     expect(now.history.map((x: { seq: number; legacy: boolean }) => [x.seq, x.legacy])).toEqual([

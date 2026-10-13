@@ -56,13 +56,13 @@ The `bb study` commands and flags of 1.0 (the README's CLI table) keep working i
 | `ideas add` / `ideas list` | `{ ok, message, idea }` / `{ ideas }` |
 | `workers <slug>` | `{ workers }` |
 | `bench <slug>` | the bench view: `slug`, `state`, `segment`, hosts, health, transfers, drift, `segments`, `artifacts` |
-| `harvest <slug> [--harvest N]` | the harvest view (plus `message` when this call started a freeze) |
+| `harvest <slug> [--harvest N] [--refreeze]` | the harvest view (plus `message` when this call started a freeze; on a study already frozen it starts nothing and has no `message`) |
 | `evidence <slug>` | the evidence document below, or `{ format, version, file, bytes }` when it is larger than one CLI response (the whole document is in that file, never trimmed) |
 | `measure <slug> <A> <B>`, `gate <slug> <ref>`, `results <slug> r<N>` | `{ run }`, below |
 | `results <slug>` | `{ runs }`, newest first |
 | `report <slug>` | `{ markdown }` |
 
-New in 1.0: `evidence`, `measure`, `gate` and `results`. `measure` and `gate` options: `--detach` (return at once), `--timeout` (how long to wait, default 25 minutes; the run continues after it), and for `measure`, `--pairs N` (noisy oracles) and `--host H`. `harvest --publish`, `--restart`, `--one-per-promotion` and `--no-measure-standalone` were removed in 1.0 (`--publish` fails with code `removed` and a hint).
+New in 1.0: `evidence`, `measure`, `gate` and `results`. `measure` and `gate` options: `--detach` (return at once), `--timeout` (how long to wait, default 25 minutes; the run continues after it), and for `measure`, `--pairs N` (noisy oracles) and `--host H`. 1.0.1 fixed `harvest` on a study already frozen for harvest: it shows that freeze and changes nothing (1.0.0 froze again when the freeze was a ready harvest from before 1.0); `--refreeze` is the explicit way to freeze again. `harvest --publish`, `--restart`, `--one-per-promotion` and `--no-measure-standalone` were removed in 1.0 (`--publish` fails with code `removed` and a hint).
 
 A run (`{ run }`, and each of `{ runs }`):
 

@@ -12,6 +12,7 @@ Never push, open a PR, or post anywhere until the human says so. Never edit `stu
 ## 1. Find the study and check it is frozen
 
 - `bb study list`, then `bb study harvest <slug>`. You want **Harvesting** with harvest h<N> **frozen**: best is pinned as `refs/studies/<slug>/harvest/h<N>` and stays there even if the study resumes. Use that ref (or its sha), not `studies/<slug>/best`, as "best" from now on.
+- `bb study harvest <slug>` on a frozen study only shows the freeze; it never starts another. A ready harvest from before 1.0 counts as frozen but has no `refs/studies/<slug>/harvest/h<N>` ref: use its best sha (`harvest.bestSha` in `bb study harvest <slug> --json`), or ask the human for `bb study harvest <slug> --refreeze`, which pins it as h<N+1>.
 - Not frozen yet? Freezing stops the study's workers, so it is the human's call: ask them to press **Freeze best for harvest** on the Harvest tab (or run `bb study harvest <slug>`). A Paused study also takes measurements, but its best can move if it resumes, and a paused study whose bench is remote only has no machines until it is frozen.
 - A harvest the plugin drafted before 1.0 (it shows changesets, contributions and PR drafts, marked "before 1.0") is a fine starting point: reuse its grouping and branches `studies/<slug>/harvest/h<N>/*` if they still make sense, and re-measure anything you change.
 

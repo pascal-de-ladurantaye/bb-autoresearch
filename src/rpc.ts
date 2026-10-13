@@ -85,8 +85,8 @@ export const rpcContract = defineRpcContract({
   "studies.attention": { input: z.null(), output: trusted<Attention>() },
   /** The human looked at the study's notices (they stop counting as new). */
   "study.notices.seen": { input: z.object({ slug }).strict(), output: ok },
-  /** Human control: freeze best for harvest (no new workers, submissions closed). */
-  "study.harvest.start": { input: z.object({ slug }).strict(), output: ok },
+  /** Human control: freeze best for harvest (no new workers, submissions closed). On a study already frozen it shows that freeze and changes nothing, unless `refreeze` (and best moved, or the freeze is from before 1.0). */
+  "study.harvest.start": { input: z.object({ slug, refreeze: z.boolean().optional() }).strict(), output: ok },
   /** Human control (confirmed): approve the spec version the human reviewed. Draft: approve and calibrate; pending: apply, or recalibrate when the oracle changed. */
   "study.spec.approve": { input: z.object({ slug, version: z.number().int().positive(), confirm: z.boolean().optional() }).strict(), output: ok },
   /** Human control (confirmed): approve the finished calibration and start running. */
@@ -180,10 +180,13 @@ export function registerRpc(bb: BbPluginApi, engine: Engine): void {
       await engine.auditControl(slug, "archive", caller, `study archived${archiveThread ? " with its study thread" : ""}`, { archiveThread: Boolean(archiveThread) });
       return { ok: true, message: await engine.archiveStudy(slug, ACTOR, { archiveThread: Boolean(archiveThread) }) };
     },
-    "study.harvest.start": async ({ slug }, ctx) => {
+    "study.harvest.start": async ({ slug, refreeze }, ctx) => {
       const caller = humanOnly(ctx);
-      const r = engine.startHarvest(slug, ACTOR);
-      if (r.started) await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.seq} started: best freezes for an agent to harvest`, { harvest: r.harvest.id });
+      const s0 = engine.study(slug);
+      const before = s0.state === "harvesting" && refreeze ? store.latestHarvest(s0.id) : undefined;
+      const r = engine.startHarvest(slug, ACTOR, { refreeze: Boolean(refreeze) });
+      const refrozen = r.started && before ? before : null;
+      if (r.started) await engine.auditControl(slug, "harvest", caller, `harvest h${r.harvest.seq} started${refrozen ? ` (refreeze after h${refrozen.seq})` : ""}: best freezes for an agent to harvest`, { harvest: r.harvest.id, ...(refrozen ? { refreeze: refrozen.id } : {}) });
       return { ok: true, message: r.text };
     },
     "study.pause": async ({ slug }, ctx) => {

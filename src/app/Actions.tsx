@@ -93,16 +93,21 @@ export function StartDialog({ o, rpc, open, onOpenChange, onDone }: { o: Overvie
   );
 }
 
-export function HarvestDialog({ slug, promotions, rpc, open, onOpenChange, onDone }: { slug: string; promotions: number; restart?: boolean; rpc: Rpc; open: boolean; onOpenChange: (v: boolean) => void; onDone: () => void }) {
+/** Freeze best for harvest; `refreeze`: freeze a study already frozen again, as a new harvest number. */
+export function HarvestDialog({ slug, promotions, refreeze, rpc, open, onOpenChange, onDone }: { slug: string; promotions: number; refreeze?: boolean; rpc: Rpc; open: boolean; onOpenChange: (v: boolean) => void; onDone: () => void }) {
   return (
     <ConfirmDialog
       open={open}
       onOpenChange={onOpenChange}
-      title="Freeze best for harvest"
-      description="Harvest freezes best so an agent can turn its promotions into pull requests. The plugin keeps the measurements; the agent does the grouping, the PR descriptions and, when you ask, the publishing."
-      confirmLabel="Freeze best"
+      title={refreeze ? "Freeze best again" : "Freeze best for harvest"}
+      description={
+        refreeze
+          ? "Freezing again starts a new harvest (the next h<N>) on the current best. The current harvest stays readable in the history; an agent harvesting it should switch to the new frozen ref."
+          : "Harvest freezes best so an agent can turn its promotions into pull requests. The plugin keeps the measurements; the agent does the grouping, the PR descriptions and, when you ask, the publishing."
+      }
+      confirmLabel={refreeze ? "Freeze best again" : "Freeze best"}
       onConfirm={async () => {
-        const r = await rpc.call("study.harvest.start", { slug });
+        const r = await rpc.call("study.harvest.start", refreeze ? { slug, refreeze: true } : { slug });
         toast.success(r.message.split("\n")[0] ?? r.message);
         onDone();
       }}
@@ -114,7 +119,7 @@ export function HarvestDialog({ slug, promotions, rpc, open, onOpenChange, onDon
         <li>Nothing is pushed unless you ask the agent to publish. Resume to keep exploring at any time.</li>
       </ul>
       <p className="text-xs text-muted-foreground">
-        CLI equivalent: <Mono>bb study harvest {slug}</Mono>
+        CLI equivalent: <Mono>bb study harvest {slug}{refreeze ? " --refreeze" : ""}</Mono>
       </p>
     </ConfirmDialog>
   );

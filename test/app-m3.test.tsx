@@ -216,10 +216,11 @@ describe("frontend: M3 study tabs", () => {
     // Read only: no publish and no keep/drop controls.
     expect(page.queryByRole("button", { name: /Publish/u })).toBeNull();
     expect(page.queryByRole("radio")).toBeNull();
-    // A new harvest (a freeze) can start from it.
-    fireEvent.click(page.getByRole("button", { name: "Freeze best for a new harvest…" }));
-    fireEvent.click(await page.findByRole("button", { name: "Freeze best" }));
-    await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size" }));
+    // Its best is frozen: no plain "new harvest" button; freezing again (a v1 freeze with a pinned ref) is explicit.
+    expect(page.queryByRole("button", { name: "Freeze best for a new harvest…" })).toBeNull();
+    fireEvent.click(page.getByRole("button", { name: "Freeze best again as a new harvest…" }));
+    fireEvent.click(await page.findByRole("button", { name: "Freeze best again" }));
+    await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size", refreeze: true }));
     await waitUntil(() => store.harvests(s.id).length === 2);
     // Report on demand.
     fireEvent.click(page.getByRole("button", { name: "Show report" }));

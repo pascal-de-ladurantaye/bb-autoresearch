@@ -3,7 +3,7 @@
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { Engine } from "./engine.ts";
 import type { AdhocRunRow, CandidateRow, ChangesetRow, HarvestRow, StudyRow, ThreadRow } from "./db/store.ts";
-import { frozenRef, type Promotion } from "./harvest.ts";
+import { currentHarvest, frozenRef, isLegacyHarvest as legacyHarvest, refreezeRefusal, type Promotion } from "./harvest.ts";
 import { dependencyReasons, prOrder, stackOrderText, type StackRecord } from "./harvest-legacy.ts";
 import { commitParts } from "./commit.ts";
 import { adhocLine, adhocResult } from "./primitives.ts";
@@ -1159,7 +1159,9 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
   const all = store.harvests(s.id);
   const latest: HarvestRow | undefined = all[0];
   const h: HarvestRow | undefined = harvestId !== undefined ? all.find((x) => x.id === harvestId) : latest;
-  const canStartState = ["running", "paused"].includes(s.state) || (s.state === "harvesting" && (!latest || !["waiting", "frozen"].includes(latest.state)));
+  // A study already frozen (or waiting to freeze) can't start another freeze from here: only `bb study harvest --refreeze`.
+  const current = currentHarvest(s, latest);
+  const canStartState = ["running", "paused"].includes(s.state) || (s.state === "harvesting" && !current);
   const promotions = store.candidates(s.id, { stages: ["decided"] }).filter((c) => c.verdict === "win").length;
   const canStart = canStartState && promotions > 0;
   const cannotStartReason = canStart
@@ -1167,9 +1169,9 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
     : promotions === 0
       ? "Nothing to harvest yet: no candidate has been promoted to best."
       : s.state === "harvesting"
-        ? latest?.state === "waiting"
+        ? current?.state === "waiting"
           ? "Best is about to freeze: in-flight candidates finish first."
-          : "Best is frozen for this harvest. Resume the study to keep exploring."
+          : `Best is frozen for harvest h${current?.seq ?? latest?.seq}. Resume the study to keep exploring.`
         : `Harvest starts from Running or Paused (the study is ${s.state}).`;
   const runs = store.adhocRuns(s.id, { limit: 20 }).map(adhocRunView);
   const base = {
@@ -1179,6 +1181,9 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
     canStart,
     cannotStartReason,
     startCommand: `bb study harvest ${s.slug}`,
+    /** The study is already frozen and freezing again would pin something new (best moved, or a pre-1.0 freeze with no frozen ref). */
+    canRefreeze: current !== null && current.state !== "waiting" && refreezeRefusal(store, s, current) === null,
+    refreezeCommand: `bb study harvest ${s.slug} --refreeze`,
     history: all.map((x) => ({ id: x.id, seq: x.seq, state: x.state, startedAt: x.started_at, finishedAt: x.finished_at, publishState: x.publish_state, legacy: isLegacyHarvest(engine, x) })),
     /** Measurements and gates agents asked for (`bb study measure|gate`), newest first. */
     runs,
@@ -1281,9 +1286,9 @@ export function harvestView(engine: Engine, s: StudyRow, harvestId?: number) {
   };
 }
 
-/** A harvest the plugin ran before 1.0: it has changesets, or stopped in one of the old phases. */
+/** A harvest the plugin ran before 1.0 (see `isLegacyHarvest` in harvest.ts). */
 function isLegacyHarvest(engine: Engine, h: HarvestRow): boolean {
-  return ["grouping", "ablating", "checking", "drafting", "ready"].includes(h.state) || engine.ctx.store.changesets(h.id).length > 0 || h.grouping_source !== null;
+  return legacyHarvest(engine.ctx.store, h);
 }
 
 export type FindingsView = ReturnType<typeof findingsView>;

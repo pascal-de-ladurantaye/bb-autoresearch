@@ -139,6 +139,53 @@ describe("primitives and evidence through the CLI (fake host)", () => {
     expect(host.refs.get("refs/studies/toy-size/harvest/h1")).toBeTruthy();
   });
 
+  it("harvest on a study already frozen shows that freeze and changes nothing; only --refreeze, after best moved, starts h2", async () => {
+    await setup();
+    await win();
+    const first = await json(["harvest", "toy-size", "--wait"]);
+    expect(first).toMatchObject({ message: expect.any(String), harvest: { seq: 1, state: "frozen" } });
+    const s = study();
+    const { store } = engine.ctx;
+    const unchanged = () => {
+      expect(store.harvests(s.id).map((h) => [h.seq, h.state])).toEqual([[1, "frozen"]]);
+      expect(store.events(s.id, { kinds: ["control.harvest"] })).toHaveLength(1);
+      expect(study().state).toBe("harvesting");
+    };
+    // Asked again (by the human, an agent thread, with --wait, or through the Harvest tab's RPC): the same view, no new freeze.
+    for (const [args, thread] of [[["harvest", "toy-size"], undefined], [["harvest", "toy-size"], "thr_agent"], [["harvest", "toy-size", "--wait"], undefined]] as const) {
+      const again = await json([...args], thread);
+      expect(again).not.toHaveProperty("message");
+      expect(again).toMatchObject({ canStart: false, canRefreeze: false, cannotStartReason: "Best is frozen for harvest h1. Resume the study to keep exploring.", harvest: { seq: 1, state: "frozen", frozenRef: "refs/studies/toy-size/harvest/h1" } });
+      unchanged();
+    }
+    const rpc = (await harness.behavior.callRpc("study.harvest.start", { slug: "toy-size" })) as { ok: boolean; message: string };
+    expect(rpc).toMatchObject({ ok: true, message: expect.stringContaining("Harvest h1 of `toy-size`: best is frozen") });
+    unchanged();
+    // --refreeze while best hasn't moved: refused, with the command that shows the freeze.
+    const same = await cli(["harvest", "toy-size", "--refreeze", "--json"]);
+    expect(same.exitCode).not.toBe(0);
+    expect(JSON.parse(same.stdout || same.stderr)).toMatchObject({ ok: false, error: { code: "study_error", message: expect.stringContaining("best hasn't moved since harvest h1 froze it"), hint: "Run `bb study harvest toy-size`." } });
+    unchanged();
+    // A study worker can't refreeze (a human control).
+    expect((await cli(["harvest", "toy-size", "--refreeze"], "thr_w1")).stderr).toContain("this is a human control");
+    // Best moved: --refreeze freezes it as h2; h1's ref stays.
+    const h1Best = study().best_sha!;
+    const moved = host.commit("T2", h1Best, "Later\n\nAutoresearch-Study: toy-size\nAutoresearch-Candidate: c/2");
+    store.updateStudy(s.id, { best_sha: moved });
+    expect(await json(["harvest", "toy-size"])).toMatchObject({ canStart: false, canRefreeze: true, refreezeCommand: "bb study harvest toy-size --refreeze", harvest: { seq: 1 } });
+    const second = await json(["harvest", "toy-size", "--refreeze", "--wait"]);
+    expect(second).toMatchObject({ message: expect.stringContaining("harvesting (h2)"), harvest: { seq: 2, state: "frozen", frozenRef: "refs/studies/toy-size/harvest/h2" } });
+    expect(host.refs.get("refs/studies/toy-size/harvest/h2")).toBe(moved);
+    expect(host.refs.get("refs/studies/toy-size/harvest/h1")).toBe(h1Best);
+    const audit = store.events(s.id, { kinds: ["control.harvest"] });
+    expect(audit).toHaveLength(2);
+    expect(audit.map((e) => JSON.parse(e.data_json))).toContainEqual(expect.objectContaining({ harvest: store.harvests(s.id)[0]!.id, refreeze: store.harvests(s.id)[1]!.id }));
+    // A harvest still waiting to freeze has nothing to refreeze.
+    const waiting = store.insertHarvest({ study_id: s.id, from_state: "paused" }, "test");
+    expect(() => engine.startHarvest("toy-size", "human", { refreeze: true })).toThrow(/harvest h3 hasn't frozen best yet/u);
+    store.updateHarvest(waiting.id, { state: "cancelled" });
+  });
+
   it("bb study measure: B against A with the study's protocol and guardrails, on its bench host, audited and counted as bench time", async () => {
     await setup();
     await win();

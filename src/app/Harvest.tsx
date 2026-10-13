@@ -27,7 +27,7 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
   const rpc = useStudyRpc();
   const [selected, setSelected] = useState<number | null>(null);
   const v = useLive((r) => r.call("study.harvest", { slug, ...(selected !== null ? { harvestId: selected } : {}) }), [slug, selected], 5000);
-  const [dialog, setDialog] = useState<null | "start" | "archive">(null);
+  const [dialog, setDialog] = useState<null | "start" | "refreeze" | "archive">(null);
   const d = v.data;
   if (!d) return <TabState loading={v.loading} error={v.error} retry={v.refetch} label="the harvest" />;
   const h = d.harvest;
@@ -71,7 +71,7 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
       ) : (
         <FrozenHarvest h={h} o={o} guide={d.guide} onOpenCandidate={onOpenCandidate} />
       )}
-      {h && (o.state === "harvesting" || o.state !== "archived") ? <NextSteps h={h} d={d} o={o} slug={slug} rpc={rpc} onChanged={done} onStart={() => setDialog("start")} onArchive={() => setDialog("archive")} /> : null}
+      {h && (o.state === "harvesting" || o.state !== "archived") ? <NextSteps h={h} d={d} o={o} slug={slug} rpc={rpc} onChanged={done} onStart={() => setDialog("start")} onRefreeze={() => setDialog("refreeze")} onArchive={() => setDialog("archive")} /> : null}
       <Runs runs={d.runs} slug={slug} />
       {d.history.length > 1 ? (
         <Section title={`Harvest history (${d.history.length})`}>
@@ -99,7 +99,7 @@ export function HarvestTab({ slug, o, onOpenCandidate, onChanged }: { slug: stri
         </Section>
       ) : null}
       <Report slug={slug} />
-      {dialog === "start" ? <HarvestDialog slug={slug} promotions={d.promotions} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
+      {dialog === "start" || dialog === "refreeze" ? <HarvestDialog slug={slug} promotions={d.promotions} refreeze={dialog === "refreeze"} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
       {dialog === "archive" ? <ArchiveDialog slug={slug} rpc={rpc} open onOpenChange={(x) => !x && setDialog(null)} onDone={done} /> : null}
     </div>
   );
@@ -249,7 +249,7 @@ function HarvestComposer({ prompt, projectId, onClose }: { prompt: string; proje
   );
 }
 
-function NextSteps({ h, d, o, slug, rpc, onChanged, onStart, onArchive }: { h: Harvest; d: HarvestView; o: OverviewResult; slug: string; rpc: Rpc; onChanged: () => void; onStart: () => void; onArchive: () => void }) {
+function NextSteps({ h, d, o, slug, rpc, onChanged, onStart, onRefreeze, onArchive }: { h: Harvest; d: HarvestView; o: OverviewResult; slug: string; rpc: Rpc; onChanged: () => void; onStart: () => void; onRefreeze: () => void; onArchive: () => void }) {
   const resume = async () => {
     try {
       toast.success((await rpc.call("study.resume", { slug })).message);
@@ -265,6 +265,12 @@ function NextSteps({ h, d, o, slug, rpc, onChanged, onStart, onArchive }: { h: H
       {d.canStart ? (
         <Button size="sm" variant="outline" onClick={onStart}>
           Freeze best for a new harvest…
+        </Button>
+      ) : null}
+      {/* Already frozen: freezing again is explicit, and offered only when it pins something new (best moved, or a freeze from before 1.0). */}
+      {d.canRefreeze ? (
+        <Button size="sm" variant="outline" onClick={onRefreeze}>
+          Freeze best again as a new harvest…
         </Button>
       ) : null}
       {o.state === "harvesting" && !waiting ? (

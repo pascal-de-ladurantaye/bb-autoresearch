@@ -7,7 +7,7 @@ import { recordCalibration, runAutoRecalibration, runCalibration, type AutoRecal
 import type { Ctx } from "./context.ts";
 import type { BenchHostRow, CandidateRow, HarvestRow, IdeaRow, ResolvedBenchHost, StudyRow, ThreadRow } from "./db/store.ts";
 import { RemoteFleet } from "./remote/fleet.ts";
-import { Harvester, harvestFrozenText } from "./harvest.ts";
+import { currentHarvest, Harvester, harvestFrozenText, isLegacyHarvest, refreezeRefusal } from "./harvest.ts";
 import { Primitives } from "./primitives.ts";
 import { checkHealth } from "./health.ts";
 import type { DispatchDecision, DispatchQuery } from "./ports.ts";
@@ -501,13 +501,29 @@ export class Engine {
    * the promotion list are recorded and best is pinned. Grouping, measuring,
    * branches, PR descriptions and publishing are an agent's job (the
    * study-harvest skill), with `bb study evidence`, `measure` and `gate`.
+   *
+   * Idempotent: on a study already harvesting (waiting, frozen, or a ready
+   * harvest from before 1.0) it reports that harvest and changes nothing.
+   * `refreeze` is the only way to start a new freeze there, and only when it
+   * would pin something new: best moved since the freeze, or the freeze is a
+   * pre-1.0 one that no frozen ref pins.
    */
-  startHarvest(slug: string, actor: string): { harvest: HarvestRow; started: boolean; text: string } {
+  startHarvest(slug: string, actor: string, opts: { refreeze?: boolean } = {}): { harvest: HarvestRow; started: boolean; text: string } {
     const study = this.study(slug);
     const latest = this.store.latestHarvest(study.id);
-    if (study.state === "harvesting" && latest && ["waiting", "frozen"].includes(latest.state)) {
-      if (latest.state === "waiting" && !this.harvester.running(latest.id)) this.harvester.start(latest.id);
-      return { harvest: latest, started: false, text: latest.state === "frozen" ? harvestFrozenText(study, latest) : `${slug} is harvesting: harvest h${latest.seq} is waiting${latest.phase_detail ? ` (${latest.phase_detail})` : ""}.` };
+    const current = currentHarvest(study, latest);
+    if (current && opts.refreeze) {
+      const refusal = refreezeRefusal(this.store, study, current);
+      if (refusal) throw new EngineError(`${slug}: ${refusal}`);
+    } else if (current) {
+      if (current.state === "waiting" && !this.harvester.running(current.id)) this.harvester.start(current.id);
+      const text =
+        current.state === "waiting"
+          ? `${slug} is harvesting: harvest h${current.seq} is waiting${current.phase_detail ? ` (${current.phase_detail})` : ""}.`
+          : isLegacyHarvest(this.store, current)
+            ? `${slug} is harvesting: harvest h${current.seq} (from before 1.0) froze best at ${current.best_sha?.slice(0, 10) ?? "?"}. Ask an agent to finish it with the study-harvest skill, or \`bb study resume ${slug}\` to keep exploring.`
+            : harvestFrozenText(study, current);
+      return { harvest: current, started: false, text };
     }
     if (!["running", "paused", "harvesting"].includes(study.state)) throw new EngineError(`${slug} is ${study.state}; harvest starts from Running or Paused`);
     if (!study.best_sha || !study.base_sha) throw new EngineError(`${slug} has no best commit yet`);

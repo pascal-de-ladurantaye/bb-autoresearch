@@ -4,7 +4,8 @@ How each version was built: what it added, the decisions taken on the way, every
 
 | Version | What it added |
 |---|---|
-| [1.0](#10-unreleased) | Unreleased. The plugin owns every measurement and verdict; agents own commit messages and harvest. Each bench host decides with its own win threshold, candidates go to the quietest host, and a much noisier host is left out; a guardrail that can't be judged fails calibration. Workers write their commit messages; harvest freezes best, and an agent turns it into PRs with `bb study evidence`, `measure` and `gate`. A study chooses its remote machines (`machine` options passed to the provider). Remote machines survive a plugin reload; unused seeds and base bundles are deleted; CI on every pull request; docs split into design, guide and release notes, with a stability policy. |
+| [1.0.1](#101) | Fix: `bb study harvest` on a study already frozen for harvest shows the freeze instead of starting a new one; `--refreeze` freezes again on purpose. |
+| [1.0.0](#100) | The plugin owns every measurement and verdict; agents own commit messages and harvest. Each bench host decides with its own win threshold, candidates go to the quietest host, and a much noisier host is left out; a guardrail that can't be judged fails calibration. Workers write their commit messages; harvest freezes best, and an agent turns it into PRs with `bb study evidence`, `measure` and `gate`. A study chooses its remote machines (`machine` options passed to the provider). Remote machines survive a plugin reload; unused seeds and base bundles are deleted; CI on every pull request; docs split into design, guide and release notes, with a stability policy. |
 | [v0.3.1](#v031-large-uploads-in-parts) | Large uploads to remote machines travel in 32 MiB parts (BB's 75-second RPC limit). |
 | [v0.3.0](#v030-remote-bench-hosts) | Remote bench hosts lent by bench provider plugins: short-lived machines that can't be BB machines, driven by the server over a small RPC contract, each calibrated on arrival and rotated before its lifetime ends. |
 | [v0.2.4](#v024) | Fixes from a 5.6-hour blind study on a large repository: bench time spent on candidates that could no longer win, on clear losses and on confirming big wins; drift pauses that were really shorter runs; measurements and promotions after a drift pause; harvest stacks whose layers didn't apply. And the UI issues found while capturing the store screenshots. |
@@ -13,6 +14,18 @@ How each version was built: what it added, the decisions taken on the way, every
 | [v0.2.1](#v021-fixes) | Wording and link fixes: the noise sentence per noise class, guardrail losses that say why, single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, worker lanes linked to their candidates. |
 | [v0.2.0](#v020-live-view-part-2) | The read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay, in two parts. |
 | [v0.1.0](#v010-guardrails-and-pre-release-fixes) | The first release: milestones M0 to M3, the human interface pass, and the guardrail and pre-release fixes. |
+
+## 1.0.1
+
+A bug fix in a CLI command 1.0 keeps stable ([stability.md](stability.md#cli-commands-and---json)). Same platform pins (BB 0.45.x, SDK 0.6.14); nothing to migrate.
+
+### `bb study harvest` on a frozen study froze it again
+
+- **Bug.** `bb study harvest <slug>` on a study already frozen for harvest is meant to show the freeze. 1.0.0 did that only when the latest harvest was a v1 one (`waiting` or `frozen`). When it was a `ready` harvest the plugin had drafted before 1.0, it started a new freeze (h2 → h3), and an agent following the study-harvest skill could do it without the human. The Harvest tab offered *Freeze best for a new harvest…* in the same case, and its RPC (`study.harvest.start`) did the same.
+- **Fix.** One rule for the CLI, the Harvest tab and the RPC (`currentHarvest`): a Harvesting study whose latest harvest is `waiting`, `frozen` or `ready` (before 1.0) is frozen. Asking to harvest it shows that harvest (the same output as a status view, no `message` in `--json`) and changes nothing: no new harvest number, no audit entry, no notice. The Harvest tab no longer offers a new harvest there ("Best is frozen for harvest h<N>"), and the RPC returns the freeze's text. A Harvesting study whose latest harvest **failed** still starts a new freeze, as before: that is the retry.
+- **`--refreeze`** (human control) is now the only way to bump the number on a frozen study, and only when it pins something new: best moved since the freeze, or the freeze is a pre-1.0 harvest, which no `refs/studies/<slug>/harvest/h<N>` ref pins. Otherwise it fails with `study_error` ("best hasn't moved since harvest h<N> froze it") and the command that shows the freeze; on a harvest still `waiting` it fails too. The Harvest tab offers the same as *Freeze best again as a new harvest…*, only when it is allowed (the harvest view's new `canRefreeze` and `refreezeCommand`; the RPC takes `refreeze: true`). The audit entry of a refreeze names the harvest it replaced.
+- **Docs.** The guide, README, `autoresearch` and `study-harvest` skills, and stability.md's CLI table say what `harvest` does on a frozen study. The skill tells an agent that a pre-1.0 harvest has no frozen ref (use its `bestSha`, or ask the human for `--refreeze`).
+- **Tests.** A v1 freeze asked again by the human, an agent thread, with `--wait` and through the RPC (no new harvest, no audit); `--refreeze` refused while best is unchanged, refused for a worker, and accepted after best moved (h2 pinned, h1's ref kept); `--refreeze` refused on a waiting harvest; a ready pre-1.0 harvest shown by the RPC and by the CLI from the study thread, then refrozen with `--refreeze`; the Harvest tab's *Freeze best again* on it.
 
 ## 1.0.0
 
@@ -359,7 +372,8 @@ The fields, and what 1.x keeps of them, are in [stability.md](stability.md#the-e
 - `bb study harvest` while a harvest is waiting or frozen shows it (a read:
   the study thread may ask). Starting one is a human control as before. When
   the latest harvest is an old one (ready, failed, cancelled), it starts a new
-  freeze; no `--restart`. `--harvest N` shows an older harvest.
+  freeze; no `--restart`. *(Fixed in 1.0.1: a ready harvest from before 1.0 counts
+  as frozen and is shown; `--refreeze` freezes again on purpose.)* `--harvest N` shows an older harvest.
 - `bb study resume` cancels a harvest still waiting; a frozen one keeps its
   ref. `bb study archive` as before.
 - `[harvest]` spec keys (`measure_standalone`, `group_timeout_minutes`,

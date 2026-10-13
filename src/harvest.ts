@@ -201,6 +201,34 @@ export class Harvester {
   }
 }
 
+/** A harvest the plugin ran before 1.0: it has changesets, or stopped in one of the old phases. Its best was frozen, but no `refs/studies/<slug>/harvest/h<N>` pins it. */
+export function isLegacyHarvest(store: { changesets(harvestId: number): unknown[] }, h: HarvestRow): boolean {
+  return ["grouping", "ablating", "checking", "drafting", "ready"].includes(h.state) || store.changesets(h.id).length > 0 || h.grouping_source !== null;
+}
+
+/**
+ * The harvest a Harvesting study is on: waiting for in-flight candidates,
+ * frozen, or a ready one from before 1.0 (its best is frozen too). `bb study
+ * harvest` on such a study shows it and changes nothing; only `--refreeze`
+ * starts a new one. Null when the study isn't harvesting or its latest
+ * harvest failed (a new freeze retries it).
+ */
+export function currentHarvest(study: StudyRow, latest: HarvestRow | undefined): HarvestRow | null {
+  return study.state === "harvesting" && latest && ["waiting", "frozen", "ready"].includes(latest.state) ? latest : null;
+}
+
+/**
+ * Why `bb study harvest --refreeze` can't freeze the current harvest again,
+ * or null when it can: only when that pins something new (best moved since
+ * the freeze, or the freeze is from before 1.0, which no frozen ref pins).
+ */
+export function refreezeRefusal(store: { changesets(harvestId: number): unknown[] }, study: StudyRow, current: HarvestRow): string | null {
+  if (current.state === "waiting") return `harvest h${current.seq} hasn't frozen best yet (in-flight candidates finish first), so there is nothing to refreeze; \`bb study harvest ${study.slug} --wait\` waits for it`;
+  if (isLegacyHarvest(store, current)) return null;
+  if (current.best_sha === study.best_sha && current.base_sha === study.base_sha) return `best hasn't moved since harvest h${current.seq} froze it at ${current.best_sha?.slice(0, 10) ?? "?"}, so there is nothing to refreeze; \`bb study harvest ${study.slug}\` shows that harvest`;
+  return null;
+}
+
 /** The notice when best is frozen: what was frozen and how to harvest it with an agent. */
 export function harvestFrozenText(study: StudyRow, h: HarvestRow): string {
   const promotions = safeJson<Promotion[]>(h.promotions_json) ?? [];

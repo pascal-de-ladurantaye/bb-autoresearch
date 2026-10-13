@@ -100,7 +100,7 @@ your agent publishes when you ask. Every candidate stays under
 | `bb study workers <slug>` | Worker threads |
 | `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration, the machine options asked for and what each machine reports), health checks, bundle transfers, drift checks, segments, seeds and base bundles on disk |
 | `bb study drift <slug>` | Request an A/A drift check on every bench host |
-| `bb study harvest <slug> [--wait] [--harvest N]` | Freeze best for harvest, or show the current (or an older) harvest |
+| `bb study harvest <slug> [--wait] [--harvest N] [--refreeze]` | Freeze best for harvest, or show the current (or an older) harvest; on a frozen study it only shows it, and `--refreeze` freezes again when best has moved |
 | `bb study evidence <slug> [--samples] [--candidates 3,7]` | Everything an agent needs to harvest, as stable JSON with `--json` (`bb-autoresearch/evidence` v1) |
 | `bb study measure <slug> <A> <B> [--pairs N] [--host H] [--detach] [--timeout D]` | Measure B against A (any two commits) with the study's protocol and guardrails, on the quietest free bench host with that host's own win threshold (waiting for remote machines a frozen study brings up); counts as bench time |
 | `bb study gate <slug> <ref> [--detach] [--timeout D]` | The study's gates on any commit (edit host) |
