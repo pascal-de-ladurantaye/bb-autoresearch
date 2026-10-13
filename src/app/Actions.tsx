@@ -93,32 +93,28 @@ export function StartDialog({ o, rpc, open, onOpenChange, onDone }: { o: Overvie
   );
 }
 
-export function HarvestDialog({ slug, promotions, restart, rpc, open, onOpenChange, onDone }: { slug: string; promotions: number; restart: boolean; rpc: Rpc; open: boolean; onOpenChange: (v: boolean) => void; onDone: () => void }) {
-  const [onePer, setOnePer] = useState(false);
+export function HarvestDialog({ slug, promotions, rpc, open, onOpenChange, onDone }: { slug: string; promotions: number; restart?: boolean; rpc: Rpc; open: boolean; onOpenChange: (v: boolean) => void; onDone: () => void }) {
   return (
     <ConfirmDialog
       open={open}
       onOpenChange={onOpenChange}
-      title={restart ? "Start a new harvest (dry run)" : "Start the harvest (dry run)"}
-      description="Harvest turns the promotions on best into reviewable changesets with measured contributions. A dry run: nothing is pushed."
-      confirmLabel="Start harvest"
+      title="Freeze best for harvest"
+      description="Harvest freezes best so an agent can turn its promotions into pull requests. The plugin keeps the measurements; the agent does the grouping, the PR descriptions and, when you ask, the publishing."
+      confirmLabel="Freeze best"
       onConfirm={async () => {
-        const r = await rpc.call("study.harvest.start", { slug, ...(restart ? { restart: true } : {}), ...(onePer ? { onePerPromotion: true } : {}) });
+        const r = await rpc.call("study.harvest.start", { slug });
         toast.success(r.message.split("\n")[0] ?? r.message);
         onDone();
       }}
     >
       <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
         <li>No new workers start and submissions close; candidates in flight finish first, so best is final.</li>
-        <li>{onePer ? `Each of the ${promotions} promotion(s) becomes its own changeset.` : `The strategist groups the ${promotions} promotion(s) into changesets (or one per promotion if it doesn't answer).`}</li>
-        <li>Each changeset is reverted from best and measured (its contribution), checked alone on its PR base, and drafted as a local branch with a PR body.</li>
-        <li>Harvest uses bench time; it counts toward the bench budget but is never blocked by it.</li>
+        <li>Best ({promotions} promotion{promotions === 1 ? "" : "s"}) is pinned as <Mono>refs/studies/{slug}/harvest/h&lt;N&gt;</Mono>.</li>
+        <li>Then ask an agent to harvest it with the <Mono>study-harvest</Mono> skill. Its measurements (<Mono>bb study measure</Mono>) use bench time and count toward the bench budget.</li>
+        <li>Nothing is pushed unless you ask the agent to publish. Resume to keep exploring at any time.</li>
       </ul>
-      <label className="flex items-center gap-2 text-sm">
-        <input type="checkbox" checked={onePer} onChange={(e) => setOnePer(e.target.checked)} /> One changeset per promotion (skip the strategist's grouping)
-      </label>
       <p className="text-xs text-muted-foreground">
-        CLI equivalent: <Mono>bb study harvest {slug}{restart ? " --restart" : ""}{onePer ? " --one-per-promotion" : ""}</Mono>
+        CLI equivalent: <Mono>bb study harvest {slug}</Mono>
       </p>
     </ConfirmDialog>
   );
@@ -142,11 +138,11 @@ export function ArchiveDialog({ slug, rpc, open, onOpenChange, onDone }: { slug:
       }}
     >
       <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
-        <li>Live workers stop and their threads are archived; a running harvest is cancelled.</li>
+        <li>Live workers stop and their threads are archived; measurements and gates still running are cancelled.</li>
         <li>Bench checkouts and bench clones are removed.</li>
         <li>{archiveThread ? "The study thread is archived too." : "The study thread stays in the sidebar."}</li>
         <li>
-          Kept: every candidate ref (<Mono>refs/studies/{slug}/c/*</Mono>), the best branch <Mono>studies/{slug}/best</Mono>, harvest branches and exports, and the study's history on this page.
+          Kept: every candidate ref (<Mono>refs/studies/{slug}/c/*</Mono>), the best branch <Mono>studies/{slug}/best</Mono>, frozen harvest refs, and the study's history on this page.
         </li>
       </ul>
       <label className="flex items-center gap-2 text-sm">
@@ -194,7 +190,7 @@ export function NeedsYou({ o, rpc, onChanged, go }: { o: OverviewResult; rpc: Rp
           </Button>
         );
       case "open_harvest":
-        return <Button size="sm" onClick={() => go("harvest")}>Review harvest</Button>;
+        return <Button size="sm" onClick={() => go("harvest")}>Open Harvest</Button>;
       case "open_bench":
         return (
           <Button size="sm" variant="outline" onClick={() => go("bench")}>
@@ -245,7 +241,7 @@ export function NeedsYou({ o, rpc, onChanged, go }: { o: OverviewResult; rpc: Rp
       </ul>
       {dialog?.kind === "approve" ? <ApproveSpecDialog o={o} version={dialog.version} changesOracle={dialog.changesOracle} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
       {dialog?.kind === "start" ? <StartDialog o={o} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
-      {dialog?.kind === "harvest" ? <HarvestDialog slug={o.slug} promotions={o.trajectory.steps.length - 1} restart={false} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
+      {dialog?.kind === "harvest" ? <HarvestDialog slug={o.slug} promotions={o.trajectory.steps.length - 1} rpc={rpc} open onOpenChange={(v) => !v && setDialog(null)} onDone={onChanged} /> : null}
     </section>
   );
 }

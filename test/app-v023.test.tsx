@@ -146,7 +146,7 @@ describe("frontend: v0.2.3 fixes", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec() }, { threadId: "thr_study", projectId: "proj_1" });
@@ -230,7 +230,7 @@ describe("frontend: v0.2.3 fixes", () => {
     await waitUntil(() => port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "smaller output" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "smaller output" }, { threadId: "thr_w1" });
     await waitUntil(() => engine.study("toy-size") && engine.ctx.store.candidateByN(engine.study("toy-size").id, 1)?.stage === "decided");
     // The real detail, with many noisy pairs (a long samples table) and a headline that differs from the medians.
     const real = (await harness.behavior.callRpc("study.candidate", { slug: "toy-size", n: 1 })) as { candidate: Record<string, unknown> & { metricRows: Array<Record<string, unknown>> } };

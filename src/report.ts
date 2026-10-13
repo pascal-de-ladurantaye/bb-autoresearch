@@ -1,11 +1,13 @@
-// Markdown for humans: PR bodies for harvested changesets and the study
-// report (trajectory, wins, notable losses, dossier, calibration and
-// segments, harvest result). Pure functions of the store. Nothing here reads
-// holdout numbers or the holdout command (only pass/fail on candidates).
+// Markdown for humans: the study report (trajectory, wins, notable losses,
+// dossier, calibration and segments, harvest). Pure functions of the store.
+// PR descriptions are an agent's (skills/study-harvest); harvests the plugin
+// drafted before v1 are reported as they were. Nothing here reads holdout
+// numbers or the holdout command (only pass/fail on candidates).
 import type { Ctx } from "./context.ts";
-import type { CandidateRow, ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
-import { dependencyReasons, foldLines, harvestAccounting, prOrder, stackOrderText, type Accounting, type Estimate } from "./harvest-math.ts";
-import type { GuardrailCost, StackRecord } from "./harvest.ts";
+import type { ChangesetRow, HarvestRow, StudyRow } from "./db/store.ts";
+import { commitParts } from "./commit.ts";
+import { foldLines, harvestAccounting, prOrder, stackOrderText, type Accounting, type Estimate, type GuardrailCost, type StackRecord } from "./harvest-legacy.ts";
+import { frozenRef, type Promotion } from "./harvest.ts";
 import { changeWords, headroomWords, relativeWords, invertRegression, promotionChain, rangeWords, storedEstimate, type GuardrailJudgement, type StoredGuardrails } from "./guardrails.ts";
 import { bestGuardrailPositions, guardrailChainBase, segmentGuardrailCalibration } from "./pipeline.ts";
 import { metricSnapshotOf } from "./snapshot.ts";
@@ -29,13 +31,6 @@ function metricOf(spec: StudySpec): MetricInfo {
 /** An improvement in words with its CI: "62.9% fewer ops (CI +62.6% to +63.3%)". */
 function better(spec: StudySpec, v: number | null, lo: number | null = null, hi: number | null = null): string {
   return v === null ? "not measured" : `${improvementText(v, metricOf(spec), { factor: false })}${lo !== null && hi !== null ? ` (${ciText(lo, hi)})` : ""}`;
-}
-
-/** Raw value of the primary metric on best (the promoted candidate's median), for metric units. */
-function bestRaw(ctx: Ctx, study: StudyRow, spec: StudySpec): number | null {
-  const promoted = ctx.store.candidates(study.id, { stages: ["decided"] }).find((c) => c.promoted_sha === study.best_sha);
-  const v = promoted ? safeJson<{ candidate?: Record<string, number> }>(promoted.metrics_json)?.candidate?.[spec.metric.name] : undefined;
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 /** A relative-to-best term as a share of the harvest's total gain: "83.0% of the gain (CI 82.5% to 83.3%) · ≈ 171,456 fewer opcodes". */
@@ -88,92 +83,10 @@ export function accountingText(a: Accounting, spec?: StudySpec): string[] {
   return lines;
 }
 
-function linkedFindings(ctx: Ctx, study: StudyRow, cs: ChangesetRow): string[] {
-  const nums = safeJson<number[]>(cs.candidates_json) ?? [];
-  const out: string[] = [];
-  for (const n of nums) {
-    const c = ctx.store.candidateByN(study.id, n);
-    if (!c) continue;
-    const fs = ctx.store.db.prepare(`SELECT * FROM findings WHERE study_id = ? AND (candidate_id = ? OR (idea_id IS NOT NULL AND idea_id = ?)) ORDER BY id LIMIT 5`).all(study.id, c.id, c.idea_id ?? -1) as Array<{ id: number; outcome: string; learned: string; revisit_if: string }>;
-    for (const f of fs) out.push(`- Finding #${f.id} (c/${n}, ${f.outcome}): ${clipWords(f.learned.replace(/\s+/gu, " "), 400)}${f.revisit_if ? ` Revisit if: ${clipWords(f.revisit_if, 160)}` : ""}`);
-  }
-  return [...new Set(out)];
-}
-
 function studyLink(ctx: Ctx, study: StudyRow, tab = "harvest"): string {
   const url = ctx.bb.appUrl();
   const path = `studies/${study.slug}/${tab}`;
   return url ? `${url.replace(/\/$/u, "")}/plugins/${ctx.bb.pluginId()}/${path}` : `BB Studies page \`${path}\``;
-}
-
-/** The ablation in words, never a signed "+22.00% worse": "best with this change reverted is 22.00% worse than best". */
-export function revertedWords(contribution: number): string {
-  if (Math.abs(contribution) < 0.00005) return "best with this change reverted measures the same as best";
-  return `best with this change reverted is ${magnitudePct(contribution, 2)} ${contribution > 0 ? "worse" : "better"} than best`;
-}
-
-/**
- * "Depends on" lines, one per dependency, the stored reason without the
- * repeated "depends on #k:" prefix: "Depends on #4 Title: reverting #4 from
- * best conflicts in …". Older rows whose reason doesn't parse show it whole on each.
- */
-export function dependencyLines(members: ChangesetRow[], all: ChangesetRow[]): string[] {
-  const inside = new Set(members.map((m) => m.id));
-  const deps = [...new Set(members.flatMap((m) => safeJson<number[]>(m.depends_on_json) ?? []))]
-    .filter((id) => !inside.has(id))
-    .map((id) => all.find((c) => c.id === id))
-    .filter((c): c is ChangesetRow => Boolean(c))
-    .sort((a, b) => a.k - b.k);
-  if (!deps.length) return [];
-  const reasons = new Map<number | null, string[]>();
-  for (const m of members) for (const [k, rs] of dependencyReasons(m.dependency_reason)) reasons.set(k, [...(reasons.get(k) ?? []), ...rs]);
-  return deps.map((d) => {
-    const why = [...new Set(reasons.get(d.k) ?? reasons.get(null) ?? [])];
-    return `Depends on #${d.k} ${clipWords(d.title, 60)}${why.length ? `: ${clipWords(why.join("; "), 300)}` : ""}`;
-  });
-}
-
-/** PR body for one changeset: what and why, measured contribution, standalone effect, findings, study link. A host's PR also covers the changesets folded into it. */
-export function prBody(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow, cs: ChangesetRow, all: ChangesetRow[]): string {
-  const folded = all.filter((c) => c.folded_into === cs.id).sort((a, b) => a.k - b.k);
-  const members = [cs, ...folded];
-  const nums = [...new Set(members.flatMap((m) => safeJson<number[]>(m.candidates_json) ?? []))].sort((a, b) => a - b);
-  const cands = nums.map((n) => ctx.store.candidateByN(study.id, n)).filter((c): c is CandidateRow => Boolean(c));
-  const metric = metricOf(spec);
-  const raw = bestRaw(ctx, study, spec);
-  const host = cs.folded_into !== null ? all.find((c) => c.id === cs.folded_into) : undefined;
-  const contribution = (c: ChangesetRow) =>
-    c.contribution === null
-      ? `not measured alone (${c.ablation_status}${c.ablation_detail ? `: ${clipWords(c.ablation_detail, 200)}` : ""})`
-      : `${shareText({ value: c.contribution, lo: c.ci_lo, hi: c.ci_hi }, h.total_effect, metric, raw)} the study found (${c.n ?? "?"} pairs; ablation: ${revertedWords(c.contribution)})`;
-  const lines = [
-    `## What`,
-    clipWords(cs.title, 200),
-    "",
-    ...cands.map((c) => `- c/${c.n}: ${clipWords(c.summary.split("\n")[0] ?? "", 200)} (when promoted: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it)`),
-    "",
-    `## Why`,
-    clipWords(cs.rationale || "Promoted by the autoresearch study because it measurably improved the metric.", 2000),
-    ...folded.flatMap((f) => (f.rationale ? ["", `#${f.k} ${clipWords(f.title, 80)}: ${clipWords(f.rationale, 1000)}`] : [])),
-    "",
-    `## Measured effect on \`${spec.metric.name}\` (${spec.metric.direction} is better, ${spec.oracle.noise} oracle)`,
-    `- Contribution: ${contribution(cs)}${cs.droppable ? " — **no measurable contribution: consider dropping this PR**" : ""}`,
-    ...folded.map((f) => `- Also includes #${f.k} ${clipWords(f.title, 60)}: ${f.fold_reason ? clipWords(f.fold_reason, 300) : "it doesn't apply on its own PR base"}. Its contribution: ${contribution(f)}.`),
-  ];
-  if (host) lines.push(`- Ships inside #${host.k}'s PR${cs.fold_reason ? `: ${clipWords(cs.fold_reason, 300)}` : ""}.`);
-  else lines.push(`- Alone on ${cs.pr_base === "base" || !cs.pr_base ? `\`${spec.study.base}\`, the study base` : `the PR below it (${cs.pr_base})`}${folded.length ? ` (with ${folded.map((f) => `#${f.k}`).join(", ")})` : ""}: ${standaloneText(cs, spec)}`);
-  for (const l of dependencyLines(members, all)) lines.push(`- ${l}`);
-  const outside = (id: number) => !members.some((m) => m.id === id);
-  const dependents = all.filter((o) => outside(o.id) && (safeJson<number[]>(o.depends_on_json) ?? []).some((id) => members.some((m) => m.id === id)));
-  if (dependents.length) lines.push(`- Needed by: ${dependents.map((d) => `#${d.k} ${clipWords(d.title, 60)}`).join(", ")}`);
-  const f = [...new Set(members.flatMap((m) => linkedFindings(ctx, study, m)))];
-  if (f.length) lines.push("", "## Findings", ...f);
-  lines.push(
-    "",
-    "---",
-    `From autoresearch study \`${study.slug}\` (harvest h${h.seq}, changeset #${cs.k} of ${all.length}${folded.length ? `, with ${folded.map((x) => `#${x.k}`).join(", ")}` : ""}). Study: ${studyLink(ctx, study)}. Every number above is a plugin measurement on the study's bench, not an agent's claim.`,
-  );
-  return clip(lines.join("\n"), 60_000);
 }
 
 export function standaloneText(cs: ChangesetRow, spec?: StudySpec): string {
@@ -234,7 +147,7 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   if (decided.length > 200) lines.push(`| … | ${decided.length - 200} earlier candidates omitted | | | | |`);
   lines.push("", "## Wins", "");
   if (!wins.length) lines.push("No promotions.");
-  for (const c of wins) lines.push(`- **c/${c.n}** ${mdText(titles.get(c.idea_id ?? -1) ?? "", 120)}: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it · ${mdText(c.summary.split("\n")[0] ?? "", 200)}`);
+  for (const c of wins) lines.push(`- **c/${c.n}** ${mdText(commitParts(c, titles.get(c.idea_id ?? -1)).title, 120)}: ${better(spec, c.effect, c.ci_lo, c.ci_hi)} than the best before it${c.idea_id !== null && titles.get(c.idea_id) ? ` · idea #${c.idea_id} ${mdText(titles.get(c.idea_id)!, 100)}` : ""}`);
   lines.push("", "## Notable losses and why", "");
   const losses = decided
     .filter((c) => ["lose", "inconclusive", "gate_failed", "rejected", "conflict"].includes(c.verdict ?? ""))
@@ -265,6 +178,7 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
 
 export function harvestSection(ctx: Ctx, study: StudyRow, spec: StudySpec, h: HarvestRow): string[] {
   const cs = ctx.store.changesets(h.id);
+  if (!cs.length) return frozenSection(ctx, study, h);
   const stacks = safeJson<StackRecord[]>(h.stacks_json) ?? [];
   const lines = [
     `## Harvest h${h.seq} (${h.state})`,
@@ -294,6 +208,28 @@ export function harvestSection(ctx: Ctx, study: StudyRow, spec: StudySpec, h: Ha
   const vb = vsBaseFromVsBest(h.total_effect, spec.metric.direction);
   if (vb !== null) lines.push(`- For the record: relative to best the total gain is ${pct(h.total_effect)}; relative to base it is ${improvementText(vb, metricOf(spec))}.`);
   lines.push(`- Harvest bench time: ${formatDuration(h.bench_seconds)}.`);
+  return lines;
+}
+
+/** A v1 harvest: best frozen for an agent to harvest (the plugin drafts no PRs). */
+function frozenSection(ctx: Ctx, study: StudyRow, h: HarvestRow): string[] {
+  const promotions = safeJson<Promotion[]>(h.promotions_json) ?? [];
+  const lines = [`## Harvest h${h.seq} (${h.state})`, ""];
+  if (h.state === "waiting") return [...lines, "Waiting for in-flight candidates to finish before best freezes."];
+  if (!h.best_sha) return [...lines, h.error ? `Could not freeze best: ${mdText(h.error, 400)}` : "Best was not frozen."];
+  lines.push(
+    `Best frozen at \`${h.best_sha.slice(0, 10)}\` (\`${frozenRef(study.slug, h.seq)}\`) on base \`${h.base_sha?.slice(0, 10) ?? "?"}\`, ${promotions.length} promotion(s) in first-parent order. An agent harvests it into PRs with the study-harvest skill (\`bb study evidence\`, \`measure\`, \`gate\`).${h.phase_detail ? ` ${mdText(h.phase_detail, 300)}.` : ""}`,
+    "",
+  );
+  for (const p of promotions) lines.push(`- \`${p.sha.slice(0, 10)}\`${p.n !== null ? ` c/${p.n}` : ""} ${mdText(p.title, 120)} (${p.paths.length} file${p.paths.length === 1 ? "" : "s"})`);
+  const runs = ctx.store.adhocRuns(study.id, { states: ["done"], limit: 20 });
+  if (runs.length) {
+    lines.push("", "Measurements and gates agents asked for (newest first):");
+    for (const r of runs) {
+      const res = safeJson<{ text?: string }>(r.result_json);
+      lines.push(`- r${r.seq} ${r.kind}${r.kind === "measure" ? ` B \`${mdText(r.ref_b, 60)}\` vs A \`${mdText(r.ref_a ?? "", 60)}\`` : ` \`${mdText(r.ref_b, 60)}\``}: ${mdText(res?.text ?? "", 300)}`);
+    }
+  }
   return lines;
 }
 

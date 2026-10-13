@@ -1,32 +1,18 @@
-// In-app approval, start, publish, changeset choice and archive (RPC), the
+// In-app approval, start, harvest (a freeze) and archive (RPC), the
 // Needs-you derivation behind them, notices with actions, and the study
 // thread messages (one-line summary, agent-only detail).
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
 import type { Engine } from "../src/engine.ts";
-import type { ExecInput, ExecResult } from "../src/host/contract.ts";
 import { needsYou, noticeAction } from "../src/views.ts";
 import { FakeHost, FakePort, fakeHostSpec, waitFor } from "./helpers.ts";
 
 type Harness = ReturnType<typeof createFakePluginHost>["harness"];
 
-/** An edit host that answers like git push and gh would (never the network). */
-class GhHost extends FakeHost {
-  ran: string[] = [];
-  async exec(input: ExecInput): Promise<ExecResult> {
-    this.ran.push(input.command);
-    const ok = (stdout = ""): ExecResult => ({ exitCode: 0, timedOut: false, durationMs: 1, stdout, stderr: "" });
-    if (input.command === "gh --version") return ok("gh version 2.0");
-    if (input.command.startsWith("git push")) return ok();
-    if (input.command.startsWith("gh pr create")) return ok(`https://github.com/acme/repo/pull/${this.ran.filter((c) => c.startsWith("gh pr create")).length}\n`);
-    return super.exec(input);
-  }
-}
-
 describe("human interface: in-app actions and Needs you", () => {
   let harness: Harness;
-  let host: GhHost;
+  let host: FakeHost;
   let port: FakePort;
   let engine!: Engine;
   const call = async <T = any>(method: string, input?: unknown, caller?: { kind: "plugin"; pluginId: string }) =>
@@ -36,13 +22,13 @@ describe("human interface: in-app actions and Needs you", () => {
   const events = (kind: string) => engine.ctx.store.events(study().id, { kinds: [kind] });
 
   beforeEach(async () => {
-    host = new GhHost();
+    host = new FakeHost();
     port = new FakePort(host);
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
-    await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0, harvestPollMs: 5, harvestGroupGraceMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
+    await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0, harvestPollMs: 5 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec() }, { threadId: "thr_study", projectId: "proj_1" });
   });
@@ -90,7 +76,7 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(events("control.approve")).toHaveLength(1);
   });
 
-  it("budget exhausted asks for a harvest; a ready harvest asks for review", async () => {
+  it("budget exhausted asks for a harvest; a frozen harvest asks for an agent", async () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["start", "toy-size"]);
     await engine.systemPause(study().id, "budget exhausted: 3/3 candidates");
@@ -100,7 +86,8 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(notice.text).toMatch(/paused itself: budget exhausted.*Next: harvest the wins on the Harvest tab/u);
     await call("study.harvest.start", { slug: "toy-size" });
     await engine.waitForHarvest("toy-size", 10_000);
-    expect(kinds()).toEqual(["harvest_ready"]);
+    expect(kinds()).toEqual(["harvest_frozen"]);
+    expect(needsYou(engine, study())[0]).toMatchObject({ title: expect.stringContaining("ask an agent to harvest it"), action: { kind: "open_harvest" }, command: "bb study evidence toy-size" });
     // The attention count for the nav panel.
     expect((await call("studies.attention")).total).toBe(1);
   });
@@ -125,55 +112,34 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(needsYou(engine, study())[0]!.detail).toContain("Ask the study thread to revise the spec");
   });
 
-  it("publish in the app: plan first, confirmation required, refusals and results are kept and audited", async () => {
+  it("a harvest the plugin drafted before v1 stays readable; publishing and keep/drop are gone", async () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["start", "toy-size"]);
     const s = study();
     const { store } = engine.ctx;
     store.setStudyState(s.id, "harvesting", "test");
-    const h = store.insertHarvest({ study_id: s.id, from_state: "paused", measure_standalone: 1 }, "test");
+    const h = store.insertHarvest({ study_id: s.id, from_state: "paused" }, "test");
     const a = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 1, title: "A", rationale: "", candidates_json: "[]", commits_json: "[]", paths_json: "[]" });
-    const b = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 2, title: "B", rationale: "", candidates_json: "[]", commits_json: "[]", paths_json: "[]" });
-    const c = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 3, title: "C", rationale: "", candidates_json: "[]", commits_json: "[]", paths_json: "[]" });
-    store.updateChangeset(a.id, { branch: "studies/toy-size/harvest/h1/01-a", standalone_sha: "aaa1111", standalone_status: "pass", pr_title: "A", pr_body: "a" });
-    store.updateChangeset(b.id, { branch: "studies/toy-size/harvest/h1/02-b", standalone_sha: "bbb2222", standalone_status: "pass", pr_base: "#1", depends_on_json: JSON.stringify([a.id]), stack: 1, pr_title: "B", pr_body: "b" });
-    store.updateChangeset(c.id, { branch: "studies/toy-size/harvest/h1/03-c", standalone_sha: "ccc3333", standalone_status: "pass", droppable: 1, pr_title: "C", pr_body: "c" });
-    store.updateHarvest(h.id, { state: "ready", finished_at: Date.now(), publish_state: "dry-run" });
-
-    // No remote: the plan says so, and a confirmed publish is refused, kept on the harvest, and audited.
-    const plan0 = await call("study.harvest.plan", { slug: "toy-size", harvestId: h.id });
-    expect(plan0).toMatchObject({ ok: false, remote: "origin", remoteUrl: null });
-    expect(plan0.problem).toMatch(/no remote named "origin"/u);
-    await expect(call("study.harvest.publish", { slug: "toy-size", harvestId: h.id })).rejects.toThrow(/confirmation required: this pushes 3 branch\(es\) of harvest h1 to origin/u);
-    await expect(call("study.harvest.publish", { slug: "toy-size", harvestId: h.id, confirm: true })).rejects.toThrow(/publish refused/u);
-    expect(store.harvest(h.id)).toMatchObject({ publish_state: "failed" });
-    expect(store.harvest(h.id)!.error).toMatch(/publish refused: the repository has no remote/u);
-    expect(events("control.publish")[0]!.data_json).toContain('"failed":true');
-    expect(kinds()).toContain("publish_failed");
-
-    // Drop rules: #1 has a dependent, #3 doesn't.
-    await expect(call("study.harvest.choice", { slug: "toy-size", harvestId: h.id, k: 1, choice: "drop" })).rejects.toThrow(/#1 can't be dropped: #2 builds on it/u);
-    expect((await call("study.harvest.choice", { slug: "toy-size", harvestId: h.id, k: 3, choice: "drop" })).message).toContain("skipped when publishing");
-    expect(events("control.harvest_choice")).toHaveLength(1);
-
-    // With a GitHub remote: the plan lists exactly what goes where; publishing opens draft PRs and the URLs stay on the harvest.
-    host.remotes = [{ name: "origin", url: "git@github.com:acme/repo.git" }];
-    const plan = await call("study.harvest.plan", { slug: "toy-size", harvestId: h.id });
-    expect(plan.ok).toBe(true);
-    expect(plan.prs).toEqual([
-      { k: 1, title: "A", branch: "studies/toy-size/harvest/h1/01-a", base: "main", stacked: false, push: true, skip: null },
-      { k: 2, title: "B", branch: "studies/toy-size/harvest/h1/02-b", base: "studies/toy-size/harvest/h1/01-a", stacked: true, push: true, skip: null },
-      { k: 3, title: "C", branch: "studies/toy-size/harvest/h1/03-c", base: "main", stacked: false, push: false, skip: "dropped by you" },
-    ]);
-    const r = await call("study.harvest.publish", { slug: "toy-size", harvestId: h.id, confirm: true });
-    expect(r.message).toContain("2 draft PR(s) opened");
-    expect(host.ran.filter((x) => x.startsWith("git push"))).toHaveLength(2);
+    store.updateChangeset(a.id, { branch: "studies/toy-size/harvest/h1/01-a", standalone_sha: "aaa1111", standalone_status: "pass", pr_title: "A", pr_body: "a", human_choice: "keep" });
+    store.updateHarvest(h.id, { state: "ready", finished_at: Date.now(), publish_state: "dry-run", grouping_source: "strategist" });
     const v = await call("study.harvest", { slug: "toy-size" });
-    expect(v.harvest.published.map((p: { status: string }) => p.status)).toEqual(["opened", "opened", "skipped"]);
-    expect(v.harvest.published[2].detail).toBe("dropped by you");
-    expect(v.harvest.changesets[0].pr.url).toBe("https://github.com/acme/repo/pull/1");
-    expect(store.notices(s.id).some((n) => n.kind === "harvest.published" && n.text.includes("2 draft PR(s) opened"))).toBe(true);
-    expect(kinds()).not.toContain("harvest_ready");
+    expect(v.harvest).toMatchObject({ legacy: true, frozenRef: null });
+    expect(v.harvest.changesets[0]).toMatchObject({ k: 1, choice: "keep", pr: { branch: "studies/toy-size/harvest/h1/01-a", body: "a" } });
+    expect(v.harvest).not.toHaveProperty("canPublish");
+    // It asks for an agent to finish it, never for the plugin to publish.
+    expect(kinds()).toEqual(["harvest_frozen"]);
+    expect(needsYou(engine, study())[0]!.title).toContain("drafted before v1");
+    for (const method of ["study.harvest.plan", "study.harvest.publish", "study.harvest.choice"]) await expect(call(method, { slug: "toy-size", harvestId: h.id })).rejects.toThrow(/no rpc method/u);
+    // A new harvest from here is a freeze; the old one stays in the history and readable by id.
+    expect((await call("study.harvest.start", { slug: "toy-size" })).ok).toBe(true);
+    await engine.waitForHarvest("toy-size", 10_000);
+    const now = await call("study.harvest", { slug: "toy-size" });
+    expect(now.harvest).toMatchObject({ seq: 2, state: "frozen", legacy: false });
+    expect(now.history.map((x: { seq: number; legacy: boolean }) => [x.seq, x.legacy])).toEqual([
+      [2, false],
+      [1, true],
+    ]);
+    expect((await call("study.harvest", { slug: "toy-size", harvestId: h.id })).harvest).toMatchObject({ seq: 1, legacy: true });
   });
 
   it("archive in the app needs confirmation and is audited", async () => {
@@ -212,6 +178,7 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(o.notices.find((n: { kind: string }) => n.kind === "control.calibrate").audit).toBe(true);
     expect(noticeAction("control.pause", study())).toBeNull();
     expect(noticeAction("harvest.ready", study())).toMatchObject({ tab: "harvest" });
+    expect(noticeAction("harvest.frozen", study())).toMatchObject({ tab: "harvest" });
   });
 
   it("study thread and worker messages: one-line summary for the human, the full detail agent-only", async () => {
@@ -221,7 +188,7 @@ describe("human interface: in-app actions and Needs you", () => {
     await waitFor(() => port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
     const verdict = port.sent.find((m) => m.threadId === "thr_w1" && m.text.includes("Verdict"))!;
     expect(verdict.summary).toBe("[autoresearch] Verdict for c/1: WIN: promoted to best, 20.0% lower size than best.");

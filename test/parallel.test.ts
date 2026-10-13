@@ -85,7 +85,7 @@ describe("M1 parallel study (fake host)", () => {
   async function submit(thread: string, tree: string, value: number, summary = `change ${tree} for speed`) {
     host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     host.metric.set(tree, value);
-    return await engine.submit(thread, summary);
+    return await engine.submit(thread, { title: summary });
   }
 
   it("spawns W > 1 workers in one pass, respecting the theme cap ceil(W/2)", async () => {

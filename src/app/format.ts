@@ -68,10 +68,15 @@ export const STATE_TONE: Record<string, string> = {
   draft: "bg-muted text-muted-foreground",
   harvesting: "bg-muted text-foreground",
   archived: "bg-muted text-muted-foreground",
-  // Harvest states.
+  // Harvest states (ready: harvests before v1).
+  waiting: "bg-muted text-foreground",
+  frozen: "bg-success/15 text-success",
   ready: "bg-success/15 text-success",
   failed: "bg-destructive/15 text-destructive",
   cancelled: "bg-muted text-muted-foreground",
+  // Requested measurements and gates.
+  queued: "bg-muted text-muted-foreground",
+  done: "bg-success/15 text-success",
 };
 
 /** Guardrail states: word + glyph + tone. */

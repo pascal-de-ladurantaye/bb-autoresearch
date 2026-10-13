@@ -210,7 +210,7 @@ describe("v0.2.1 (fake host)", () => {
     host.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     host.metric.set(tree, value);
     host.rss.set(tree, rss);
-    return await engine.submit(thread, `change ${tree}`);
+    return await engine.submit(thread, { title: `change ${tree}` });
   }
 
   it("Oracle tab: the noise sentence per class; a missing floor reads 'not measured' (not 0.00%), and the hosts carry null", async () => {

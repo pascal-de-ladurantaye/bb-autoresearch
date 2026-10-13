@@ -185,7 +185,7 @@ describe("v1 measurement quality (fake hosts)", () => {
     edit.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     edit.metric.set(tree, value);
     if (runMs !== undefined) edit.runMs.set(tree, runMs);
-    return await engine.submit(thread, `change ${tree} for speed`);
+    return await engine.submit(thread, { title: `change ${tree} for speed` });
   }
 
   it("each host decides with its own win threshold, and a candidate goes to the quietest free host first", async () => {

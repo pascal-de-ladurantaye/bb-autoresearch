@@ -53,7 +53,7 @@ describe("frontend: human interface", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec() }, { threadId: "thr_study", projectId: "proj_1" });
@@ -81,7 +81,7 @@ describe("frontend: human interface", () => {
     await waitUntil(() => port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     await waitUntil(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
   }
 
@@ -161,7 +161,7 @@ describe("frontend: human interface", () => {
     await bench.findByText(/No drift checks yet/u);
     const harvest = await open("toy-size/harvest");
     await harvest.findByText(/Nothing to harvest yet: no candidate has been promoted/u);
-    expect((harvest.getByRole("button", { name: "Start harvest…" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((harvest.getByRole("button", { name: "Freeze best for harvest…" }) as HTMLButtonElement).disabled).toBe(true);
     const overview = await open("toy-size/overview");
     await overview.findByText(/The trajectory appears once candidates are measured/u);
   });
@@ -256,7 +256,7 @@ describe("frontend: human interface", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     const noGuardrail = fakeHostSpec().replace('[[guardrail]]\nname = "rss"\nmax_regression = "5%"\n', "");
@@ -309,22 +309,22 @@ describe("frontend: human interface", () => {
     expect(defaultProjectFor("gone", [], new Set(["other"]))).toBeNull();
   });
 
-  it("publish dialog shows the plan and why it can't run yet", async () => {
+  it("the Harvest tab lists the measurements and gates agents asked for, with their results in words", async () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["start", "toy-size"]);
     const s = engine.study("toy-size");
     const { store } = engine.ctx;
     store.setStudyState(s.id, "harvesting", "test");
-    const h = store.insertHarvest({ study_id: s.id, from_state: "paused", measure_standalone: 1 }, "test");
-    const cs = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 1, title: "Drop whitespace", rationale: "", candidates_json: "[]", commits_json: "[]", paths_json: "[]" });
-    store.updateChangeset(cs.id, { branch: "studies/toy-size/harvest/h1/01-drop", standalone_sha: "abc1234", standalone_status: "pass", pr_title: "Drop whitespace", pr_body: "body" });
-    store.updateHarvest(h.id, { state: "ready", finished_at: Date.now(), publish_state: "dry-run" });
+    const h = store.insertHarvest({ study_id: s.id, from_state: "paused" }, "test");
+    store.updateHarvest(h.id, { state: "frozen", base_sha: s.base_sha, best_sha: s.best_sha, promotions_json: "[]", finished_at: Date.now() });
+    const m = store.insertAdhocRun({ study_id: s.id, kind: "measure", ref_a: "base", ref_b: "split/1", sha_a: "aaaaaaa", sha_b: "bbbbbbb", host_id: "local", pairs: null, actor: "thr_agent" });
+    store.updateAdhocRun(m.id, { state: "done", bench_seconds: 12, result_json: JSON.stringify({ kind: "measure", text: "B (split/1) vs A (base): 12.0% lower size, one run each on local: win against the 1.00% threshold" }) });
+    const g = store.insertAdhocRun({ study_id: s.id, kind: "gate", ref_a: null, ref_b: "split/2", sha_a: null, sha_b: "ccccccc", host_id: null, pairs: null, actor: "thr_agent" });
+    store.updateAdhocRun(g.id, { state: "failed", error: "gate failed: npm test exited 1" });
     const page = await open("toy-size/harvest");
-    fireEvent.click(await page.findByRole("button", { name: "Publish draft PRs…" }));
-    await page.findByText(/Publishing can't run yet/u);
-    expect(page.getByText(/no remote named "origin"/u)).toBeTruthy();
-    expect(page.getAllByText("studies/toy-size/harvest/h1/01-drop").length).toBeGreaterThan(0);
-    const confirm = page.getByRole("button", { name: /Push 1 branch and open draft PRs/u }) as HTMLButtonElement;
-    expect(confirm.disabled).toBe(true);
+    const runs = await page.findByLabelText("Measurements and gates");
+    expect(runs.textContent).toMatch(/r2.*failed.*gate.*split\/2.*gate failed: npm test exited 1/u);
+    expect(runs.textContent).toMatch(/r1.*done.*measure.*split\/1.*against.*base.*12\.0% lower size/u);
+    expect(page.getByText("Ask an agent to harvest it")).toBeTruthy();
   });
 });

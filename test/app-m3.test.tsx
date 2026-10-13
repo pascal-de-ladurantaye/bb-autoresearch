@@ -46,7 +46,7 @@ describe("frontend: M3 study tabs", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: SPEC }, { threadId: "thr_study", projectId: "proj_1" });
@@ -56,7 +56,7 @@ describe("frontend: M3 study tabs", () => {
     await waitUntil(() => port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     await waitUntil(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
   });
   afterEach(async () => {
@@ -153,25 +153,34 @@ describe("frontend: M3 study tabs", () => {
     expect(page.getByLabelText("Bench intervals").textContent).toContain("c/1");
   });
 
-  it("harvest: empty state starts a dry run", async () => {
+  it("harvest: the empty state freezes best, then shows the promotions and how to ask an agent", async () => {
     const page = await open("toy-size/harvest");
-    await page.findByText(/A dry run: nothing is pushed until you publish/u);
+    await page.findByText(/so an agent can turn it into pull requests/u);
     expect(page.getByText("bb study harvest toy-size")).toBeTruthy();
-    fireEvent.click(await page.findByRole("button", { name: "Start harvest…" }));
+    fireEvent.click(await page.findByRole("button", { name: "Freeze best for harvest…" }));
     // A deliberate step: the dialog says what happens, then the confirm button starts it.
     await page.findByText(/candidates in flight finish first/u);
-    fireEvent.click(await page.findByRole("button", { name: "Start harvest" }));
+    fireEvent.click(await page.findByRole("button", { name: "Freeze best" }));
     await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size" }));
-    await waitUntil(() => engine.ctx.store.latestHarvest(study().id) !== undefined);
+    await waitUntil(() => engine.ctx.store.latestHarvest(study().id)?.state === "frozen");
     expect(study().state).toBe("harvesting");
-    await page.findByText(/Harvest h1/u);
+    await page.findByText("Harvest h1");
+    // The promotion with the worker's commit title, the pinned ref, and the guide with the prompt for an agent.
+    const promotions = await page.findByLabelText("Promotions");
+    expect(promotions.textContent).toMatch(/c\/1.*drop trailing whitespace/u);
+    expect(page.getByText("refs/studies/toy-size/harvest/h1")).toBeTruthy();
+    expect((await page.findByTestId("harvest-prompt")).textContent).toContain("study-harvest skill");
+    expect(page.getByRole("button", { name: "Ask in a new thread…" })).toBeTruthy();
+    expect(page.getAllByText(/bb study measure toy-size <A> <B>/u).length).toBeGreaterThan(0);
+    // No plugin-drafted PRs and no publish button any more.
+    expect(page.queryByRole("button", { name: /Publish/u })).toBeNull();
   });
 
-  it("harvest: changesets, contribution, dependency, interaction warning, PR body, publish command", async () => {
+  it("harvest: a harvest from before v1 stays readable: changesets, contribution, dependency, interaction warning, PR body", async () => {
     const s = study();
     const { store } = engine.ctx;
     store.setStudyState(s.id, "harvesting", "test");
-    const h = store.insertHarvest({ study_id: s.id, from_state: "running", measure_standalone: 1 }, "test");
+    const h = store.insertHarvest({ study_id: s.id, from_state: "running" }, "test");
     const cs1 = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 1, title: "Drop trailing whitespace", rationale: "First win.", candidates_json: "[1]", commits_json: "[]", paths_json: '["src/a.ts"]' });
     const cs2 = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 2, title: "Compact the header", rationale: "Builds on #1.", candidates_json: "[1]", commits_json: "[]", paths_json: '["src/a.ts"]' });
     store.updateChangeset(cs1.id, { ablation_status: "measured", contribution: 0.05, ci_lo: 0.04, ci_hi: 0.06, n: 5, stack: 1, branch: "studies/toy-size/pr/1", pr_status: "drafted", pr_title: "Drop trailing whitespace", pr_body: "## Why\nWhitespace-body-marker", standalone_status: "pass" });
@@ -202,14 +211,15 @@ describe("frontend: M3 study tabs", () => {
     expect(page.getByLabelText("Stacks").textContent).toContain("#1 → #2");
     fireEvent.click(page.getByText(/PR preview: Drop trailing whitespace/u));
     expect(page.getByText(/Whitespace-body-marker/u)).toBeTruthy();
-    expect(page.getByText("bb study harvest toy-size --publish")).toBeTruthy();
     expect(page.getByText("/exports/h1")).toBeTruthy();
-    // Publishing is in the app now, behind a confirmation.
-    expect(page.getByRole("button", { name: "Publish draft PRs…" })).toBeTruthy();
-    // A new dry run is offered once this one is ready.
-    fireEvent.click(page.getByRole("button", { name: "Start a new harvest…" }));
-    fireEvent.click(await page.findByRole("button", { name: "Start harvest" }));
-    await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size", restart: true }));
+    expect(page.getByText(/drafted before v1, read only/u)).toBeTruthy();
+    // Read only: no publish and no keep/drop controls.
+    expect(page.queryByRole("button", { name: /Publish/u })).toBeNull();
+    expect(page.queryByRole("radio")).toBeNull();
+    // A new harvest (a freeze) can start from it.
+    fireEvent.click(page.getByRole("button", { name: "Freeze best for a new harvest…" }));
+    fireEvent.click(await page.findByRole("button", { name: "Freeze best" }));
+    await waitFor(() => expect(page.inspection.rpcCalls.find((c) => c.method === "study.harvest.start")?.input).toEqual({ slug: "toy-size" }));
     await waitUntil(() => store.harvests(s.id).length === 2);
     // Report on demand.
     fireEvent.click(page.getByRole("button", { name: "Show report" }));
@@ -220,9 +230,9 @@ describe("frontend: M3 study tabs", () => {
     const s = study();
     const { store } = engine.ctx;
     // Another study's harvest takes global id 1: this study's first harvest is still h1.
-    store.insertHarvest({ study_id: "st_other", from_state: "running", measure_standalone: 1 }, "test");
+    store.insertHarvest({ study_id: "st_other", from_state: "running" }, "test");
     store.setStudyState(s.id, "harvesting", "test");
-    const h = store.insertHarvest({ study_id: s.id, from_state: "running", measure_standalone: 1 }, "test");
+    const h = store.insertHarvest({ study_id: s.id, from_state: "running" }, "test");
     expect(h.id).toBe(2);
     expect(h.seq).toBe(1);
     const cs1 = store.insertChangeset({ harvest_id: h.id, study_id: s.id, k: 1, title: "Add the parser", rationale: "", candidates_json: "[1]", commits_json: "[]", paths_json: '["src/x.ts"]' });
@@ -235,8 +245,8 @@ describe("frontend: M3 study tabs", () => {
     store.updateHarvest(h.id, { state: "ready", finished_at: Date.now(), grouping_source: "strategist", total_effect: 0.2, total_ci_lo: 0.19, total_ci_hi: 0.21, total_n: 5, stacks_json: JSON.stringify([{ stack: 1, members: [cs1.id, cs2.id], layers: [{ host: cs1.id, members: [cs1.id, cs2.id] }], status: "not_needed", estimate: null, n: null, detail: null }]), publish_state: "dry-run" });
     const page = await open("toy-size/harvest");
     const list = await page.findByLabelText("Changesets");
-    expect(page.getByText("Harvest h1")).toBeTruthy();
-    expect(page.queryByText("Harvest h2")).toBeNull();
+    expect(page.getByText(/^Harvest h1 \(drafted before v1/u)).toBeTruthy();
+    expect(page.queryByText(/^Harvest h2/u)).toBeNull();
     expect(list.textContent).toContain("#2 ships inside #1's PR: #2 needs src/x.ts, which #1 adds or changes, so it doesn't apply on `main` alone.");
     expect(list.textContent).toContain("Its PR also ships #2");
     expect(list.textContent).toContain("ships inside #1's PR");
@@ -265,7 +275,7 @@ describe("frontend: M3 study tabs", () => {
 
   it("overview: provider usage line and a harvest link", async () => {
     const s = study();
-    const h = engine.ctx.store.insertHarvest({ study_id: s.id, from_state: "running", measure_standalone: 1 }, "test");
+    const h = engine.ctx.store.insertHarvest({ study_id: s.id, from_state: "running" }, "test");
     engine.ctx.store.updateHarvest(h.id, { state: "failed", finished_at: Date.now(), error: "boom" });
     const page = await open("toy-size/overview");
     expect((await page.findByLabelText("Provider usage")).textContent).toMatch(/Provider usage:/u);

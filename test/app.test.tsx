@@ -24,7 +24,7 @@ describe("frontend: Studies panel and thread badge", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 } })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec() }, { threadId: "thr_study", projectId: "proj_1" });
@@ -34,7 +34,7 @@ describe("frontend: Studies panel and thread badge", () => {
     await waitUntil(() => port.spawned.length >= 1);
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 800);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "drop trailing whitespace" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     await waitUntil(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
   });
   afterEach(async () => {
@@ -87,7 +87,11 @@ describe("frontend: Studies panel and thread badge", () => {
     ideas.lifecycle.unmount();
 
     const cands = renderSlot(app.navPanels[0]!, { subPath: "toy-size/candidates/1" }, { rpc: realRpc() });
-    await cands.findByText("drop trailing whitespace", { selector: "p" });
+    // The worker's commit message, used verbatim for the candidate and its commit on best.
+    const message = await cands.findByLabelText("Commit message");
+    expect(message.textContent).toContain("drop trailing whitespace");
+    expect(message.textContent).toContain("its commit on best");
+    expect(cands.getByText("Commit message (the worker's)")).toBeTruthy();
     await cands.findByText(/Samples \(size/u);
     expect((await cands.findAllByText("src/a.ts")).length).toBeGreaterThan(0);
     await cands.findByText("Diff · 1 file(s)");

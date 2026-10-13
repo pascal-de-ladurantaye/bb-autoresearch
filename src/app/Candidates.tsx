@@ -31,7 +31,7 @@ export function CandidatesTab({ slug, metric, selected, onSelect }: { slug: stri
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
     const all = list.data?.candidates ?? [];
-    return q ? all.filter((c) => `${c.summary} ${c.ideaTitle ?? ""} c/${c.n}`.toLowerCase().includes(q)) : all;
+    return q ? all.filter((c) => `${c.title} ${c.summary} ${c.ideaTitle ?? ""} c/${c.n}`.toLowerCase().includes(q)) : all;
   }, [list.data, query]);
   return (
     <div className="space-y-3">
@@ -98,7 +98,7 @@ function Table({ rows, metric, selected, onSelect }: { rows: CandidateView[]; me
               </td>
               <td className="max-w-80 px-3 py-2">
                 <div className="truncate">{c.ideaTitle ?? `idea #${c.ideaId ?? "?"}`}</div>
-                <div className="truncate text-xs text-muted-foreground">{c.summary}</div>
+                <div className="truncate text-xs text-muted-foreground">{c.title}</div>
               </td>
               <td className="whitespace-nowrap px-3 py-2">
                 <VerdictBadge verdict={c.verdict} stage={c.stage} />
@@ -199,8 +199,18 @@ function CandidateDetail({ slug, n, metric, onClose }: { slug: string; n: number
               · ref <Mono>{c.ref}</Mono>
             </p>
           </Section>
-          <Section title="Summary">
-            <p className="whitespace-pre-wrap text-sm">{c.summaryFull}</p>
+          <Section title={c.commit.fromWorker ? "Commit message (the worker's)" : "Summary"}>
+            {c.commit.fromWorker ? (
+              <div className="space-y-1 rounded-md border border-border bg-card px-3 py-2" aria-label="Commit message">
+                <p className="text-sm font-medium">{c.commit.title}</p>
+                {c.commit.body ? <p className="whitespace-pre-wrap text-sm">{c.commit.body}</p> : null}
+                <p className="text-xs text-muted-foreground">
+                  Used verbatim for this candidate's commit{c.promotedSha ? " and its commit on best" : ""}; the plugin only adds its <Mono>Autoresearch-Study</Mono> and <Mono>Autoresearch-Candidate</Mono> trailers.
+                </p>
+              </div>
+            ) : (
+              <p className="whitespace-pre-wrap text-sm">{c.summaryFull}</p>
+            )}
           </Section>
           <Samples samples={c.samples} metric={metric} noise={c.noise} />
           {c.gateOutput ? (

@@ -518,4 +518,36 @@ export const MIGRATIONS: string[] = [
    * at). Cleared by the next calibration, which measures it again.
    */
   `ALTER TABLE bench_hosts ADD COLUMN excluded_json TEXT`,
+  // ---- v1: agents own commits, harvest and publishing ----
+  /** The worker's commit message: a title (at most 72 characters) and an optional body, used verbatim for the candidate and promotion commits. */
+  `ALTER TABLE candidates ADD COLUMN commit_title TEXT`,
+  `ALTER TABLE candidates ADD COLUMN commit_body TEXT`,
+  /**
+   * Measurements and gates an agent or the human asked for (`bb study
+   * measure`, `bb study gate`): the trust boundary's primitives for agent-run
+   * harvests. Same bench hosts, lock and budget as candidates.
+   */
+  `CREATE TABLE adhoc_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    ref_a TEXT,
+    ref_b TEXT NOT NULL,
+    sha_a TEXT,
+    sha_b TEXT NOT NULL,
+    host_id TEXT,
+    pairs INTEGER,
+    state TEXT NOT NULL,
+    progress TEXT,
+    result_json TEXT,
+    error TEXT,
+    actor TEXT NOT NULL,
+    bench_seconds REAL NOT NULL DEFAULT 0,
+    requested_at INTEGER NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER,
+    UNIQUE (study_id, seq)
+  )`,
+  `CREATE INDEX adhoc_runs_study ON adhoc_runs (study_id, id)`,
 ];

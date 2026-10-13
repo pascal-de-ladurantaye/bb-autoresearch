@@ -122,7 +122,7 @@ describe("M2 remote bench (fake hosts)", () => {
   async function submit(thread: string, tree: string, value: number, summary = `change ${tree} for speed`) {
     edit.nextSnapshotFor.set(`/wt/${thread}`, { tree });
     edit.metric.set(tree, value);
-    return await engine.submit(thread, summary);
+    return await engine.submit(thread, { title: summary });
   }
 
   it("resolves bench hosts by name or id and rejects unknown machines", async () => {

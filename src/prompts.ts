@@ -121,9 +121,16 @@ export function workerBrief(b: BriefInput): string {
     "## Loop",
     "1. Understand the relevant code. Stay inside the editable scope.",
     "2. Make the change, then run a fast local check (build or a focused test). Do not run long benchmarks.",
-    "3. Call `study_submit_candidate` with a one-paragraph summary. The plugin commits your worktree for you, rebases it onto the current best, runs the gates, and queues it for the bench. Then END YOUR TURN; the verdict arrives later as a message.",
+    "3. Call `study_submit_candidate` with the commit message for your change: `title` (one line, at most 72 characters) and `body`. The plugin commits your worktree with that message for you, rebases it onto the current best, runs the gates, and queues it for the bench. Then END YOUR TURN; the verdict arrives later as a message.",
     "4. Read the verdict. Refine and resubmit, or stop.",
     `5. Before you stop: call \`study_record_finding\` (what you learned, why it won or lost, when it is worth revisiting), then \`study_finish\`. \`study_finish\` refuses until a finding is recorded.`,
+    "",
+    "",
+    "## Commit message",
+    `Your title and body are used verbatim: for your candidate's commit and, if it wins, for the commit on \`studies/${b.study.slug}/best\` that later becomes a PR. The plugin only appends its \`Autoresearch-Study\` and \`Autoresearch-Candidate\` trailers.`,
+    "- Title: what this change does to the code (\"Cache parsed headers per request\"), not the idea's name or the hoped-for result. Follow the repository's style (`git log --oneline -15` shows it).",
+    "- Body: why it should help, what you checked locally, and any trade-off. No measured numbers: the plugin measures and records those itself.",
+    "- Each resubmission takes its own message: describe that version.",
     "",
     `Other workers run in parallel on other ideas. When one of them wins, \`studies/${b.study.slug}/best\` moves: your next submission is rebased onto it automatically. Only a CONFLICT verdict needs you to rebase by hand.`,
     "",
@@ -410,43 +417,4 @@ const pctAbs = (f: number) => `${(Math.abs(f) * 100).toFixed(1)}%`;
 function fmtNum(v: number | undefined): string {
   if (v === undefined) return "n/a";
   return Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : v.toPrecision(4);
-}
-
-export interface HarvestRoundInput {
-  study: StudyRow;
-  spec: StudySpec;
-  harvest: { id: number; seq: number };
-  promotions: Array<{ sha: string; n: number | null; title: string; paths: string[] }>;
-  candidates: Map<number, CandidateRow | undefined>;
-  dossier: { version: number; text: string } | null;
-  /** Where best's code is and how to read it (the "Code" block). */
-  code?: CodeInfo;
-}
-
-/** The harvest grouping round: one turn asking the strategist for study_propose_harvest. */
-export function harvestRoundPrompt(d: HarvestRoundInput): AgentMessage {
-  const summary = `[autoresearch] Harvest h${d.harvest.seq}: please group the ${d.promotions.length} promotion${d.promotions.length === 1 ? "" : "s"} on best into changesets (one PR each) with study_propose_harvest.`;
-  const lines = [
-    `Harvest h${d.harvest.seq} · study \`${d.study.slug}\` · group the promotions into changesets`,
-    "",
-    `Best is final for this harvest: ${d.promotions.length} promotion(s) on \`studies/${d.study.slug}/best\`, oldest first. Each changeset becomes one PR; the plugin then measures each one's contribution by reverting it from best (ablation), checks it alone on the base, and drafts the PRs. You don't run anything.`,
-    "",
-    ...(d.code ? codeLines(d.code) : []),
-    "## Promotions",
-  ];
-  for (const p of d.promotions) {
-    const c = p.n !== null ? d.candidates.get(p.n) : undefined;
-    lines.push(`- ${p.n !== null ? `c/${p.n}` : p.sha.slice(0, 10)} ${quoted(p.title, 120)}${c ? ` · ${ciText(c)}` : ""} · files: ${p.paths.slice(0, 8).join(", ")}${p.paths.length > 8 ? `, … ${p.paths.length - 8} more` : ""}`);
-  }
-  if (d.dossier) lines.push("", `## Dossier (v${d.dossier.version})`, clip(d.dossier.text, 1500));
-  lines.push(
-    "",
-    "## This round",
-    "- Call `study_propose_harvest` once with `groups`: each group has a title (the PR title), the candidate numbers it contains, and a rationale (the PR's why).",
-    "- Group by theme: promotions that are one idea refined twice, or that only make sense together, belong in one changeset. Unrelated wins stay separate so each PR can be reviewed and reverted alone.",
-    "- Every promotion must be in exactly one group. The tool rejects unknown or duplicated candidates; fix and call it again.",
-    "- If you don't answer, the plugin uses one changeset per promotion.",
-    "- Keep your reply short, then end your turn.",
-  );
-  return { summary, detail: clip(lines.join("\n"), 12_000) };
 }

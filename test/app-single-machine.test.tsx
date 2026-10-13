@@ -63,7 +63,7 @@ describe("frontend: single-machine mode", () => {
     host.refs.set("main", host.commit("T0", null));
     host.metric.set("T0", 1000);
     port.addThread("thr_study");
-    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch"] });
+    const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     await harness.behavior.callAgentTool("study_propose", { spec_toml: SPEC }, { threadId: "thr_study", projectId: "proj_1" });
@@ -111,7 +111,7 @@ describe("frontend: single-machine mode", () => {
     host.delays = { gate: 1500, measure: 1 };
     host.nextSnapshot = { tree: "T1" };
     host.metric.set("T1", 1100);
-    await harness.behavior.callAgentTool("study_submit_candidate", { summary: "unroll the loop" }, { threadId: "thr_w1" });
+    await harness.behavior.callAgentTool("study_submit_candidate", { title: "unroll the loop" }, { threadId: "thr_w1" });
     await waitUntil(() => host.active.gate > 0);
     const shown = await harness.behavior.runCli(["show", "toy-sm"]);
     expect(shown.stdout).toMatch(/testing c\/1 \(gates hold the bench\)/u);

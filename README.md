@@ -80,14 +80,17 @@ candidate stays under `refs/studies/<slug>/c/<n>`.
 | `bb study workers <slug>` | Worker threads |
 | `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration), health checks, bundle transfers, drift checks, segments, seeds and base bundles on disk |
 | `bb study drift <slug>` | Request an A/A drift check on every bench host |
-| `bb study harvest <slug> [--wait] [--restart] [--one-per-promotion] [--no-measure-standalone]` | Start or show a dry-run harvest |
-| `bb study harvest <slug> --publish` | Publish the ready harvest as DRAFT PRs on GitHub |
+| `bb study harvest <slug> [--wait] [--harvest N]` | Freeze best for harvest, or show the current (or an older) harvest |
+| `bb study evidence <slug> [--samples] [--candidates 3,7]` | Everything an agent needs to harvest, as stable JSON with `--json` (`bb-autoresearch/evidence` v1) |
+| `bb study measure <slug> <A> <B> [--pairs N] [--host H] [--detach]` | Measure B against A (any two commits) with the study's protocol and guardrails on its bench host; counts as bench time |
+| `bb study gate <slug> <ref> [--detach]` | The study's gates on any commit |
+| `bb study results <slug> [r<N>] [--wait]` | Measurements and gates asked for |
 | `bb study report <slug>` | The study report (Markdown) |
-| `bb study archive <slug> [--archive-thread]` | Stop for good: workers, bench checkouts and clones, a running harvest; `--archive-thread` also archives the study thread (the app's archive dialog does by default) |
+| `bb study archive <slug> [--archive-thread]` | Stop for good: workers, bench checkouts and clones, measurements still running; `--archive-thread` also archives the study thread (the app's archive dialog does by default) |
 
 Every command takes `--json` (one JSON document from the same view models as
-the page; errors carry a hint with the next command). Approval and publishing
-work in the app or the CLI; both are deliberate, audited the same way, and the
+the page; errors carry a hint with the next command). Approval, harvest and
+archiving work in the app or the CLI; both are deliberate, audited the same way, and the
 CLI refuses human controls from a study's own worker and study threads (see
 the [threat model](docs/design.md#threat-model)).
 
@@ -99,7 +102,7 @@ the [threat model](docs/design.md#threat-model)).
 - **Budgets.** Max workers, candidates, bench hours, deadline, and tokens (per-thread usage as BB reports it) are enforced. Dollar cost isn't available to plugins.
 - **Provider limits.** Rate-limited turns are retried at the window reset, and spawns hold until then. A tight usage window halves W. Neither path has been seen live yet.
 - **Snapshots.** Workers' worktrees are committed with `git add -A`: give the repo a `.gitignore` for build outputs.
-- **Harvest.** Dependencies are detected only through revert conflicts, gate failures and changed files. Stacks are ordered by dependency; a layer that doesn't apply or pass its gates on its PR base is folded into the layer it needs, so a stack can have fewer PRs than changesets. Contributions are measured relative to best and shown as shares of the gain.
+- **Harvest.** The plugin freezes best and measures and gates what an agent asks; grouping, PR descriptions and publishing are the agent's, with the repository's own tools. `measure` and `gate` are refused while the study runs workers and its bench is busy.
 
 ## Layout
 
@@ -113,10 +116,11 @@ the [threat model](docs/design.md#threat-model)).
 | `src/present.ts` | The improvement convention (better is positive), shared by the page, CLI, report and agent messages |
 | `host.ts`, `src/host/` | `bb.host` entry and ops: git (snapshot, prepare, compose/revert, logs), background jobs, bundles, bench clones, health, exports, seeds and base bundles (and their cleanup) |
 | `src/engine.ts` | Lifecycle, control loop, worker/strategist tools, budgets, rate limits, notices, harvest control, reconciliation |
+| `src/commit.ts` | Worker commit messages: checks, trailers, mapping commits back to candidates |
+| `src/primitives.ts`, `src/evidence.ts` | `bb study measure` / `gate` (requested measurements and gates on the study's bench) and the `bb study evidence` document |
 | `src/pipeline.ts` | Candidate pipeline and job launcher (parallel gates, one measurement per bench lock) |
-| `src/harvest.ts`, `src/harvest-math.ts` | Harvest phases (grouping, ablation, dependencies, stacks, standalone, drafting) and their pure math |
-| `src/publisher.ts` | `PrPublisher`: dry-run (local branches + files) and GitHub (draft PRs via `gh`) |
-| `src/report.ts` | PR bodies and the Markdown study report |
+| `src/harvest.ts`, `src/harvest-legacy.ts` | Harvest as a freeze (wait for the bench, pin best), and the display helpers for harvests the plugin ran before 1.0 |
+| `src/report.ts` | The Markdown study report |
 | `src/bench.ts`, `src/transfer.ts`, `src/health.ts`, `src/drift.ts`, `src/holdout.ts` | Bench sites, git bundle relay, health checks, drift checks, the private holdout |
 | `src/bench-provider/`, `src/remote/` | The bench provider contract (zod schemas), its client and the remote bench runner; the fleet that joins, calibrates, rotates, re-adopts after a reload and cleans up remote machines, and its view |
 | `examples/bench-provider-local/` | An example bench provider plugin (local temp directories and child processes) |
@@ -124,7 +128,7 @@ the [threat model](docs/design.md#threat-model)).
 | `src/scheduler.ts` | Pure policy: adaptive W, backpressure, provider-limit W, idea choice, budgets, strategist triggers, idle handling |
 | `src/views.ts`, `src/rpc.ts`, `src/cli.ts`, `src/tools.ts`, `src/prompts.ts` | View models, RPC, `bb study`, role-gated agent tools, agent-facing text |
 | `src/db/` | SQLite schema (append-only migrations) and typed store |
-| `skills/` | `study-create` and `autoresearch` (usage, strategist, harvest) |
+| `skills/` | `study-create`, `autoresearch` (usage, strategist) and `study-harvest` (an agent's harvest into PRs, one study or several) |
 
 ## Develop
 

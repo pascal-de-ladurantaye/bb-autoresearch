@@ -342,14 +342,18 @@ export const specSchema = z
       })
       .strict()
       .prefault({}),
-    /** Harvest: grouping, ablation and PR drafting (not part of the oracle hash). */
+    /**
+     * Harvest settings of the plugin-run harvest before v1. Since v1 an agent
+     * harvests (skills/study-harvest), so these keys are still accepted (stored
+     * specs keep parsing) but have no effect. Not part of the oracle hash.
+     */
     harvest: z
       .object({
-        /** Measure each changeset applied alone on its PR base (costs bench time); gates always run. */
+        /** No effect since v1. */
         measure_standalone: z.boolean().default(true),
-        /** How long to wait for the strategist's study_propose_harvest before grouping one changeset per promotion. */
+        /** No effect since v1. */
         group_timeout_minutes: z.number().min(0.1).max(24 * 60).default(10),
-        /** Remote the github publisher pushes to. */
+        /** No effect since v1. */
         remote: z.string().min(1).max(100).default("origin"),
       })
       .strict()

@@ -130,7 +130,7 @@ describe("end to end with real git (LocalHostRunner)", () => {
 
     const wt = join(root, "thr_w1");
     writeFileSync(join(wt, "src/data.txt"), "hello world padding\n");
-    const ticket = await engine.submit("thr_w1", "Collapse runs of spaces");
+    const ticket = await engine.submit("thr_w1", { title: "Collapse runs of spaces" });
     expect(ticket).toContain("Submitted as c/1");
     await engine.settle();
     const c = store.candidateByN(study.id, 1)!;
@@ -144,7 +144,7 @@ describe("end to end with real git (LocalHostRunner)", () => {
 
     // Second submission from the same worktree after its own promotion.
     writeFileSync(join(wt, "bench/measure.sh"), "echo METRIC size=1\n");
-    const rejected = await engine.submit("thr_w1", "Edit the benchmark (should be rejected)");
+    const rejected = await engine.submit("thr_w1", { title: "Edit the benchmark (should be rejected)" });
     expect(rejected).toContain("REJECTED (scope)");
     // Hermetic: every health check used the injected readings, never the machine's load.
     expect(runner.probes).toBeGreaterThan(0);

@@ -149,7 +149,7 @@ describe("[git] identity: the engine", () => {
     await engine.start("toy-size", "human");
     await engine.settle();
     writeFileSync(join(root, "thr_w1", "src/data.txt"), "hello world padding\n");
-    expect(await engine.submit("thr_w1", "Collapse runs of spaces")).toContain("Submitted as c/1");
+    expect(await engine.submit("thr_w1", { title: "Collapse runs of spaces" })).toContain("Submitted as c/1");
     await engine.settle();
     const c = store.candidateByN(study.id, 1)!;
     expect(c.verdict).toBe("win");
@@ -182,7 +182,7 @@ describe("[git] identity: the engine", () => {
       await engine.settle();
       host.nextSnapshot = { tree: "T1" };
       host.metric.set("T1", 800);
-      await engine.submit("thr_w1", "shrink");
+      await engine.submit("thr_w1", { title: "shrink" });
       await engine.settle();
       expect(store.candidateByN(id, 1)!.verdict).toBe("win");
       const expected = mode === "repo" ? "Repo Owner <owner@example.com>" : "autoresearch <autoresearch@bb.local>";
