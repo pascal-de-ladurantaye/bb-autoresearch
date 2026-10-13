@@ -29,11 +29,13 @@ A few rules make an oracle trustworthy:
 
 ## 2. Calibrate and start
 
-1. **Approve and calibrate.** The study page's *Needs you* offers *Approve spec v1 and calibrate* (review the spec on the Oracle tab first), or run `bb study calibrate <slug>`. Calibration runs the gates on the base commit and A/A measurements (base against itself) on every bench host. The report gives the noise floor, the smallest win the study can detect (the win threshold, or MDE), each guardrail's noise, and the bench time per candidate.
-2. **Read the report.** A threshold larger than any plausible win means the benchmark is too noisy for this study: make runs longer or quieter, add pairs, or move the bench to a quieter machine, then calibrate again. A failed calibration says why; ask the study thread for a revised spec.
+1. **Approve and calibrate.** The study page's *Needs you* offers *Approve spec v1 and calibrate* (review the spec on the Oracle tab first), or run `bb study calibrate <slug>`. Calibration runs the gates on the base commit and A/A measurements (base against itself) on every bench host. The report gives each host's noise floor and the smallest win it can detect (its win threshold, or MDE, never below `min_effect`), each guardrail's noise, and the bench time per candidate.
+2. **Read the report.** A threshold larger than any plausible win means the benchmark is too noisy for this study: make runs longer or quieter, add pairs, or move the bench to a quieter machine, then calibrate again. A guardrail whose noise is too wide for its limit fails calibration, with the two fixes (loosen the limit, or raise `n_max`): otherwise every win would be flagged inconclusive on it. A failed calibration says why; ask the study thread for a revised spec.
 3. **Seed ideas and start.** Add ideas on the Ideas tab (or `bb study ideas add`), then *Approve and start* (`bb study start <slug>`). Workers spawn in their own worktrees from `studies/<slug>/best`; the strategist in the study thread keeps the idea queue full.
 
 Where it measures: `bench_hosts = ["local"]` (the default) is this machine, where single-machine mode keeps gates from overlapping timing runs. Another BB machine keeps its own clone. Remote machines from a bench provider plugin (`[[oracle.remote_bench]]`, see [bench-providers.md](bench-providers.md)) each calibrate on arrival and are replaced before their lifetime ends; a plugin reload keeps them.
+
+With several bench hosts, each one decides with its own win threshold, and a candidate goes to the quietest free host first, so a quiet machine detects smaller wins than a noisy one. A host much noisier than the others (`[oracle] max_host_noise_ratio`, 2× the median of the others' noise floor by default, and beyond what chance gives equal hosts) is left out: a remote machine is replaced, a local or BB host measures nothing until the next calibration. The report and the Bench tab say which and why.
 
 ## 3. Read verdicts
 
@@ -52,9 +54,11 @@ Steer from the Ideas tab (add, pin, reorder, veto) and the Overview (pause, resu
 
 ## 4. Harvest with your agent
 
-When the study has done its work, freeze it: *Start harvest* on the Overview, or `bb study harvest <slug>`. Best stops moving and no more candidates are taken.
+When the study has done its work, freeze it: *Freeze best for harvest…* on the Harvest tab or the Overview (Needs you offers it when the budget runs out), or `bb study harvest <slug>`. Best stops moving, no more candidates are taken, in-flight ones finish, and best is pinned as `refs/studies/<slug>/harvest/h<N>`.
 
-Turning best into pull requests is an agent's job, not the plugin's: ask your agent (the study thread, or any thread in the project) to harvest the study. The `study-harvest` skill guides it. It reads the study's evidence (`bb study evidence <slug> --json`), groups and splits the changes into reviewable PRs or stacks, and checks each one with the plugin: `bb study measure` for an A/B on the study's bench hosts, `bb study gate` for the study's gates on any commit. The numbers in the PR descriptions are the plugin's measurements, not the agent's. It writes descriptions in your repository's conventions and publishes only when you ask, with your repository's own tools.
+Turning best into pull requests is an agent's job, not the plugin's: ask your agent (the study thread, or any thread in the project) to harvest the study. The `study-harvest` skill guides it. It reads the study's evidence (`bb study evidence <slug> --json`), groups and splits the changes into reviewable PRs or stacks, and checks each one with the plugin: `bb study measure` for an A/B on the study's bench hosts, `bb study gate` for the study's gates on any commit. The numbers in the PR descriptions are the plugin's measurements, not the agent's. It writes descriptions in your repository's conventions and publishes only when you ask, with your repository's own tools. The plugin never pushes.
+
+A requested measurement runs like a candidate's: on the quietest free bench host, judged with that host's own win threshold and guardrail noise, under its bench lock, and its time counts toward the bench budget. A study whose bench is remote only has no machines while paused (pausing destroys them); freezing it brings them up again, and a measurement asked before they are ready waits for them. `measure` and `gate` are refused while the study runs workers and its bench is busy: freeze it first. Every request and result is in `bb study results <slug>` and on the Harvest tab.
 
 Then resume the study to keep exploring (`bb study resume <slug>`), or archive it (`bb study archive <slug>`): workers stop, bench checkouts and remote machines go, and every candidate ref and the best branch stay.
 
@@ -83,7 +87,16 @@ Part of the oracle hash (changing one recalibrates), except where noted.
 | `confirm`, `skip_confirm_factor` | `true`, 3 | Wins are re-measured with fresh pairs, unless the CI's lower bound is at least 3× the win threshold (the verdict says it skipped). `0` always confirms. |
 | `side_runs`, `min_side_seconds` | `"auto"`, 5 | Runs of `measure` per side of a pair, keeping each metric's best value. `"auto"` picks the count at calibration so a side lasts at least 5 s. |
 
-`[oracle.drift] recalibrate_below = 0.6` (not hashed): when best's runs take less than 60% of their calibrated time (code that got several times faster is noisier relative to itself), the plugin recalibrates on best at the next free bench slot, in a new segment with the same oracle, instead of letting a drift check pause the study. Noise that grows at the same run time still pauses it, and nothing more is measured on that machine until you resume. Best vs base compounds every segment ("81.8% lower time (5.5×) across 3 segments · this segment 3.62 → 2.04 s"). Simulated error rates and bench savings are in the [v0.2.4 release notes](release-notes.md#v024).
+`[oracle.drift] recalibrate_below = 0.6` (not hashed): when best's runs take less than 60% of their calibrated time (code that got several times faster is noisier relative to itself), the plugin recalibrates on best at the next free bench slot, in a new segment with the same oracle, instead of letting a drift check pause the study. Noise that grows at the same run time still pauses it, and nothing more is measured on that machine until you resume. An automatic recalibration that finds a bench host unhealthy waits `[oracle.health] retry_seconds` and tries again, up to `recalibration_retries` (30) times, before it pauses the study. Best vs base compounds every segment ("81.8% lower time (5.5×) across 3 segments · this segment 3.62 → 2.04 s"). Simulated error rates and bench savings are in the [v0.2.4 release notes](release-notes.md#v024).
+
+### Several bench hosts (`[oracle]`)
+
+`bench_hosts` is part of the oracle hash (changing it recalibrates); `max_host_noise_ratio` isn't.
+
+| Key | Default | What it does |
+|---|---|---|
+| `bench_hosts` | `["local"]` | Where candidates are measured: `"local"` (this machine), or BB machine names or ids. Each host is calibrated on its own and decides with its own win threshold; a candidate goes to the quietest free one. |
+| `max_host_noise_ratio` | `2` | A host whose noise floor is more than this times the median of the other hosts' (and beyond what chance gives equal hosts with the calibration's pairs) is left out until the next calibration; a remote machine is replaced (after two replacements in a row, an entry keeps its machines). `0` turns it off. |
 
 ### Remote bench hosts (`[[oracle.remote_bench]]`)
 
@@ -113,7 +126,7 @@ gates = true                        # run the gates there too
 | `env` | `{}` | Environment for every command on the machines. |
 | `gates` | `false` | Run the gates on these machines (under their bench lock), so single-machine mode no longer serializes them with measurements here. |
 
-The seed is scanned for credentials (token and key patterns; files such as gem, bundler and npm credentials, `.netrc`, SSH keys, cloud CLI configs, `.env`) before any upload, and refused when anything matches outside `seed_allow`: no machine is created, and a notice lists what matched (paths and rules, never the values). Machines are destroyed when the study pauses (once idle) or is archived; a plugin reload keeps calibrated machines and re-adopts them. Seeds and base bundles no study uses are deleted from the edit host at load and on archive; `bb study bench` shows their size.
+The seed is scanned for credentials (token and key patterns; files such as gem, bundler and npm credentials, `.netrc`, SSH keys, cloud CLI configs, `.env`) before any upload, and refused when anything matches outside `seed_allow`: no machine is created, and a notice lists what matched (paths and rules, never the values). Machines are destroyed when the study pauses (once idle) or is archived, and come back when it resumes or is frozen for harvest; a plugin reload keeps calibrated machines and re-adopts them. Seeds and base bundles no study uses are deleted from the edit host at load and on archive; `bb study bench` shows their size.
 
 ### Commit identity (`[git] identity`)
 

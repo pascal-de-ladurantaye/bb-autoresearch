@@ -2,8 +2,11 @@
 
 A BB plugin for long-running, measured code-optimization studies. Short-lived
 agent workers propose changes in parallel; the plugin owns the loop, the
-measurements, and every keep or discard decision. A study optimizes the
-benchmark you give it: only changes that beat its noise are kept.
+measurements, and every keep or discard decision. When a study is done, an
+agent turns its wins into PRs (the `study-harvest` skill), and every number it
+puts in them comes from the plugin. A study optimizes the benchmark you give
+it: only changes that beat its noise are kept, and whether that benchmark
+represents production is yours to judge.
 
 ![The Live tab mid-study: one lane per worker, candidate cards moving from tests to the bench and Promoted, and the measurement's confidence interval narrowing pair by pair against the win threshold](docs/screenshots/live.jpg)
 
@@ -48,21 +51,25 @@ has a `bb study` command. Each page leads with what needs you.
    commit and the benchmark against itself to find its noise and the smallest
    win it can detect.
 3. **Start.** Seed ideas and start. Hidden workers each take one idea in their
-   own worktree and submit a candidate; the plugin tests it, measures it against
-   best, and keeps it only when its confidence interval clears the threshold.
+   own worktree and submit a candidate with their own commit message; the
+   plugin tests it, measures it against best on the quietest free bench host,
+   and keeps it only when its confidence interval clears that host's threshold.
 4. **Watch and steer.** The Live tab shows workers, candidates and each
    measurement's CI band narrowing to its verdict; any study can be replayed.
    Steer from the Ideas tab and the Overview.
-5. **Harvest.** Freeze the study and ask your agent to turn best into
-   reviewable PRs, checking each one with the plugin's measurements.
+5. **Harvest.** Freeze best and ask your agent to turn it into reviewable PRs.
+   It reads `bb study evidence`, groups and splits the changes, and has the
+   plugin measure and gate every PR (`bb study measure`, `bb study gate`).
 
 The [guide](docs/guide.md) walks through each step. Measurements can run on
 this machine (single-machine mode keeps tests out of the way of timing runs),
 on another BB machine, or on short-lived remote machines lent by a
 [bench provider](docs/bench-providers.md) plugin;
 [`examples/bench-provider-local/`](examples/bench-provider-local/) is one for
-local temp directories. Nothing is pushed unless you publish, and every
-candidate stays under `refs/studies/<slug>/c/<n>`.
+local temp directories. Each bench host decides with its own win threshold,
+and one much noisier than the others is left out. The plugin never pushes:
+your agent publishes when you ask. Every candidate stays under
+`refs/studies/<slug>/c/<n>`.
 
 ## CLI
 
@@ -82,27 +89,29 @@ candidate stays under `refs/studies/<slug>/c/<n>`.
 | `bb study drift <slug>` | Request an A/A drift check on every bench host |
 | `bb study harvest <slug> [--wait] [--harvest N]` | Freeze best for harvest, or show the current (or an older) harvest |
 | `bb study evidence <slug> [--samples] [--candidates 3,7]` | Everything an agent needs to harvest, as stable JSON with `--json` (`bb-autoresearch/evidence` v1) |
-| `bb study measure <slug> <A> <B> [--pairs N] [--host H] [--detach]` | Measure B against A (any two commits) with the study's protocol and guardrails on its bench host; counts as bench time |
-| `bb study gate <slug> <ref> [--detach]` | The study's gates on any commit |
+| `bb study measure <slug> <A> <B> [--pairs N] [--host H] [--detach] [--timeout D]` | Measure B against A (any two commits) with the study's protocol and guardrails, on the quietest free bench host with that host's own win threshold (waiting for remote machines a frozen study brings up); counts as bench time |
+| `bb study gate <slug> <ref> [--detach] [--timeout D]` | The study's gates on any commit (edit host) |
 | `bb study results <slug> [r<N>] [--wait]` | Measurements and gates asked for |
 | `bb study report <slug>` | The study report (Markdown) |
 | `bb study archive <slug> [--archive-thread]` | Stop for good: workers, bench checkouts and clones, measurements still running; `--archive-thread` also archives the study thread (the app's archive dialog does by default) |
 
 Every command takes `--json` (one JSON document from the same view models as
-the page; errors carry a hint with the next command). Approval, harvest and
+the page; errors carry a hint with the next command; the shapes 1.x keeps are
+in [stability.md](docs/stability.md)). Approval, freezing for harvest and
 archiving work in the app or the CLI; both are deliberate, audited the same way, and the
 CLI refuses human controls from a study's own worker and study threads (see
 the [threat model](docs/design.md#threat-model)).
 
 ## Limits
 
-- **The benchmark.** A study optimizes the benchmark it is given. Whether that benchmark represents production is yours to judge; the plugin doesn't second-guess it.
+- **The benchmark.** A study optimizes the benchmark it is given. Whether that benchmark represents production (workload, inputs, hardware) is yours to judge; the plugin doesn't second-guess it, and the holdout only helps if you configure one.
 - **Trust.** Oracle commands run with full trust on edit and bench hosts, and agents with shell access can reach the plugin's RPC and CLI (see the [threat model](docs/design.md#threat-model)). Run studies whose results matter with the bench, and the holdout, on a machine the workers can't reach.
 - **Edit host.** The edit host is the BB server's own machine. Remote edit hosts aren't built.
 - **Budgets.** Max workers, candidates, bench hours, deadline, and tokens (per-thread usage as BB reports it) are enforced. Dollar cost isn't available to plugins.
 - **Provider limits.** Rate-limited turns are retried at the window reset, and spawns hold until then. A tight usage window halves W. Neither path has been seen live yet.
 - **Snapshots.** Workers' worktrees are committed with `git add -A`: give the repo a `.gitignore` for build outputs.
-- **Harvest.** The plugin freezes best and measures and gates what an agent asks; grouping, PR descriptions and publishing are the agent's, with the repository's own tools. `measure` and `gate` are refused while the study runs workers and its bench is busy.
+- **Harvest.** The plugin freezes best and measures and gates what an agent asks; grouping, splitting, PR descriptions and publishing are the agent's, with the repository's own tools. `measure` and `gate` are refused while the study runs workers and its bench is busy, and on a paused study whose bench is remote only (pausing destroys the machines; freezing brings them back). Harvests the plugin ran before 1.0 are readable, not resumable.
+- **Bench hosts.** Each host is compared with its peers only at calibration: one that becomes noisy mid-segment pauses the study for drift rather than leaving the dispatch set.
 
 ## Layout
 

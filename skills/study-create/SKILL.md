@@ -12,6 +12,7 @@ You turn the user's goal into a study spec (TOML) that the autoresearch plugin c
 Ask only what you cannot find in the code:
 
 - **Objective and metric.** What number should move, which direction is better, and its unit. One primary metric; others become guardrails.
+- **The benchmark is theirs.** Say it plainly: the study optimizes exactly the benchmark it is given. Whether that benchmark represents the production workload, inputs and hardware is the human's responsibility; the plugin doesn't judge it. Help them pick a representative one, and offer the optional holdout (below), but don't add caveats or warnings to the spec.
 - **Guardrails.** Secondary metrics that must not regress, each with two limits: how much worse one change may make it than the current best (`max_regression`, e.g. memory ≤ 5% worse), and how much worse it may get in total over the whole study, against the segment base (`max_total_regression`, default the same as `max_regression`; e.g. 10%). Without a total limit, many small regressions can each pass and add up.
 - **Scope.** Which directories workers may edit. Everything else, and especially the benchmark harness and tests, is protected.
 - **Budget.** How many candidates and bench hours; a deadline if any.

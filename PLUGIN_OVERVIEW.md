@@ -1,12 +1,12 @@
 ## What you get
 
 - **Studies.** A study optimizes one number: test runtime, render time, request latency, bundle size, instruction counts. Describe the goal in a thread; the `study-create` skill reads the code and drafts the spec: the metric, the benchmark command, the tests that must keep passing, the files agents may edit, and optional guardrail metrics.
-- **An orchestrated loop.** Short-lived worker agents each take one idea, edit in their own git worktree and submit a candidate. A strategist agent in the study thread keeps the idea queue full and keeps a map of what has been learned. The plugin schedules everything; there is no prompt telling an agent to never stop.
+- **An orchestrated loop.** Short-lived worker agents each take one idea, edit in their own git worktree and submit a candidate with their own commit message. A strategist agent in the study thread keeps the idea queue full and keeps a map of what has been learned. The plugin schedules everything; there is no prompt telling an agent to never stop.
 - **Verdicts the plugin decides.** Agents never run the benchmark or choose what to keep. The plugin runs the tests, measures one candidate at a time per bench machine with paired, interleaved runs, and keeps a change only when its confidence interval clears the smallest effect calibration says it can detect. Wins are confirmed with fresh runs before they land.
 - **Guardrails.** Secondary metrics have a per-change limit and a limit against the starting point, both judged on a confidence interval, so small regressions can't pile up.
-- **Bench machines.** Measure on this machine (tests take turns with timing runs), on another BB machine, or on short-lived remote machines lent by a bench provider plugin, each calibrated on its own. Remote machines survive a plugin update.
+- **Bench machines.** Measure on this machine (tests take turns with timing runs), on another BB machine, or on short-lived remote machines lent by a bench provider plugin. Each machine is calibrated and judged with its own threshold, candidates go to the quietest one, and a much noisier one is left out. Remote machines survive a plugin update.
 - **Live view and replay.** Watch workers, candidates and each measurement's confidence band narrowing pair by pair, beside the study thread if you like. Any study can be replayed from its recorded events.
-- **Harvest with your agent.** Freeze the study and ask your agent to turn the result into reviewable PRs. It checks every claim with the plugin's own measurements and gates, and publishes only when you ask.
+- **Harvest with your agent.** Freeze the study and ask your agent to turn the result into reviewable PRs with the `study-harvest` skill. It groups and splits the changes and writes descriptions in your repository's style; every number comes from the plugin (`bb study evidence`, `measure`, `gate`), and it publishes with your own tools only when you ask.
 
 ## How it works
 

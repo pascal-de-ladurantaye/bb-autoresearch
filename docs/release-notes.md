@@ -4,7 +4,7 @@ How each version was built: what it added, the decisions taken on the way, every
 
 | Version | What it added |
 |---|---|
-| [1.0](#10-unreleased) | Unreleased. Remote machines survive a plugin reload; unused seeds and base bundles are deleted; CI on every pull request; these docs split into design, guide and release notes. |
+| [1.0](#10-unreleased) | Unreleased. The plugin owns every measurement and verdict; agents own commit messages and harvest. Each bench host decides with its own win threshold, candidates go to the quietest host, and a much noisier host is left out; a guardrail that can't be judged fails calibration. Workers write their commit messages; harvest freezes best, and an agent turns it into PRs with `bb study evidence`, `measure` and `gate`. Remote machines survive a plugin reload; unused seeds and base bundles are deleted; CI on every pull request; docs split into design, guide and release notes, with a stability policy. |
 | [v0.3.1](#v031-large-uploads-in-parts) | Large uploads to remote machines travel in 32 MiB parts (BB's 75-second RPC limit). |
 | [v0.3.0](#v030-remote-bench-hosts) | Remote bench hosts lent by bench provider plugins: short-lived machines that can't be BB machines, driven by the server over a small RPC contract, each calibrated on arrival and rotated before its lifetime ends. |
 | [v0.2.4](#v024) | Fixes from a 5.6-hour blind study on a large repository: bench time spent on candidates that could no longer win, on clear losses and on confirming big wins; drift pauses that were really shorter runs; measurements and promotions after a drift pause; harvest stacks whose layers didn't apply. And the UI issues found while capturing the store screenshots. |
@@ -16,9 +16,520 @@ How each version was built: what it added, the decisions taken on the way, every
 
 ## 1.0 (unreleased)
 
-<!-- The measurement and agent-harvest notes of 1.0 (docs/notes/v1-*.md) are folded in here when the release is assembled. -->
+1.0 draws one line through the plugin. The plugin owns the **trust boundary**: every measurement and gate, verdicts and promotion to best, budgets, the bench machines (calibration, locks, remote hosts) and the evidence record; an agent asking "is X better than Y?" always gets the plugin's answer. **Agents** own judgment and prose: commit messages, and harvest (grouping, splitting, stacking, PR descriptions, publishing) with the repository's own tools. **The user owns the benchmark**: a study optimizes the benchmark it is given, and whether that benchmark represents production is the user's call; the plugin adds no consensus modes or platform warnings, and the holdout stays optional. Same platform pins (BB 0.45.x, SDK 0.6.14).
 
-### Remote machines across a plugin reload
+Upgrading from v0.3: running studies keep their segments and oracle hashes (the new spec keys are not hashed); a study calibrated before 1.0 uses per-host thresholds from its next measurement; a harvest the plugin was still running stops where it was and becomes frozen (read only, an agent takes over); candidates in flight keep their old commit messages.
+
+### Measurement quality
+
+#### Why
+
+A study on two cloud machines: one host had a noise floor of 5.44% per pair (win threshold 3.33%), the other 2.42% (threshold 1.42%). The segment took the worst host, so every candidate had to clear 3.33% wherever it was measured, and several real gains of 3-6% ended inconclusive on the quiet host. A guardrail with 2.9% noise and a 1% limit could never be judged: calibration only warned, so every win carried an inconclusive flag on it. An automatic recalibration that failed its health check paused the study for hours.
+
+#### 1. Per-host win thresholds
+
+- **Before.** `measurementMde` returned `max(segment MDE, host MDE)`. The segment MDE was the largest of all hosts, so in practice every host used the noisiest host's threshold.
+- **After.** Each host decides with its own calibrated MDE (the segment's for a host without a calibration), never below `min_effect`: `max(min_effect, host.mde ?? segment.mde)`. Remote machines that calibrate on arrival use their own threshold too. Before, they used the larger of their own and the segment's.
+- **Why it's safe.** Each host's threshold is calibrated so that the false-win rate on that host is the nominal rate (the simulation below shows it). Candidates are assigned to hosts by availability, not by outcome, so per-host thresholds add no selection bias. The confirmation runs on the same host.
+- **Guardrail noise per host.** The expensive and deterministic classes judge guardrails with calibrated noise. That noise is now the measuring host's own (`hostGuardrailCalibration`: the segment's per-host record, or a remote machine's arrival calibration, else the segment's worst).
+- **Segment columns (decision).** `segments.mde` and `noise_floor` still hold the noisiest measuring host's numbers, so older readers (the CLI segment table, events) keep working. Everything a person reads shows the per-host thresholds instead:
+  - the calibration report's headline ("2 bench hosts, each deciding with its own win threshold: 1.42% on b, 3.33% on a (noise floor per pair: …); a candidate goes to the quietest free host. b: Detects changes …");
+  - the Overview's threshold line;
+  - the Oracle tab (sentence, host table, segments table);
+  - the bench host list and `bb study bench` / `show` ("win threshold 1.42%, noise 2.42%");
+  - the CLI's MDE row ("… (each host decides with its own)");
+  - the report's segment lines;
+  - the worker brief ("A win must clear the win threshold of the bench host that measures it …");
+  - the noise sentence ("1.23% to 3.62% per pair, depending on the bench host").
+- **Running studies.** A study calibrated before 1.0 already has per-host MDEs in `bench_hosts.mde`, so it uses per-host thresholds from its next measurement on. Nothing has to be recalibrated.
+
+#### 2. The quietest free host first
+
+- **Before.** A queued candidate went to the first free host in spec order. Remote machines come after local hosts, so with one candidate at a time the local host took everything.
+- **After.** `Pipeline.dispatchHosts` orders hosts by effective win threshold, then noise floor, then spec order (hosts without a calibration go last). Measurements, drift checks, `study_request_profile` and requested measurements (`bb study measure`) use this order. Gates keep theirs.
+
+#### 3. Hosts much noisier than their peers
+
+- **Rule.** A host whose calibrated noise floor is more than `[oracle] max_host_noise_ratio` (default 2, `0` off) times the median of the *other* hosts' noise floors is not used. Comparing with the others' median (not a median that includes the host) makes the rule work with two hosts: the peer is the other host, and the quietest host always stays. The deterministic class is exempt.
+- **Chance guard (decision).** A noise floor estimated from 12 A/A pairs (the default `calibration_pairs`) is itself noisy. Two hosts with the same true noise differ by more than 2× about 8% of the time, so with two hosts one of them would be dropped about 17% of the time. A host is therefore taken out only when its ratio is also beyond what chance gives equal hosts about 1% of the time, `chanceRatio`:
+  - the rule is exp(2.326 · √2 · se), where se is the standard error of log σ̂;
+  - noisy class: se = 1.3/√n for the robust SD of n pairs (the MAD's asymptotic 1.17/√n is optimistic at a dozen pairs);
+  - expensive class: se = 1.3/√(2(n − 1)) for the sample SD of n runs.
+
+  The effective limit is max(`max_host_noise_ratio`, `chanceRatio`):
+
+  | Pairs | Ratio needed | Equal hosts falsely flagged (simulated) |
+  |---|---|---|
+  | 12 | 3.4× | 0.9% |
+  | 20 | 2.6× | 0.8% |
+  | 40 | 2.0× (the limit binds) | 0.6% |
+
+  A host above the limit but within chance keeps measuring with its own win threshold (item 1), and calibration warns: "a's noise floor … is 2.5× …, above max_host_noise_ratio 2, but with 12 calibration pairs two equal hosts differ that much by chance (it would take more than 3.4×) … More calibration pairs would tell them apart". The real study's 2.25× would get that warning at 12 pairs and be dropped at 40.
+- **What happens to a noisy host.**
+  - **BB machine or edit host.** It leaves the dispatch set (`bench_hosts.excluded_json`: reason, noise, peers' median, segment). It gets no measurements, no drift checks, no profiles and no requested measurements until the next calibration (human or automatic), which measures it again and clears the flag when it is quiet.
+  - **Remote machine, during the study's calibration.** It isn't marked calibrated and leaves when the calibration ends (`markNoisy`, then `endCalibration`). Leaving earlier would start a replacement that joins while the calibration finishes and is then left behind. The slot refills once the study runs, and the replacement calibrates on arrival.
+  - **Remote machine, on arrival.** It is compared with the study's measuring hosts (`noisyOnArrival`). At most `NOISY_REPLACEMENTS` (2) machines of an entry are replaced in a row. The next one is kept, with one notice ("… after 2 replacement(s) in a row that were too: it is kept and measures with its own win threshold; candidates go to quieter hosts first"). From then on the entry's machines are kept as they come (`acceptsNoisy`, also respected by calibrations), so a provider whose machines are all noisier than the edit host doesn't churn. The count is in memory and starts over after a reload.
+  - **Remote machine, in an automatic recalibration.** It leaves at once and is replaced (or kept, as above).
+- **Where it shows.**
+  - The calibration report ("Not used: a (noise floor …)", one warning per host).
+  - The calibration-ready notice (its warnings).
+  - The `segment.recalibrated` notice.
+  - `bench.noisy_host` events and feed lines.
+  - The bench host list ("not used: much noisier than the other hosts", with the reason).
+  - `bb study bench` ("NOT USED until the next calibration (…)").
+  - The Oracle tab's host tables.
+  - A `bench.noisy_host` notice when a remote machine is kept (informational, opens the Bench tab).
+
+#### 4. Guardrails that can't be judged
+
+- **Before.** A guardrail whose CI half-width at a full evaluation was not below its limit gave a calibration *warning*, and every win was flagged inconclusive on it.
+- **After.** Calibration fails (`guardrailProblems`), on the worst measuring host, with the fixes. The noisy class names two: loosen the limit (to the half-width plus a quarter), or raise `n_max` to about n_max · (1.25 · half-width / limit)², the CI narrowing with √n. When that would take more than 1000 pairs, it says `n_max` can't do it. The expensive class names `confirm_runs` and `calibration_runs`; the deterministic class names `tolerance` or `noise = "noisy"`. Example from the live check:
+
+  > guardrail mem can't be judged: its CI half-width at a full evaluation is 2.21% (noise 1.50%), not below its 1.0% limit, so every win would be flagged inconclusive on it. Fix the spec: loosen its max_regression to at least 2.8%, or raise oracle.protocol n_max from 6 to about 46 (the CI narrows with the square root of the pairs; each evaluation then takes longer).
+
+- **Automatic recalibrations** fail the same way, and the study pauses with the message: the spec has to change.
+- **A remote machine** on which a guardrail can't be judged leaves on arrival, like one above `max_mde`.
+
+#### 5. Automatic recalibration and health checks
+
+- **Before.** A host that failed its health check made `runAutoRecalibration` fail, and the study paused ("automatic recalibration failed …") until a human resumed it.
+- **After.** Every host's health is checked first, each under its own bench lock and before any A/A run, so a busy machine costs no A/A on the others. If one fails (or fails between that check and its A/A), nothing changes: the hosts keep their calibration, `recalibrate_due` stays set with `health_retries` and `retry_at`, a `recalibration.deferred` event is recorded, and the next try waits `[oracle.health] retry_seconds`. The pipeline's backoff handles the wait, and `retry_at` survives a reload. Measurements stay on hold meanwhile, as for any due recalibration.
+  - The status line says "recalibrating on best waits for a healthy bench (retry 3 of 30, next in 40 s)".
+  - The usual "unhealthy for N min" notice goes out after `notify_after_minutes`.
+- **Bounded (`[oracle.health] recalibration_retries`, default 30).** After that many retries the study pauses ("… a bench host stayed unhealthy through 30 retries, 60 s apart: … then resume: it recalibrates first"). The recalibration stays due, with a fresh count, so resuming recalibrates before anything is measured.
+
+#### Spec keys
+
+Both are left out of the oracle hash, so existing segments keep their hash (tested). Stored specs are read with the defaults (`normalizeSpec`).
+
+| Key | Default | What it does |
+|---|---|---|
+| `[oracle] max_host_noise_ratio` | `2` | A bench host whose noise floor is more than this times the median of the other hosts' (and beyond chance) is not used; `0` turns it off; otherwise 1-100. |
+| `[oracle.health] recalibration_retries` | `30` | Health-check retries of an automatic recalibration, `retry_seconds` apart, before it pauses the study. |
+
+#### Simulation
+
+`test/v1-sim.test.ts` uses the real study's per-pair noise: 2.42% (quiet host) and 5.44% (noisy host). Each threshold is calibrated from 400 A/A pairs of its host's own noise (min_effect 1%, `n_min` 6, `n_max` 20, confirmation on), giving thresholds of 1.22% and 3.04% (the study had 1.42% and 3.33%). Each cell runs the same noise stream under both rules (common random numbers): v0.3 judges the quiet host's candidates against the segment's threshold (the noisy host's), v1 against its own. The noisy host's threshold is the same under both rules, so its verdicts are identical. 1,000 candidates per cell (`SIM_TRIALS=1000`; the suite runs 150 per cell and asserts the bounds):
+
+| True effect | Quiet host: wins v0.3 → v1 | Quiet host: losses v0.3 → v1 | Quiet host: first-measurement wins v0.3 → v1 | Noisy host: wins | Noisy host: losses | Noisy host: first-measurement wins |
+|---|---|---|---|---|---|---|
+| −2% | 0.0% → 0.0% | 42.5% → 45.9% | 0.0% → 0.0% | 0.0% | 16.8% | 0.0% |
+| 0 | 0.0% → 0.0% | 4.5% → 6.0% | 0.0% → 0.9% | 0.0% | 5.5% | 0.6% |
+| +1% | 0.0% → 1.0% | 0.7% → 0.8% | 0.1% → 7.8% | 0.1% | 2.7% | 1.4% |
+| +2% | 0.0% → 19.4% | 0.0% → 0.1% | 0.8% → 45.4% | 0.4% | 1.1% | 4.6% |
+| +3% | 1.3% → 80.9% | 0.0% → 0.0% | 11.6% → 89.4% | 2.2% | 0.4% | 13.6% |
+| +4.5% | 64.8% → 99.9% | 0.0% → 0.0% | 80.3% → 100.0% | 14.7% | 0.2% | 38.4% |
+| +6% | 99.1% → 100.0% | 0.0% → 0.0% | 99.7% → 100.0% | 52.9% | 0.0% | 73.4% |
+
+- **False wins per host.** 0.0% on both hosts at no true effect and at −2%, under both rules. Before the confirmation, the quiet host's own threshold gives chance wins at 0.9%, about the noisy host's 0.6% under its own. That is the nominal per-host rate the threshold is calibrated for, where v0.3 held the quiet host to 0.0%. The confirmation removes them.
+- **Detection on the quiet host.** A real 3% gain went from 1.3% to 80.9% wins, 4.5% from 64.8% to 99.9%, and 2% from 0% to 19.4%. These are the 3-6% gains the study saw end inconclusive.
+- **False losses** on real gains stay at or below 0.8%. At no true effect, the quiet host's false losses rise from 4.5% to 6.0%, about the noisy host's 5.5%. A lower threshold makes the futility rule stop fewer measurements early, and some of them then end in a loss.
+
+#### Tests
+
+- `test/v1-measurement.test.ts`, pure functions: peers' median, two-host and three-host cases, the chance ratio (including the study's 2.25× at 12 and 40 pairs), dispatch order, threshold wording, and the oracle hash with and without the new keys (also as an older stored spec without them).
+- `test/v1-measurement.test.ts`, fake hosts:
+  - each host's own threshold in the verdict, with the quiet host taking a lone candidate although it is listed second, both hosts measuring at once, and every surface (Overview, Oracle tab, bench hosts, CLI);
+  - a 20× noisier host excluded with the report, warning, notice and event, measuring nothing, then back after the next calibration;
+  - a 2.5× host kept with the chance warning;
+  - `max_host_noise_ratio = 0`;
+  - an automatic recalibration that defers on a failed health check, waits `retry_seconds`, then runs without a pause;
+  - the bound, the pause, and a resume that recalibrates first;
+  - a recalibration that finds one host disturbed and leaves it out of the new segment.
+- `test/remote-fleet.test.ts` (the example provider, real processes): a noisy remote machine is left out at calibration and leaves when it ends; two arrival replacements leave; the third machine is kept with a notice; the entry then keeps its machines, and the quiet edit host takes the candidate.
+- `test/guardrails.test.ts`: an unjudgeable guardrail fails calibration end to end with both fixes; the fixes it names work (the loosened limit is above the half-width, and the half-width at the named `n_max` is below the limit); several hosts name the worst; and each noise class names its own fixes.
+- `test/v1-sim.test.ts`: the simulation above.
+
+#### Live check (BB 0.45, one laptop, a second BB instance with its own data directory, the example provider, a toy repository under /tmp)
+
+The installed plugin and its studies were not touched: a second BB instance (own data directory and ports) ran a path install of this branch plus the example bench provider. The installed plugin's database was backed up first, and its studies and their states matched the backup afterwards.
+
+- **Toy.** `src/cost.txt` holds a number. The protected measure sleeps in proportion to it and prints it with noise, plus a `mem` guardrail with ±3% noise. Remote commands get `AUTORESEARCH_REMOTE`, which the measure uses to pick each host's noise. Noisy class, `n_min` 3, `n_max` 6, 12 calibration pairs, `min_effect` 0.5%, one remote machine (example provider) plus the edit host, one claude-code worker, pinned ideas.
+- **Study 1 (edit host ±0.2%, remote ±5%).**
+  - Spec v1, with `mem` limited to 1%, failed calibration with the message quoted in item 4. Spec v2 loosened it to 3% and calibrated.
+  - The remote machine was not used ("Not used: bench-provider-local #2 (noise floor 4.17% per pair, 28.5× the 0.15% median of the other bench hosts, above max_host_noise_ratio 2)") and left when the calibration ended.
+  - Once running, replacements #3 and #4 calibrated on arrival and were replaced; #5 was kept, with the notice.
+  - Three candidates won on the edit host (threshold 0.50%; the kept machine's was 4.08%).
+  - Each win that made best's runs shorter recalibrated automatically. In segment 3 the noisy machine was replaced again on recalibration, and two more arrivals were replaced before one was kept. This churn led to `acceptsNoisy`: an entry that already hit the bound now keeps its machines, also on recalibration (covered by the fleet test).
+- **Study 2 (edit host ±2%, remote ±0.2%, `max_host_noise_ratio = 20`).**
+  - Calibration: "2 bench hosts, each deciding with its own win threshold: 0.50% on bench-provider-local #10, 2.02% on … (local)".
+  - Both candidates went to the remote machine, which is listed after the edit host, and were judged against 0.50%.
+  - A CPU burner (`yes`, 45 s) started when the first measurement began. The automatic recalibration after that promotion found both hosts unhealthy ("competing process yes … at 100% CPU (limit 90%)") and deferred three times, 5-13 s apart, then ran and opened segment 2 with no pause.
+  - In segment 2 the edit host, 23.6× the remote's noise, was left out until segment 3's recalibration measured it again.
+- **Seen and fixed during the check.**
+  - Nested parentheses in the noisy-host reason.
+  - Replacement churn after each recalibration (above).
+- **Cleanup.** Both studies were archived with their threads. The second instance was stopped and its data directory and the toy repository were deleted.
+
+#### Data model
+
+- **Migration (append-only).** `bench_hosts.excluded_json`.
+- **New events.** `bench.noisy_host` (host, mode, noise, peers, ratio, limit, action `excluded`/`replaced`/`kept`, when `calibration`/`recalibration`/`arrival`), `recalibration.deferred` (tries, max, retry_seconds, problems). Both are in the live feed and replay.
+- **Changed events.** `recalibration.failed` gains `health` and `tries`.
+- **`studies.recalibrate_due`** gains `health_retries` and `retry_at`.
+- **Calibration reports and segment details.** Every calibrated host is included, the noisy ones with `excluded` (why).
+- **Remote machines.** `calibration_json` gains `guardrails`.
+- **New notice kind.** `bench.noisy_host` (informational).
+- **View models.**
+  - Overview: `calibration.thresholds`.
+  - Bench hosts: `threshold`, `excluded`.
+  - Oracle calibration: `thresholds`; its hosts gain `threshold` and `excluded`.
+  - Oracle segments: `thresholds`; their hosts gain `threshold` and `excluded`.
+- **Removed.** `guardrailWarnings` (replaced by `guardrailProblems`).
+
+#### Known issues
+
+- **Only calibration judges noise between hosts.** Drift checks still compare a host with its own calibration, not with its peers, so a host that becomes noisy mid-segment pauses the study for drift (as before) rather than leaving the dispatch set.
+- **The chance guard's standard error is approximate** (simulated for normal noise). Heavy-tailed benchmarks make noise floors vary more, so hosts are taken out somewhat more often than 1%.
+- **Single-machine mode** still serializes gates with measurements when the edit host has been left out of the dispatch set (it measures nothing then, so this only costs gate parallelism).
+- **Gates** keep spec order. They aren't sent to the noisier hosts to keep quiet hosts free for measurements.
+
+### Agents own commits, harvest and publishing
+
+#### Why
+
+The plugin was doing work that belongs to agents: it wrote commit messages
+(a candidate's PR inherited the wrong title from its idea), grouped and
+ablated promotions, drafted branches and PR bodies, and published to GitHub
+only. It couldn't split a candidate that bundled two changes, consolidate two
+studies on one repository into one stack, or publish to a repository that
+uses another review tool.
+
+The plugin now owns only the trust boundary: measurements and gates, verdicts
+and promotion, budgets, bench machines, and the evidence record. Commit
+messages, harvest (grouping, splitting, stacking, PR descriptions) and
+publishing belong to agents, with skills and the repository's own tools.
+
+#### 1. Worker-written commit messages
+
+- `study_submit_candidate` takes `title` (required: one line, at most 72
+  characters after trimming) and `body` (optional, at most 4000 characters).
+  `summary` is gone; the candidate's `summary` column now stores
+  `title\n\nbody` so every view that read it keeps working.
+- `src/commit.ts` checks the message (`checkCommitMessage`) and builds it
+  (`candidateCommitMessage`): the title and body verbatim, then the plugin's
+  two trailers, `Autoresearch-Study: <slug>` and
+  `Autoresearch-Candidate: c/<n>`. The same message is used for the worker
+  snapshot, the candidate rebased onto best, and the promotion squash on
+  best. The promotion no longer carries the idea title, the effect, the CI,
+  the verdict reasons or the `Autoresearch-Source` trailer: the numbers live
+  in the evidence, and the source sha is the candidate ref.
+- A body containing an `Autoresearch-*:` line is refused (the plugin's
+  trailers map commits back to candidates, and to a study when several share
+  a repository). A refused message commits nothing and tells the worker why.
+- Candidates submitted before 1.0 (in flight at the upgrade) keep the old
+  message source: the idea title, or the summary's first line, with the
+  summary as the body (`commitParts`).
+- The worker brief has a "Commit message" section: the title says what the
+  change does (not the idea's name or the hoped-for result) in the
+  repository's style; the body says why, what was checked, and trade-offs, and
+  no measured numbers.
+- The host contract's snapshot message limit went from 4096 to 8192 (title +
+  body + trailers).
+- Candidate pages show the worker's commit message (`candidateDetail().commit`,
+  `candidateRow().title`); the evidence carries it.
+
+#### 2. Primitives: `bb study measure`, `gate`, `results`, `evidence`
+
+All in `src/primitives.ts` and `src/evidence.ts`, wired through the engine
+(`requestMeasure`, `requestGate`, `adhocRun`) and the CLI.
+
+##### `bb study measure <slug> <A> <B> [--pairs N] [--host H] [--detach] [--timeout D] [--json]`
+
+- Measures B against A (A is the reference: "best" side; better is positive)
+  with the study's noise-class strategy, guardrails and calibrated side runs,
+  on one of the study's bench hosts, under that host's bench lock (bench
+  interval kind `adhoc`), with a health check first (deferred and retried
+  like a candidate, at most `adhocHealthTries` times).
+- An estimate, not a sequential decision: a fixed number of pairs, the
+  study's `n_max` (or `--pairs N`, noisy oracles only), with early stops off.
+  Deterministic: one run each. Expensive: the strategy's runs.
+- The classification is the candidate verdict rules applied to B against A
+  (`decideVerdict`): `win` (B better beyond the threshold), `lose`,
+  `inconclusive`. The threshold is the one a candidate on that host gets
+  (`measurementMde`: each host's own win threshold, above).
+  Guardrails are judged against A with the per-step limit (the total limit
+  applies to the step alone: A is not the segment base).
+- Refs (validated: no option-like or `..` refs): a sha, a branch or tag of
+  the repository, `best`, `base`, `c/<n>` (the candidate ref), or rev syntax
+  (`best~1`, `<branch>^`). Resolved on the edit host.
+- `--host` takes a bench host's name or id (not one left out for its noise);
+  without it the host is chosen when the run starts, in the pipeline's dispatch
+  order (the quietest online, healthy, idle host first, then any healthy one,
+  then any online one). With no host online yet on a study whose remote
+  machines are coming (frozen for harvest, or running), the run waits for them
+  (`adhocHostWaitMs`, 30 minutes); a remote machine that leaves mid-run starts
+  it again on another host, up to three times, unless `--host` named it.
+- Waits for the result (up to `--timeout`, default 25 min, max 30) unless
+  `--detach`; the run continues past the timeout either way.
+
+##### `bb study gate <slug> <ref> [--detach] [--timeout D] [--json]`
+
+The study's gates on any commit, on the edit host, in a checkout keyed
+`<slug>-adhoc-gate`. A failing command is retried once (`flaky` when the retry
+passes, as for candidates). In single-machine mode the gates take the edit
+host's bench lock and their time counts as bench time; otherwise they don't
+(as for candidates). Remote gate machines (`gates = true`) are not used here.
+
+##### `bb study results <slug> [r<N>] [--wait] [--json]`
+
+The runs asked for, newest first, or one in full. Runs are numbered per study
+(`r<seq>`).
+
+##### Records, audit, budget
+
+- Each request is a row in the new `adhoc_runs` table (kind, refs as asked and
+  the shas they resolved to, host, pairs, state `queued|running|done|failed|cancelled`,
+  progress, `result_json`, error, actor, bench seconds, times).
+- Audit: the request is a `control.measure` / `control.gate` event with the
+  caller (the CLI's thread id, else `human`); the result is
+  `measure.adhoc_finished` / `gate.adhoc_finished` (or `*.adhoc_failed`). No
+  notice per request: an agent asks for many, and they are not control
+  changes. These event names don't collide with the candidate pipeline's
+  `measure.*` events the live view replays.
+- Bench seconds go to the study's budget (`addBenchSeconds`) and the run's
+  row. A spent bench budget doesn't refuse a request: harvest follows an
+  exhausted budget by design (the old harvest's measurements weren't blocked
+  either); a Running study whose budget runs out this way pauses as usual.
+
+##### Who may ask, and when (decision)
+
+- Any thread except a study's own workers (a worker measuring its own
+  candidates would spend the bench budget outside the pipeline). The study
+  thread may: it is where a human most often asks for a harvest. Not human
+  controls, so the CLI's human-control guard doesn't apply.
+- Refused for a draft, calibrating or archived study, or one without a
+  calibrated segment.
+- **Refused while any of the study's workers is live and its bench is busy**
+  (a candidate testing, queued or measuring). That covers Running, and the
+  workers finishing their last submission after a pause or a freeze. With an
+  idle bench a request is taken even while workers run: it holds the bench
+  lock, so a candidate arriving meanwhile waits for it, and verdicts are never
+  mixed with it. Paused and Harvesting studies without live workers always
+  take requests. The refusal names the fix (`bb study pause`, `bb study harvest`).
+- Paused studies release their remote machines, so a remote-only bench has
+  no host while paused; the refusal says so and names the fix: freezing the
+  study for harvest brings the machines up again and keeps them, and a request
+  made before they are ready waits for them (above).
+- CLI only, no agent tools: harvesting is done by whichever agent the human
+  asks (an ordinary thread or the study thread), and agent tools are
+  role-gated to study threads; the CLI works from any thread with a shell. No
+  RPC either: the app shows the runs but doesn't start them.
+
+##### Reload
+
+Runs are background jobs of the plugin instance. Dispose aborts them; the next
+instance's reconcile marks queued or running rows `failed` with "interrupted by
+a plugin reload; run it again" (`Primitives.reconcile`). Archive cancels a
+study's runs.
+
+#### The evidence document (`bb study evidence <slug> --json`)
+
+Stable within a version: fields are only added; a field that changes meaning
+or goes away bumps `version`. Options: `--samples` adds each candidate's raw
+samples; `--candidates 3,7` (or `c/3`) limits the candidates. When the
+document is larger than one CLI response (200,000 characters), it is written
+whole to `<plugin data dir>/exports/<slug>-evidence/evidence.json` on the edit
+host and stdout is `{ "format", "version", "file", "bytes" }`, never a trimmed
+document. Holdout data never appears (only `study.holdout: true|false` and a
+candidate's `holdout: "pass"|"fail"|null`). The text form (without `--json`)
+is a short summary.
+
+The fields, and what 1.x keeps of them, are in [stability.md](stability.md#the-evidence-json).
+
+#### 3. Harvest is a freeze
+
+- `bb study harvest <slug>` (or the Harvest tab, or Needs you after the budget
+  runs out) moves Running or Paused to Harvesting as before: no new workers,
+  submissions refused, in-flight candidates finish (`waiting`). Then the
+  harvest is `frozen`: base, best, segment and the promotions (first-parent
+  log, mapped to candidates by the trailers, with each commit's subject and
+  body) are recorded, and best is pinned as `refs/studies/<slug>/harvest/h<N>`.
+  A `harvest.frozen` notice says what was frozen and how to ask an agent.
+- Removed: the strategist's grouping round and `study_propose_harvest`,
+  ablation, dependency probes, stacks and folds, standalone checks, branch
+  drafting, PR bodies (`prBody`), the dry-run export, the GitHub publisher
+  (`src/publisher.ts`), publish plans and keep/drop choices, `--publish`
+  (it now fails with `removed` and a hint naming the study-harvest skill),
+  `--restart`, `--one-per-promotion`, `--no-measure-standalone`, and the RPC
+  methods `study.harvest.plan`, `study.harvest.publish`,
+  `study.harvest.choice`. `study.harvest.start` takes `{ slug }` only.
+  `src/harvest-math.ts` became `src/harvest-legacy.ts`: only the display
+  helpers old records still need.
+- `bb study harvest` while a harvest is waiting or frozen shows it (a read:
+  the study thread may ask). Starting one is a human control as before. When
+  the latest harvest is an old one (ready, failed, cancelled), it starts a new
+  freeze; no `--restart`. `--harvest N` shows an older harvest.
+- `bb study resume` cancels a harvest still waiting; a frozen one keeps its
+  ref. `bb study archive` as before.
+- `[harvest]` spec keys (`measure_standalone`, `group_timeout_minutes`,
+  `remote`) are still accepted, so stored specs keep parsing, and have no
+  effect. They were never part of the oracle hash.
+- **Harvests from before 1.0 stay readable**, read only: changesets,
+  contributions and accounting, stacks, folds, PR previews, branches, export
+  directory and publish results, on the Harvest tab (selectable from the
+  history), in `bb study harvest --harvest N`, the report, and the evidence's
+  `harvests` (`legacy: true`).
+- **A harvest the plugin was still running at the upgrade** (grouping,
+  ablating, checking or drafting) can't continue. On load it becomes `frozen`
+  on the best it had frozen, with "stopped while <phase> when the plugin moved
+  to agent-run harvests (1.0)"; what it measured and drafted so far stays
+  readable, and an agent takes over. A legacy `waiting` harvest simply
+  continues as a v1 freeze. Mid-harvest studies on a machine that upgrades
+  lose the remaining automatic phases: finish them with an agent.
+- Needs you: a frozen harvest (or an old `ready` one) is one item, "Best is
+  frozen (harvest hN): ask an agent to harvest it", opening the Harvest tab,
+  CLI `bb study evidence <slug>`. Kinds `harvest_ready` and `publish_failed`
+  are gone; `harvest_frozen` is new.
+
+#### 4. The `study-harvest` skill
+
+`skills/study-harvest/SKILL.md`, enabled for ordinary threads and the study
+thread (`skillsForRole`). It tells an agent how to: check the study is frozen
+(and ask the human to freeze it otherwise), read the evidence and the
+repository's conventions (target branch, commit and PR style, templates, the
+review tool), plan PRs (group, keep apart, split by file or hunk, stack, drop
+nothing alone) and show the plan, build branches in its own worktree and
+check nothing was lost against the frozen tree, measure each PR on its base
+and contributions at the top with `bb study measure`, gate with
+`bb study gate`, write descriptions that cite the plugin runs, and publish
+with the repository's own tool (gh, Graphite, Sapling, Gerrit, Phabricator, …)
+only when asked. It also covers consolidating several studies on one
+repository into one stack, and a short "don't" list (no self-measured numbers,
+no pushing before asked, no touching `studies/*` or `refs/studies/*`, no
+lifecycle controls).
+
+##### Worked example: two studies on one repository into one stack
+
+Not run on real studies; this is how an agent following the skill does it.
+Say `svc-latency` (p99, noisy) and `svc-memory` (RSS, noisy) both ran on
+`acme/svc`, from bases `a1` and `b2`, and the human asks for one stack.
+
+1. The human freezes both (`bb study harvest svc-latency`, `bb study harvest svc-memory`).
+   The agent reads `bb study evidence svc-latency --json` and `… svc-memory --json`.
+   Their promotions are told apart by `Autoresearch-Study`; both repositories
+   are the same, so `refs/studies/svc-latency/harvest/h1` and
+   `refs/studies/svc-memory/harvest/h1` resolve in either.
+2. Common base: `origin/main` at `c3`, newer than both bases.
+3. Plan: latency c/4 (a header cache) and memory c/7 (a smaller header struct)
+   both edit `src/headers.rs`: adjacent layers, the struct first because the
+   cache builds on it. Latency c/9 and memory c/2 are the same fix (drop a
+   per-request clone): one PR, from c/2 (the smaller diff), noted in both
+   descriptions. Latency c/11 bundles an allocator tweak with a logging
+   change: split by hunk; the logging hunk is its own PR at the bottom.
+   The agent shows this table and the measurements it plans, with their bench
+   cost from each study's `segments[-1].evalSeconds`.
+4. It rebuilds the stack on `c3` in its own worktree (`git cherry-pick`,
+   `git checkout -p`), resolves conflicts, and checks the union against each
+   frozen best with `git diff` per study.
+5. Measurements, each by the study whose metric the layer targets, plus the
+   cross-check: `bb study measure svc-memory <layer-1 base> <layer-1>` (the
+   struct, memory's metric), `bb study measure svc-latency <layer-1> <layer-2>`
+   (the cache, latency's metric), … and at the end
+   `bb study measure svc-latency c3 <top>` and `bb study measure svc-memory c3 <top>`
+   so each study's oracle sees the whole stack; any layer the cross-check
+   flags (`guardrails` or `classification: lose` on the other metric) gets
+   its own measurement with the other study too. `bb study gate` with each
+   study on each layer. Both studies are frozen, so neither has live workers
+   and both take the requests; each runs on its own bench hosts with its own
+   protocol.
+6. Descriptions cite both studies' runs where both apply ("p99 12.4% lower
+   (CI …), svc-latency r4; RSS unchanged within its 2% limit, svc-memory r2").
+   Publishing waits for the human, then uses `gt submit --draft` or
+   `gh pr create --draft --base <layer below>` bottom first, whichever the
+   repository uses.
+
+#### 5. UI
+
+- **Harvest tab**: without a harvest, what harvest does now and *Freeze best
+  for harvest…*. A frozen harvest shows its state, base → best and the pinned
+  ref, the promotions (candidate link, the worker's commit title, its effect
+  when promoted, files, the full commit message on demand), and while
+  Harvesting an **Ask an agent to harvest it** box: the prompt (copyable),
+  *Ask in a new thread…* (BB's composer, prefilled, in the study's project),
+  *Open the study thread*, and the four commands. Every page shows
+  **Measurements and gates agents asked for** (newest 20: run, state, what
+  was asked, the result line or error, bench time). The history lists every
+  harvest (old ones marked "before 1.0") and opens any of them. Old harvests
+  render read only, without the publish dialog or keep/drop radios. Resume,
+  archive and *Freeze best for a new harvest…* where they apply.
+- **Candidates**: the detail's "Summary" became "Commit message (the
+  worker's)" with title, body and a line saying it is used verbatim; the list
+  shows the commit title under the idea.
+- Overview harvest line, Needs you, notices and the freeze dialog reworded.
+
+#### Also fixed
+
+- A win that passed the holdout lost its guardrail judgement (the holdout
+  step rebuilt the verdict without it), so its `metrics_json` had no
+  `guardrailJudgement`. The verdict now keeps it (`{ ...result, … }`).
+
+#### Data model
+
+Append-only migrations: `candidates.commit_title`, `candidates.commit_body`;
+table `adhoc_runs` (+ index). Harvest states gain `frozen`
+(`HARVEST_STATES`; `LEGACY_ACTIVE_HARVEST_STATES` names the old in-progress
+ones). Bench interval kind `adhoc`. Checkout roles `adhoc-a`, `adhoc-b`
+(the old `hbase`/`harvest` roles are gone). Config `harvestGroupGraceMs` removed,
+`harvestHealthTries` renamed `adhocHealthTries`. New events: `control.measure`,
+`control.gate`, `measure.adhoc_finished`, `gate.adhoc_finished`,
+`measure.adhoc_failed`, `gate.adhoc_failed`; `harvest.frozen` (with `legacy`
+when an old harvest was stopped). No longer emitted: `harvest.grouped`,
+`harvest.grouping_fallback`, `harvest.total`, `harvest.ablation`,
+`harvest.dependency`, `harvest.folded`, `harvest.standalone`,
+`harvest.drafted`, `harvest.ready`, `harvest.publishing`, `harvest.published`,
+`harvest.publish_refused`, `harvest.choice`, `harvest.proposed`,
+`harvest.phase`. The `harvest_proposals` table stays (unused).
+
+#### Tests
+
+Removed with the code: `test/harvest.test.ts` (real-git ablation, stacks,
+drafting), `test/harvest-order.test.ts` (stack planning and folds), the
+grouping/attribution/publisher parts of `test/m3.test.ts`, and the app and RPC
+tests of publishing and keep/drop. Updated: every caller of
+`study_submit_candidate` (title instead of summary), harvest UI/CLI/RPC
+tests (freeze, legacy read-only view, Needs you). `FakeHost` gained a
+`commitLog` and resolves known shas. New `test/v1-agent-harvest.test.ts`:
+commit message checks and building; the worker's message verbatim on the
+candidate, rebased and promoted commits; the freeze (promotions, pinned ref,
+notice, read access for the study thread, resume keeps the ref); `measure`
+(classification both ways, guardrails, samples, audit events, bench time,
+results, refused refs/hosts/`--pairs`); `gate` (pass, flaky, failure tail,
+workers refused); the busy-bench refusal and `--detach`; the evidence
+document (exact top-level keys, commit messages, promotions, runs, findings,
+never the holdout, `--samples`, `--candidates`, the file fallback);
+reconciliation of interrupted runs and of a mid-flight legacy harvest; and a
+real-git end to end where a bundled win is frozen, split into two commits by
+"an agent" with plain git, and each part measured and gated by the plugin.
+App tests: the freeze from the empty Harvest tab through promotions and the
+agent guide, the runs list, the read-only old harvest, the candidate's commit
+message.
+
+#### Live check (a second BB instance, a toy repository under /tmp, a temporary project)
+
+A second BB server with its own
+data directory (the installed plugin and its studies untouched), the plugin
+installed there from this branch, a deterministic toy study (output bytes of a
+status report, a `lines` guardrail) with Claude workers. Workers wrote their
+own commit messages, used verbatim on best; one win bundled two unrelated
+changes. After the freeze, an agent given the Harvest tab's prompt followed
+the study-harvest skill: it split the bundled candidate, regrouped it with a
+later win into two PRs, measured each on its base and gated it through the
+plugin, and wrote PR descriptions citing the runs, without pushing.
+
+#### Known issues
+
+- The Live view's bench strip and the Bench tab's host lines don't say a host
+  is busy with a requested measurement (the interval is recorded with kind
+  `adhoc` and shows in the Bench tab's interval list).
+- `bb study measure` doesn't reuse a host's cached best build unless A is
+  best; B is always built fresh.
+- No RPC or app button starts a measurement or gate: agents do, with the CLI.
+
+
+### Operations: remote machines across a reload, seed cleanup, CI, docs
+
+#### Remote machines across a plugin reload
 
 - **Why.** Unloading destroyed every remote machine, so a plugin update in the middle of a study (or of a harvest measuring on remote machines) cost one join and one calibration per slot, and cancelled whatever the machines were measuring for good.
 - **Unload keeps calibrated machines.** Their `remote_hosts` rows stay `ready` (nothing new is persisted: the rows already hold the provider id, home, seed, expiry and calibration, and the bench host row its noise floor and threshold). The old instance stops using them at once: its runners are marked lost, so a command in flight is cancelled on the machine before the next instance measures there. Machines that were creating, joining, calibrating or retiring are still destroyed (best effort, bounded), since they hold no calibration worth keeping.
@@ -27,21 +538,21 @@ How each version was built: what it added, the decisions taken on the way, every
 - **What still destroys machines.** Pause (once idle), archive, a lifetime that ends, a provider that reports the machine gone. A disabled plugin's machines are not destroyed: the provider ends them with their lifetime, or the next load re-adopts or destroys them.
 - **Measurements in flight** at unload restart from scratch, as before (the pipeline's reconcile); best is built again on each machine (in-memory build caches don't survive a reload).
 
-### Seeds and base bundles
+#### Seeds and base bundles
 
 - **Garbage collection.** A new host op, `artifacts`, lists the packed seeds (`<dataDir>/seeds`) and shallow base bundles (`<dataDir>/bundles`) on the edit host and, with `gc`, deletes the ones the server didn't ask to keep. The server keeps, for every non-archived study on that host, the seed of each spec entry for its current baseline and inputs (and the newest one built), and the base bundle of its base. It runs at load (in the background) and when a study is archived, and records `remote.artifacts_deleted`. Files younger than 10 minutes are kept (a seed being packed has no row yet); leftover temporary files older than a day are removed. Deleting a file that was still wanted costs a rebuild, not a wrong result: a seed is checked on disk before reuse, and a missing base bundle is built again.
 - **Size report.** `bb study bench` (and its `--json`, as `artifacts`) reports the seeds and base bundles on the edit host, what this study uses, and what the last cleanup deleted.
 - **No rebuild for an unchanged seed.** A seed was keyed by its baseline and the spec version, so any approved spec change (a budget, say) built and uploaded it again for the next machine. It is now keyed by its baseline and its inputs: the seed command, `seed_allow` and the cores it is told about. A refused seed stays blocked until one of those (or the baseline) changes.
 
-### CI
+#### CI
 
 `.github/workflows/ci.yml` runs on pull requests and on `main`: `pnpm install --frozen-lockfile`, `tsc --noEmit`, the test suite, and `bb plugin build` with the bb CLI from npm (`bb-app`, pinned to 0.45.0, the oldest BB the plugin supports; the build needs no running BB server).
 
-### Docs
+#### Docs
 
-`docs/design.md` is the design alone. The implementation notes of every version moved here, newest first (the v0.3.1 notes had landed after "Credits"). `docs/guide.md` is a short user guide, the README points at the three, and `docs/stability.md` says what 1.0 keeps stable and how versions change.
+`docs/design.md` is the design alone. The implementation notes of every version moved here, newest first (the v0.3.1 notes had landed after "Credits"), and 1.0's measurement and harvest notes are folded in above. `docs/guide.md` is a short user guide, the README points at the three, and `docs/stability.md` says what 1.0 keeps stable and how versions change.
 
-### Live check (BB 0.45, one MacBook, a second BB instance with its own data dir, the example provider, a toy repo under /tmp)
+#### Live check (BB 0.45, one MacBook, a second BB instance with its own data dir, the example provider, a toy repo under /tmp)
 
 The installed plugin was left alone: a second BB server and host daemon (`bb-app --data-dir …` on other ports) ran this branch and the example provider. Toy: `src/cost.txt` holds a number, a protected measure prints it, a seed of 2 MB, `setup` runs a tool from it; remote only, 2 machines, noisy, `n_min` 3.
 
@@ -51,10 +562,25 @@ The installed plugin was left alone: a second BB server and host daemon (`bb-app
 - **Cleanup.** A stale 3 MB seed file aged past the grace period was deleted at that reload (`remote.artifacts_deleted`, `bb study bench` showed "last cleanup (plugin loaded) deleted 1 file(s), 2.9 MiB"). Archiving destroyed both machines and, with the study's own seed and base bundle aged past the grace period, deleted them too: nothing was left under the data dir's `seeds/` and `bundles/`.
 - **Found.** The example provider keeps its registry at one default root under the OS temp dir, shared by every BB instance on the machine; two instances smoke-testing at once overwrite each other's `state.json` (each keeps its own machines in memory, so nothing was destroyed). Start a second instance with its own `TMPDIR` to keep them apart.
 
-### Known issues
+#### Known issues
 
 - A kept machine that is re-adopted keeps the calibration it had; it is not recalibrated after the reload (the code and the machine are the same, and drift checks continue).
 - Status polls of a machine whose provider plugin is missing during the run (not at load) still treat it as gone, as before.
+
+### Where the parts meet
+
+The measurement, harvest and operations changes were built side by side; these are the places they touch.
+
+- **`bb study measure` measures like a candidate.** Its host is chosen when the run starts, in the pipeline's dispatch order: the quietest free host first (each host's own win threshold, then its noise floor), and never a host left out for being much noisier than its peers (`--host` naming one is refused with the reason). The classification uses that host's own threshold and its guardrails that host's own calibrated noise, as a candidate measured there would.
+- **Remote-only studies wait for their machines.** A study paused at the end of its budget destroys its remote machines. Freezing it for harvest brings them up again, and a `bb study measure` asked before any is ready waits for them ("waiting for a bench host: remote machines on their way (2 joining)") instead of failing with no bench host. The same holds while a reload re-adopts machines. A machine that leaves mid-run (its lifetime, the provider) starts the run again on another host, up to three times, unless `--host` named it. A paused remote-only study still refuses, and says that freezing brings the machines back.
+- **Reload, thresholds and noisy hosts.** A re-adopted machine keeps its own threshold (its bench host row is untouched), a local host left out for its noise stays out (`bench_hosts.excluded_json`), and the count of noisy replacements in a row is kept on the study (`studies.remote_noisy_json`), so a reload doesn't restart it and an entry that already hit the bound keeps its machines.
+- **Seeds, base bundles and the freeze.** A paused or harvesting study isn't archived, so cleanup at load keeps its seed and base bundle however old they are; the machines that join after the freeze reuse the seed (no new build), and an agent's own branches (a split of best built on the study base) reach them as delta bundles like any candidate.
+- **Evidence.** `benchHosts[].threshold` is the host's own win threshold (never below `min_effect`) and `benchHosts[].excluded` says why a host measures nothing until the next calibration. `segments[].threshold` keeps the segment column: the noisiest measuring host's.
+- **Wording.** User-facing text says "before 1.0" for harvests and commit messages the plugin made under v0.x.
+
+Tests: `test/v1-measurement.test.ts` (measure goes to the quiet host with its own threshold, refuses the excluded one by name, and the evidence shows both); `test/remote-fleet.test.ts` (the example provider, real processes: a remote-only study paused with no machines, a reload while paused keeps its aged seed and base bundle, the freeze brings machines up and a measure asked before they are ready waits, then measures with the machine's own threshold, an agent's split branch measures there too, no seed rebuild; a reload during a requested measurement fails that run, re-adopts both machines with their thresholds, and the next request measures on one of them; a machine killed mid-run restarts the run elsewhere, and fails a run pinned to it with `--host`; the noisy-replacement count survives a reload).
+
+<!-- integration live check -->
 
 ## v0.3.1: large uploads in parts
 
