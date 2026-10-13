@@ -91,6 +91,12 @@ export const remoteBench = z
     /** Run the gates on these machines too (not on the edit host). */
     gates: z.boolean().default(false),
     /**
+     * Frozen for harvest, machines are kept only while a requested measurement
+     * or gate is queued or running, and released after this many idle minutes
+     * (the next request brings them up again). Not part of the oracle hash.
+     */
+    idle_release_minutes: z.number().min(0).max(24 * 60).default(10),
+    /**
      * What machine the provider creates (machine type, SMT off, CPU platform,
      * image, ...): provider-specific keys, passed verbatim to
      * `benchProvider.create`. Part of the oracle hash.
@@ -510,7 +516,7 @@ export function oracleHash(spec: StudySpec, protectedContentHash = ""): string {
   // seed and setup commands, environment); how many, how long they live, the seed allowlist and
   // where gates run are operations. Left out when empty, so specs without them keep their hash.
   // `machine` is hashed (it changes what is measured), but left out when absent or empty so older specs keep their hash.
-  const remote = (remoteRaw ?? []).map(({ hosts: _h, lifetime_minutes: _l, rotate_before_minutes: _r, seed_allow: _a, gates: _g, machine, ...judged }) => (machine && Object.keys(machine).length ? { ...judged, machine } : judged));
+  const remote = (remoteRaw ?? []).map(({ hosts: _h, lifetime_minutes: _l, rotate_before_minutes: _r, seed_allow: _a, gates: _g, idle_release_minutes: _idle, machine, ...judged }) => (machine && Object.keys(machine).length ? { ...judged, machine } : judged));
   const oracle = { ...rest, protocol, ...(remote.length ? { remote_bench: remote } : {}) };
   const judged = {
     metric: spec.metric,

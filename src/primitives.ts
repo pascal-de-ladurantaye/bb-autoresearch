@@ -197,7 +197,7 @@ export class Primitives {
 
   private noHostText(study: StudyRow): string {
     const spec = this.store.spec(study);
-    return `${study.slug} has no online bench host${spec.oracle.remote_bench?.length && study.state === "paused" ? " (its remote machines are released while it is paused; freeze it for harvest with `bb study harvest`, which brings them up and keeps them)" : ""}`;
+    return `${study.slug} has no online bench host${spec.oracle.remote_bench?.length && study.state === "paused" ? " (its remote machines are released while it is paused; freeze it for harvest with `bb study harvest`, which brings them up for its requests)" : ""}`;
   }
 
   /** Wait until a bench host is online (remote machines joining), up to adhocHostWaitMs. */

@@ -19,6 +19,7 @@ Keys new in 1.0 that are not part of the oracle hash:
 | Key | Default | What it does |
 |---|---|---|
 | `[oracle] max_host_noise_ratio` | `2` | A bench host whose calibrated noise floor is more than this times the median of the other hosts' (and beyond what chance gives equal hosts) is left out: a remote machine is replaced, a local or BB host measures nothing until the next calibration. `0` turns it off; otherwise 1-100. |
+| `[[oracle.remote_bench]] idle_release_minutes` | `10` | Frozen for harvest, remote machines are released after this many minutes without a requested measurement or gate queued or running; the next request brings them up again. |
 | `[oracle.health] recalibration_retries` | `30` | Health-check retries of an automatic recalibration, `retry_seconds` apart, before it pauses the study. |
 
 And one that is part of the oracle hash, left out of it when absent or empty so specs without it keep their hash:

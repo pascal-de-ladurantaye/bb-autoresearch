@@ -865,6 +865,39 @@ describe("remote bench hosts (example provider, real git)", () => {
     expect(store.segment(sid, 1)).toBeTruthy();
   });
 
+  it("1.0: frozen for harvest, machines stay only while requested runs need them: released after idle_release_minutes, brought back by the next run", async () => {
+    setup();
+    await started(spec({ remote: "idle_release_minutes = 5" }));
+    const sid = studyId();
+    expect((await decided(queue(50))).verdict).toBe("win");
+    engine.startHarvest(SLUG, "human");
+    await until(() => store.latestHarvest(sid)?.state === "frozen" && ready().length === 2);
+    const run = await engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human");
+    await until(() => store.adhocRun(run.id)!.state === "done");
+    const created = provider.calls()["benchProvider.create"];
+    // Within the grace the machines stay.
+    clock.advance(4 * 60_000);
+    await tick(2);
+    await engine.fleet.settle();
+    expect(ready()).toHaveLength(2);
+    // Idle past it: released and destroyed, and nothing replaces them while nothing is asked.
+    clock.advance(2 * 60_000);
+    await until(() => live().length === 0);
+    await engine.fleet.settle();
+    expect(alive()).toHaveLength(0);
+    expect(store.events(sid, { kinds: ["remote.left"] }).slice(0, 2).map((e) => JSON.parse(e.data_json).reason)).toEqual([expect.stringContaining("idle while frozen for harvest"), expect.stringContaining("idle while frozen for harvest")]);
+    clock.advance(60 * 60_000);
+    await tick(3);
+    await engine.fleet.settle();
+    expect(live()).toHaveLength(0);
+    expect(provider.calls()["benchProvider.create"]).toBe(created);
+    // The next request brings them up again and waits for them.
+    const again = await engine.requestMeasure(SLUG, { refA: "base", refB: "best" }, "human");
+    await until(() => ["done", "failed"].includes(store.adhocRun(again.id)!.state));
+    expect(store.adhocRun(again.id)!.state, store.adhocRun(again.id)!.error ?? "").toBe("done");
+    expect(provider.calls()["benchProvider.create"]).toBeGreaterThan(created);
+  });
+
   it("measures on local and remote hosts together, each with its own calibration", async () => {
     setup();
     await started(spec({ benchHosts: '"local"' }));

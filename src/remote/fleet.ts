@@ -323,7 +323,13 @@ export class RemoteFleet {
         if (row.expires_at !== null && now >= row.expires_at) this.leave(row, "its lifetime ended", { notify: this.pipeline.lockKeyBusy(benchLockKey(study, spec, row.bench_host_id)) });
       }
       const current = this.store.remoteHosts(study.id, { live: true });
-      if (this.wants(study)) this.fillSlots(study, spec, current, now);
+      if (study.state === "harvesting") {
+        // Frozen: machines only while requested measurements need them (and an idle grace after), per entry.
+        const wanted = this.entries(study, spec).map((e) => this.harvestWants(study, e, now));
+        this.fillSlots(study, spec, current, now, wanted);
+        const idle = current.filter((r) => wanted[r.entry] === false && (r.state === "ready" || (JOINING as readonly string[]).includes(r.state)));
+        if (idle.length) this.release(study, spec, idle, "idle while frozen for harvest: no requested measurement for a while (the next one brings machines up again)");
+      } else if (this.wants(study)) this.fillSlots(study, spec, current, now);
       else if (this.keeps(study, now)) {
         // A finished calibration waits for the human: its machines stay (no new ones) for a while.
       } else this.release(study, spec, current, study.state === "archived" ? "study archived" : study.state === "paused" ? "study paused" : `study ${study.state}`);
@@ -334,13 +340,30 @@ export class RemoteFleet {
     }
   }
 
-  private fillSlots(study: StudyRow, spec: StudySpec, live: RemoteHostRow[], now: number): void {
+  /**
+   * Frozen for harvest, an entry's machines are wanted while best is still
+   * freezing (in-flight candidates), while a requested measurement or gate is
+   * queued or running, and for `idle_release_minutes` after the last one (or
+   * after the freeze). Then they are released; the next request brings them
+   * up again and waits for them.
+   */
+  private harvestWants(study: StudyRow, entry: RemoteBenchSpec, now: number): boolean {
+    const h = this.store.latestHarvest(study.id);
+    if (!h || h.state === "waiting") return true;
+    if (this.store.adhocRuns(study.id, { states: ["queued", "running"], limit: 1 }).length) return true;
+    const last = this.store.adhocRuns(study.id, { limit: 1 })[0];
+    const lastActive = Math.max(h.started_at ?? 0, h.finished_at ?? 0, last ? (last.finished_at ?? last.requested_at) : 0);
+    return now - lastActive < (entry.idle_release_minutes ?? 10) * 60_000;
+  }
+
+  private fillSlots(study: StudyRow, spec: StudySpec, live: RemoteHostRow[], now: number, wanted?: boolean[]): void {
     const entries = this.entries(study, spec);
     const slots = new Set<string>();
     entries.forEach((entry, i) => {
       for (let k = 1; k <= entry.hosts; k++) {
         const slot = `${i}.${k}`;
         slots.add(slot);
+        if (wanted && !wanted[i]) continue;
         const mine = live.filter((r) => r.slot === slot && r.provider === entry.provider);
         const ready = mine.filter((r) => r.state === "ready");
         const joining = mine.filter((r) => (JOINING as readonly string[]).includes(r.state));

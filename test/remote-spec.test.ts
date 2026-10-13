@@ -31,7 +31,7 @@ describe("remote bench spec", () => {
   it("parses an entry with defaults", () => {
     const { spec, warnings } = ok(withRemote());
     expect(spec.oracle.remote_bench).toEqual([
-      { provider: "bench-provider-local", hosts: 2, cores: 4, lifetime_minutes: 60, seed: "scripts/seed.sh", seed_allow: [], setup: "scripts/setup.sh", env: { LANG: "C.UTF-8" }, gates: false },
+      { provider: "bench-provider-local", hosts: 2, cores: 4, lifetime_minutes: 60, seed: "scripts/seed.sh", seed_allow: [], setup: "scripts/setup.sh", env: { LANG: "C.UTF-8" }, gates: false, idle_release_minutes: 10 },
     ]);
     expect(warnings.join("\n")).toMatch(/only remote machines measure/u);
     expect(ok(DETERMINISTIC_SPEC).spec.oracle.remote_bench).toEqual([]);
@@ -63,7 +63,7 @@ describe("remote bench spec", () => {
     expect(oracleHash(normalizeSpec(stored))).toBe("8c0b5b606b195eed");
     const base = oracleHash(ok(withRemote()).spec);
     expect(base).not.toBe(oracleHash(ok(withRemote("")).spec));
-    const ops = withRemote(REMOTE.replace("hosts = 2", "hosts = 3").replace("lifetime_minutes = 60", 'lifetime_minutes = 90\nrotate_before_minutes = 15\ngates = true\nseed_allow = ["fixtures/**"]'));
+    const ops = withRemote(REMOTE.replace("hosts = 2", "hosts = 3").replace("lifetime_minutes = 60", 'lifetime_minutes = 90\nrotate_before_minutes = 15\ngates = true\nseed_allow = ["fixtures/**"]\nidle_release_minutes = 30'));
     expect(oracleHash(ok(ops).spec)).toBe(base);
     expect(oracleHash(ok(withRemote(REMOTE.replace("cores = 4", "cores = 8"))).spec)).not.toBe(base);
     expect(oracleHash(ok(withRemote(REMOTE.replace('setup = "scripts/setup.sh"', 'setup = "scripts/setup2.sh"'))).spec)).not.toBe(base);
