@@ -14,7 +14,7 @@ How each version was built: what it added, the decisions taken on the way, every
 | [v0.2.0](#v020-live-view-part-2) | The read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay, in two parts. |
 | [v0.1.0](#v010-guardrails-and-pre-release-fixes) | The first release: milestones M0 to M3, the human interface pass, and the guardrail and pre-release fixes. |
 
-## 1.0 (unreleased)
+## 1.0.0
 
 1.0 draws one line through the plugin. The plugin owns the **trust boundary**: every measurement and gate, verdicts and promotion to best, budgets, the bench machines (calibration, locks, remote hosts) and the evidence record; an agent asking "is X better than Y?" always gets the plugin's answer. **Agents** own judgment and prose: commit messages, and harvest (grouping, splitting, stacking, PR descriptions, publishing) with the repository's own tools. **The user owns the benchmark**: a study optimizes the benchmark it is given, and whether that benchmark represents production is the user's call; the plugin adds no consensus modes or platform warnings, and the holdout stays optional. Same platform pins (BB 0.45.x, SDK 0.6.14).
 
