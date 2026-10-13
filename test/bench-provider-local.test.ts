@@ -108,6 +108,7 @@ describe("local bench provider", () => {
       maxHosts: 3,
       maxLifetimeSeconds: 7200,
       cores: { min: 1, max: 2 },
+      machineOptions: [],
     });
     p.setAvailable(false, "maintenance");
     expect(await call(p, "benchProvider.describe", {})).toMatchObject({ available: false, reason: "maintenance" });

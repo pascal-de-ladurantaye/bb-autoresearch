@@ -44,6 +44,8 @@ lifetime_minutes = 30
   `done: true` once the process exited **and** the returned offsets reached
   the end of both streams, so a caller that keeps polling until `done` gets
   all output even when it exceeds `maxBytes`.
+- `describe` lists no machine options; `create` accepts an empty `machine` and
+  rejects any key with `[invalid] unknown machine option <key>`.
 - A machine past its expiry (creation time plus `lifetimeSeconds`, capped at
   `maxLifetimeSeconds`) becomes `gone`: its processes are killed and its
   directory removed. Expiry is checked on every call and by a sweep timer.

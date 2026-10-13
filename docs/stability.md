@@ -14,12 +14,18 @@ Every key the 1.0 spec schema accepts ([`src/spec.ts`](../src/spec.ts); the READ
 - Its **oracle hash** stays the same, so an upgrade never forces a recalibration or a new segment by itself. Defaults of keys that are part of the oracle hash don't change within 1.x; a new hashed key is left out of the hash when it is unset, as `remote_bench` was in v0.3.0.
 - New keys may be added, always optional, with defaults that keep 1.0 behavior. The schema is strict (an unknown key is an error), so a spec that uses a newer key needs that newer release.
 
-Keys new in 1.0, neither part of the oracle hash:
+Keys new in 1.0 that are not part of the oracle hash:
 
 | Key | Default | What it does |
 |---|---|---|
 | `[oracle] max_host_noise_ratio` | `2` | A bench host whose calibrated noise floor is more than this times the median of the other hosts' (and beyond what chance gives equal hosts) is left out: a remote machine is replaced, a local or BB host measures nothing until the next calibration. `0` turns it off; otherwise 1-100. |
 | `[oracle.health] recalibration_retries` | `30` | Health-check retries of an automatic recalibration, `retry_seconds` apart, before it pauses the study. |
+
+And one that is part of the oracle hash, left out of it when absent or empty so specs without it keep their hash:
+
+| Key | Default | What it does |
+|---|---|---|
+| `[[oracle.remote_bench]] machine` | none | Provider-specific machine options (an inline table), passed verbatim to `benchProvider.create` for every machine of the entry. |
 
 Deprecated in 1.0: the `[harvest]` keys (`measure_standalone`, `group_timeout_minutes`, `remote`) are still accepted, so stored specs keep parsing, and have no effect since harvest became a freeze. They will be removed in 2.0.
 
@@ -28,7 +34,8 @@ Deprecated in 1.0: the `[harvest]` keys (`measure_standalone`, `group_timeout_mi
 The eleven `benchProvider.*` methods, their input and output schemas, the error codes and the rules in [bench-providers.md](bench-providers.md) ([`src/bench-provider/contract.ts`](../src/bench-provider/contract.ts)) are frozen as `contractVersion: 1`:
 
 - Every 1.x release talks to a provider that implements v1.
-- The schemas are strict on both sides, so v1 never gains a field, a method or an error code. Any change is a new contract version, and 1.x keeps accepting v1 providers alongside it.
+- The schemas are strict on both sides, so from 1.0 on v1 gains no field, method or error code. Any change is a new contract version, and 1.x keeps accepting v1 providers alongside it.
+- 1.0 completed v1 with two optional fields: `create`'s `machine` (at most 32 keys matching `^[a-zA-Z][a-zA-Z0-9_]{0,63}$`, values strings of at most 256 characters, numbers or booleans) and `describe`'s `machineOptions` (`[{ name, description }]`). They are part of contract v1 as frozen for 1.x, with their rule: a provider rejects a machine option it doesn't understand with `[invalid] unknown machine option <key>`. bb-autoresearch sends `machine` only when a spec sets options, so a provider written before them works until a study asks for machine options; a provider that lists `machineOptions` needs bb-autoresearch 1.0 or newer (earlier releases' strict schema refuses the field).
 - What bb-autoresearch does with a provider (which labels it sets, when it creates, lists and destroys machines, the layout it uses under the remote home) is behavior, not contract: a provider must not depend on it beyond what bench-providers.md says.
 
 ### CLI commands and `--json`
@@ -91,6 +98,7 @@ A run (`{ run }`, and each of `{ runs }`):
     "gates": ["…"],
     "protocol": { "nMin", "nMax", "minEffect", "confidence" },
     "holdout": false,
+    "remoteBench": [{ "provider", "hosts", "cores", "memoryGb", "machine" }],  // machine: the options passed to create, or null
     "specVersion": 2
   },
   "git": {
@@ -106,7 +114,8 @@ A run (`{ run }`, and each of `{ runs }`):
   // noiseFloor/threshold: the noisiest measuring host's (each host's own are in benchHosts)
   "segments": [{ "k", "baseline", "oracleHash", "specVersion", "noiseFloor", "threshold", "evalSeconds", "startedAt", "auto" }],
   // each host's own win threshold (never below min_effect); excluded: why a host much noisier than its peers measures nothing until the next calibration (or null)
-  "benchHosts": [{ "id", "name", "mode": "shared|clone|remote", "active", "noiseFloor", "threshold", "sideRuns", "excluded" }],
+  // remote machines also have remote: { provider, cores, machine (the options it was created with, or null), reported (benchProvider.info's answer) }
+  "benchHosts": [{ "id", "name", "mode": "shared|clone|remote", "active", "noiseFloor", "threshold", "sideRuns", "excluded", "remote" }],
   "candidates": [{
     "n", "ref", "sha", "parentSha", "preparedSha", "againstSha", "promotedSha",
     "idea": { "id", "title", "theme" },          // or null

@@ -344,6 +344,8 @@ export interface RemoteHostRow {
   left_reason: string | null;
   home: string | null;
   info_json: string | null;
+  /** The machine options it was created with (JSON object), or null when the spec set none. */
+  machine_json: string | null;
   seed_sha: string | null;
   base_sha: string | null;
   join_seconds: number | null;
@@ -1170,14 +1172,14 @@ export class Store {
   }
 
   // ---- remote bench hosts (v0.3.0) ----
-  insertRemoteHost(row: Pick<RemoteHostRow, "study_id" | "entry" | "slot" | "provider" | "create_key" | "cores" | "memory_gb" | "lifetime_seconds" | "replaces"> & { name: string }): RemoteHostRow {
+  insertRemoteHost(row: Pick<RemoteHostRow, "study_id" | "entry" | "slot" | "provider" | "create_key" | "cores" | "memory_gb" | "lifetime_seconds" | "replaces"> & { name: string; machine_json?: string | null }): RemoteHostRow {
     return this.tx(() => {
       const r = this.db
         .prepare(
-          `INSERT INTO remote_hosts (study_id, entry, slot, provider, create_key, bench_host_id, state, replaces, cores, memory_gb, lifetime_seconds, created_at)
-           VALUES (?, ?, ?, ?, ?, '', 'creating', ?, ?, ?, ?, ?)`,
+          `INSERT INTO remote_hosts (study_id, entry, slot, provider, create_key, bench_host_id, state, replaces, cores, memory_gb, lifetime_seconds, created_at, machine_json)
+           VALUES (?, ?, ?, ?, ?, '', 'creating', ?, ?, ?, ?, ?, ?)`,
         )
-        .run(row.study_id, row.entry, row.slot, row.provider, row.create_key, row.replaces, row.cores, row.memory_gb, row.lifetime_seconds, this.now());
+        .run(row.study_id, row.entry, row.slot, row.provider, row.create_key, row.replaces, row.cores, row.memory_gb, row.lifetime_seconds, this.now(), row.machine_json ?? null);
       const id = Number(r.lastInsertRowid);
       const benchId = `remote-${id}`;
       this.db.prepare(`UPDATE remote_hosts SET bench_host_id = ? WHERE id = ?`).run(benchId, id);

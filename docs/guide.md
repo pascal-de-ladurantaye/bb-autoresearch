@@ -23,7 +23,7 @@ Then the noise class, which decides the protocol:
 A few rules make an oracle trustworthy:
 
 - **Protect the harness.** List the benchmark and its tests under `[scope] protected`. Their content is hashed into the oracle: a worker can't edit them, and changing them yourself starts a new segment.
-- **Measure the real thing.** Run `measure` yourself first. Use the inputs and machine shape you care about; on remote machines, set `cores` to the production machine's core count.
+- **Measure the real thing.** Run `measure` yourself first. Use the inputs and machine shape you care about; on remote machines, set `cores` to the production machine's core count and `machine` to the node shape your workload runs on (machine type, SMT, CPU platform, image: whatever the provider lists).
 - **Guardrails** are secondary metrics with two limits: how much worse one change may make them than best (`max_regression`), and how much worse best may get over the whole study (`max_total_regression`). Both are judged on a CI.
 - **Holdout** (optional, `[oracle.holdout]`): a second workload kept on the bench host. It runs on every win before promotion; agents only learn pass or fail.
 
@@ -107,6 +107,7 @@ Machines lent by a bench provider plugin ([bench-providers.md](bench-providers.m
 provider = "bench-provider-local"   # the provider plugin's id
 hosts = 2                           # machines at a time
 cores = 8                           # match the production machine
+machine = { machine_type = "c3-standard-8", threads_per_core = 1 }   # the provider's machine options
 lifetime_minutes = 120              # capped by the provider
 seed = "scripts/build_seed.sh"      # runs here in a checkout of best; prints a directory or tarball to ship
 setup = "scripts/remote_setup.sh"   # runs on each machine after the seed is unpacked
@@ -118,6 +119,7 @@ gates = true                        # run the gates there too
 | `provider` | (required) | The bench provider plugin's id. |
 | `hosts` | 1 | Machines measuring at a time. While one rotates its slot has one more (never more than `hosts` + one replacement per slot). |
 | `cores`, `memory_gb` | (required), none | The machine shape. Match the production machine's core count: code that sizes thread pools from the visible CPU count behaves differently on a machine whose quota is lower (every command gets `AUTORESEARCH_CORES`, and the Bench tab warns when the counts differ). |
+| `machine` | none | What machine the provider creates: an inline table of provider-specific options (machine type, SMT off, CPU platform, image, …; at most 32 keys, values strings, numbers or booleans), passed verbatim to the provider's `create` for every machine of this entry. Calibration checks the keys against the options the provider lists and names the valid ones on a typo; a provider rejects a key it doesn't know. Part of the oracle hash: changing it recalibrates. The Bench tab and `bb study bench` show what was asked for and what each machine reports. |
 | `lifetime_minutes` | 120 | How long a machine lives, capped by the provider's maximum. |
 | `rotate_before_minutes` | a fifth of the lifetime, at least 1.5× the last join plus one evaluation | When the replacement starts. It joins and calibrates first; the old machine then takes no new work and is destroyed once nothing runs on it. |
 | `seed` | none | A command run on the edit host in a checkout of the segment's baseline that prints the path of a directory or tarball (toolchains, dependency caches, vendored packages). Built once per segment baseline and seed inputs (the command, `seed_allow`, `cores`), packed and cached by content hash, uploaded to each machine and unpacked; `AUTORESEARCH_SEED` points at it. |

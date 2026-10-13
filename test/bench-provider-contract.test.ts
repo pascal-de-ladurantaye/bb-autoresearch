@@ -30,6 +30,42 @@ describe("bench provider contract", () => {
     expect(put.safeParse({ bytes: 3, sha256: "nope" }).success).toBe(false);
   });
 
+  it("machine options: optional on create, keys and values bounded, listed by describe", () => {
+    const create = benchProviderContract["benchProvider.create"].input;
+    const base = { key: "k", cores: 4, lifetimeSeconds: 60, labels: {} };
+    expect(create.safeParse(base).success).toBe(true);
+    expect(create.safeParse({ ...base, machine: {} }).success).toBe(true);
+    expect(create.safeParse({ ...base, machine: { machine_type: "c3-standard-8", smt: false, threads_per_core: 1 } }).success).toBe(true);
+    for (const bad of [{ "1type": "x" }, { "bad-key": "x" }, { ["k".repeat(65)]: "x" }, { image: "x".repeat(257) }, { nested: { a: 1 } }, { list: ["a"] }]) {
+      expect(create.safeParse({ ...base, machine: bad }).success, JSON.stringify(bad).slice(0, 40)).toBe(false);
+    }
+    expect(create.safeParse({ ...base, machine: Object.fromEntries(Array.from({ length: 32 }, (_, i) => [`k${i}`, i])) }).success).toBe(true);
+    expect(create.safeParse({ ...base, machine: Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`k${i}`, i])) }).success).toBe(false);
+    const d = benchProviderContract["benchProvider.describe"].output;
+    const v1 = { contractVersion: 1, displayName: "x", available: true, maxHosts: null, maxLifetimeSeconds: null, cores: null };
+    expect(d.safeParse({ ...v1, machineOptions: [{ name: "machine_type", description: "The machine type" }] }).success).toBe(true);
+    expect(d.safeParse({ ...v1, machineOptions: [{ name: "bad-name", description: "" }] }).success).toBe(false);
+  });
+
+  it("the example provider lists no machine options, accepts an empty machine, and rejects unknown keys", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { createLocalBenchProvider } = await import("../examples/bench-provider-local/provider.ts");
+    const root = mkdtempSync(join(tmpdir(), "ar-machine-opts-"));
+    const p = createLocalBenchProvider({ root, sweepMs: 0 });
+    const caller = { experimental_caller: { kind: "plugin" as const, pluginId: "bb-autoresearch" } };
+    try {
+      expect((await p.handlers["benchProvider.describe"]({}, caller)).machineOptions).toEqual([]);
+      const ok = await p.handlers["benchProvider.create"]({ key: "a", cores: 1, lifetimeSeconds: 60, labels: {}, machine: {} }, caller);
+      expect(ok.state).toBe("ready");
+      await expect(p.handlers["benchProvider.create"]({ key: "b", cores: 1, lifetimeSeconds: 60, labels: {}, machine: { smt: false } }, caller)).rejects.toThrow(/^\[invalid\] unknown machine option smt$/u);
+    } finally {
+      p.dispose();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("finds the error code after BB's prefix; no code is internal", () => {
     expect(errorCode(new Error("HTTP 500: [invalid] caller not allowed"))).toBe("invalid");
     expect(errorCode(providerError("capacity", "full"))).toBe("capacity");

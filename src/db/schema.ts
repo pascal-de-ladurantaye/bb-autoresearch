@@ -553,4 +553,6 @@ export const MIGRATIONS: string[] = [
   // ---- 1.0 integration ----
   /** Consecutive noisy replacements per remote entry (RemoteFleet.noisyOnArrival), kept across a plugin reload. */
   `ALTER TABLE studies ADD COLUMN remote_noisy_json TEXT`,
+  /** The machine options a remote machine was created with (`[[oracle.remote_bench]] machine`, JSON), next to info_json (what it reported). */
+  `ALTER TABLE remote_hosts ADD COLUMN machine_json TEXT`,
 ];

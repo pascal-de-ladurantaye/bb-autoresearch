@@ -243,6 +243,12 @@ export class RemoteFleet {
       }
       if (v.maxHosts !== null && e.hosts > v.maxHosts) problems.push(`${where}: hosts = ${e.hosts}, but ${v.displayName} allows at most ${v.maxHosts} machines`);
       if (v.cores && (e.cores < v.cores.min || e.cores > v.cores.max)) problems.push(`${where}: cores = ${e.cores}, but ${v.displayName} offers ${v.cores.min} to ${v.cores.max}`);
+      // Machine options: checked against the keys the provider lists (a provider that lists none checks them itself at create).
+      if (v.machineOptions && e.machine) {
+        const known = new Set(v.machineOptions.map((o) => o.name));
+        const unknown = Object.keys(e.machine).filter((k) => !known.has(k));
+        if (unknown.length) problems.push(`${where}: unknown machine option${unknown.length > 1 ? "s" : ""} ${unknown.join(", ")}; ${v.displayName} accepts ${v.machineOptions.length ? v.machineOptions.map((o) => o.name).join(", ") : "no machine options"}`);
+      }
       if (v.maxLifetimeSeconds !== null && e.lifetime_minutes * 60 > v.maxLifetimeSeconds) {
         warnings.push(`${where}: lifetime_minutes = ${e.lifetime_minutes} is capped at ${v.displayName}'s maximum of ${Math.floor(v.maxLifetimeSeconds / 60)} minutes`);
       }
@@ -400,6 +406,8 @@ export class RemoteFleet {
       lifetime_seconds: this.lifetimeSeconds(entry),
       replaces,
       name: "",
+      // An empty table is the provider's default: not sent, so a provider whose schema predates `machine` keeps working.
+      machine_json: entry.machine && Object.keys(entry.machine).length ? JSON.stringify(entry.machine) : null,
     });
     const name = `${entry.provider} #${row.id}`;
     this.store.tx(() => {
@@ -590,7 +598,9 @@ export class RemoteFleet {
     if (signal.aborted) return;
     const client = this.client(row0.provider);
     this.phase(rowId, "creating the machine", { state: "joining" });
-    const created = await client.call("benchProvider.create", { key: row0.create_key, cores: row0.cores, ...(row0.memory_gb !== null ? { memoryGb: row0.memory_gb } : {}), lifetimeSeconds: row0.lifetime_seconds, labels: { ...OWNER_LABEL, study: study.id, slot: row0.slot } }, { retries: 3, signal });
+    // The study's machine options, verbatim, as recorded when the row was made (a spec change applies to new machines).
+    const machine = safeJson<Record<string, string | number | boolean>>(row0.machine_json);
+    const created = await client.call("benchProvider.create", { key: row0.create_key, cores: row0.cores, ...(row0.memory_gb !== null ? { memoryGb: row0.memory_gb } : {}), lifetimeSeconds: row0.lifetime_seconds, labels: { ...OWNER_LABEL, study: study.id, slot: row0.slot }, ...(machine ? { machine } : {}) }, { retries: 3, signal });
     const providerExp = created.expiresAt ? Date.parse(created.expiresAt) : NaN;
     const ownExp = this.ctx.now() + row0.lifetime_seconds * 1000;
     this.assignedAt.set(rowId, Date.now());

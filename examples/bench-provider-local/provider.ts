@@ -322,6 +322,8 @@ export function createLocalBenchProvider(opts: LocalBenchProviderOptions = {}): 
       maxHosts,
       maxLifetimeSeconds,
       cores: { ...cores },
+      // Local directories have no machine options: `create` accepts an empty `machine` and rejects any key.
+      machineOptions: [],
     })),
 
     "benchProvider.create": guard("benchProvider.create", (input) => {
@@ -329,6 +331,8 @@ export function createLocalBenchProvider(opts: LocalBenchProviderOptions = {}): 
         if (m.key === input.key) return { hostId: m.hostId, state: m.state, expiresAt: iso(m.expiresAt) };
       }
       if (!available) throw providerError("transient", `provider unavailable${unavailableReason ? `: ${unavailableReason}` : ""}`);
+      const unknown = Object.keys(input.machine ?? {})[0];
+      if (unknown !== undefined) throw providerError("invalid", `unknown machine option ${unknown}`);
       if (input.cores < cores.min || input.cores > cores.max) {
         throw providerError("invalid", `cores must be between ${cores.min} and ${cores.max}`);
       }

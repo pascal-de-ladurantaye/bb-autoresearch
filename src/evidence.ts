@@ -149,6 +149,8 @@ export async function studyEvidence(ctx: Ctx, study: StudyRow, spec: StudySpec, 
       gates: [...spec.oracle.gate],
       protocol: { nMin: spec.oracle.protocol.n_min, nMax: spec.oracle.protocol.n_max, minEffect: spec.oracle.protocol.min_effect, confidence: spec.oracle.protocol.confidence },
       holdout: Boolean(spec.oracle.holdout),
+      /** The remote bench entries: provider, machines at a time, the shape asked for, and the machine options passed to create. */
+      remoteBench: (spec.oracle.remote_bench ?? []).map((e) => ({ provider: e.provider, hosts: e.hosts, cores: e.cores, memoryGb: e.memory_gb ?? null, machine: e.machine && Object.keys(e.machine).length ? { ...e.machine } : null })),
       specVersion: study.spec_version,
     },
     git: {
@@ -175,7 +177,21 @@ export async function studyEvidence(ctx: Ctx, study: StudyRow, spec: StudySpec, 
       auto: Boolean(safeJson<{ auto?: boolean }>(g.details_json)?.auto),
     })),
     /** Each host decides with its own win threshold (never below min_effect); `excluded` is why a host much noisier than its peers measures nothing until the next calibration. */
-    benchHosts: benchHosts.map((h) => ({ id: h.host_id, name: h.name, mode: h.mode, active: h.active === 1, noiseFloor: h.noise_floor, threshold: h.mde === null ? null : measurementMde(store, study, spec, h), sideRuns: h.side_runs, excluded: safeJson<{ reason?: string }>(h.excluded_json)?.reason ?? null })),
+    benchHosts: benchHosts.map((h) => {
+      // A remote machine: the machine options it was created with, and what it reported (benchProvider.info).
+      const remote = h.mode === "remote" ? store.remoteHostByBench(study.id, h.host_id) : undefined;
+      return {
+        id: h.host_id,
+        name: h.name,
+        mode: h.mode,
+        active: h.active === 1,
+        noiseFloor: h.noise_floor,
+        threshold: h.mde === null ? null : measurementMde(store, study, spec, h),
+        sideRuns: h.side_runs,
+        excluded: safeJson<{ reason?: string }>(h.excluded_json)?.reason ?? null,
+        ...(remote ? { remote: { provider: remote.provider, cores: remote.cores, machine: safeJson<Record<string, string | number | boolean>>(remote.machine_json), reported: safeJson<Record<string, unknown>>(remote.info_json) } } : {}),
+      };
+    }),
     candidates: candidates.map((c) => candidateOut(ctx, study, c, ideas, findingsBy.get(c.id) ?? [], Boolean(opts.samples))),
     findings: findings.map((f) => ({ id: f.id, candidate: f.candidate_id !== null ? (store.candidate(f.candidate_id)?.n ?? null) : null, idea: f.idea_id, outcome: f.outcome, learned: f.learned, revisitIf: f.revisit_if || null, evidence: f.evidence || null, at: f.created_at })),
     ideas: ideaRows.map((i) => ({ id: i.id, title: i.title, theme: i.theme, status: i.status, source: i.source })),

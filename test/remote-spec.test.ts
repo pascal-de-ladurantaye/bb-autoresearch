@@ -69,6 +69,22 @@ describe("remote bench spec", () => {
     expect(oracleHash(ok(withRemote(REMOTE.replace('setup = "scripts/setup.sh"', 'setup = "scripts/setup2.sh"'))).spec)).not.toBe(base);
   });
 
+  it("machine options: an inline table passed verbatim; hashed when set, so specs without it keep their hash", () => {
+    // The hash this spec had before machine options existed (v0.3.x and the rest of 1.0).
+    expect(oracleHash(ok(withRemote()).spec)).toBe("99cf09db8cf48db2");
+    expect(oracleHash(ok(withRemote(`${REMOTE}machine = {}\n`)).spec)).toBe("99cf09db8cf48db2");
+    const shaped = ok(withRemote(`${REMOTE}machine = { machine_type = "c3-standard-8", smt = false, threads_per_core = 1 }\n`)).spec;
+    expect(shaped.oracle.remote_bench[0]!.machine).toEqual({ machine_type: "c3-standard-8", smt: false, threads_per_core: 1 });
+    expect(oracleHash(shaped)).not.toBe("99cf09db8cf48db2");
+    const other = ok(withRemote(`${REMOTE}machine = { machine_type = "c3-standard-4", smt = false, threads_per_core = 1 }\n`)).spec;
+    expect(oracleHash(other)).not.toBe(oracleHash(shaped));
+    const bad = (m: string) => parseSpec(withRemote(`${REMOTE}machine = ${m}\n`)).ok;
+    expect(bad('{ "bad-key" = "x" }')).toBe(false);
+    expect(bad(`{ image = "${"x".repeat(257)}" }`)).toBe(false);
+    expect(bad("{ nested = { a = 1 } }")).toBe(false);
+    expect(bad(`{ ${Array.from({ length: 33 }, (_, i) => `k${i} = ${i}`).join(", ")} }`)).toBe(false);
+  });
+
   it("no bench_hosts with remote machines means remote only; gates on remote turn single-machine mode off", () => {
     expect(resolveBenchHosts([], [], "host_e", { remote: true })).toEqual({ ok: true, hosts: [] });
     expect(resolveBenchHosts([], [], "host_e")).toMatchObject({ ok: true, hosts: [{ entry: "local" }] });

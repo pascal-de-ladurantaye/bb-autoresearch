@@ -49,6 +49,7 @@ export function RemoteBench({ v, onOpenCandidate, now = Date.now() }: { v: Remot
               {e.setup ? " · setup runs on each machine" : ""}
               {v.baseBundle ? ` · repository ${bytes(v.baseBundle.bytes)} (shallow at the study base)` : ""}
             </div>
+            {e.machine ? <div className="text-xs text-muted-foreground">machine: {Object.entries(e.machine).map(([k, x]) => `${k}=${String(x)}`).join(", ")}</div> : null}
             {e.blocked ? <div className="text-xs text-warning-text">⚠ no new machine: {e.blocked}</div> : null}
           </li>
         ))}
@@ -79,6 +80,13 @@ export function RemoteBench({ v, onOpenCandidate, now = Date.now() }: { v: Remot
                 {m.joinSeconds !== null ? ` · joined in ${duration(m.joinSeconds)}` : ""} · {m.measured} measured
                 {m.shape ? ` · ${m.shape.os}/${m.shape.arch}${m.shape.cpuModel ? ` · ${m.shape.cpuModel}` : ""}` : ""}
               </div>
+              {m.machine || (m.shape && Object.keys(m.shape.extra).length) ? (
+                <div className="text-xs text-muted-foreground">
+                  {m.machine ? `asked for: ${Object.entries(m.machine).map(([k, x]) => `${k}=${String(x)}`).join(", ")}` : ""}
+                  {m.machine && m.shape && Object.keys(m.shape.extra).length ? " · " : ""}
+                  {m.shape && Object.keys(m.shape.extra).length ? `reports: ${Object.entries(m.shape.extra).slice(0, 12).map(([k, x]) => `${k}=${x}`).join(", ")}` : ""}
+                </div>
+              ) : null}
               {m.shapeWarning ? <div className="text-xs text-warning-text">⚠ {m.shapeWarning}</div> : null}
             </li>
           ))}

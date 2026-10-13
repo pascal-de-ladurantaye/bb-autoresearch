@@ -21,7 +21,9 @@ export interface RemoteMachineView {
   cores: number;
   memoryGb: number | null;
   /** What the machine reports: OS, arch, CPU model, visible CPUs and quota. */
-  shape: { os: string; arch: string; cpuModel: string | null; nproc: number | null; quota: number | null; memoryGb: number | null } | null;
+  shape: { os: string; arch: string; cpuModel: string | null; nproc: number | null; quota: number | null; memoryGb: number | null; extra: Record<string, string> } | null;
+  /** The machine options it was created with (the spec's `machine`), or null. */
+  machine: Record<string, string | number | boolean> | null;
   /** The visible CPU count differs from the cores asked for (thread pools sized from it would differ from the target machine). */
   shapeWarning: string | null;
   createdAt: number;
@@ -48,6 +50,8 @@ export interface RemoteEntryView {
   hosts: number;
   cores: number;
   memoryGb: number | null;
+  /** The machine options new machines are created with (`machine` in the spec), or null. */
+  machine: Record<string, string | number | boolean> | null;
   lifetimeMinutes: number;
   rotateLeadMinutes: number;
   gates: boolean;
@@ -88,7 +92,7 @@ export function remoteView(engine: Engine, s: StudyRow, spec: StudySpec | null):
   const gating = store.benchIntervals(s.id, { since: now }).filter((i) => i.kind === "gate" && i.ended_at === null);
   const names = new Map(store.benchHosts(s.id, { all: true }).map((h) => [h.host_id, h.name] as const));
   const machines = rows.map((r): RemoteMachineView => {
-    const info = safeJson<{ os?: string; arch?: string; cpuModel?: string | null; nproc?: number | null; cpuQuotaCores?: number | null; memoryBytes?: number | null }>(r.info_json);
+    const info = safeJson<{ os?: string; arch?: string; cpuModel?: string | null; nproc?: number | null; cpuQuotaCores?: number | null; memoryBytes?: number | null; extra?: Record<string, string> }>(r.info_json);
     const cal = safeJson<{ noiseFloor?: number; mde?: number; sideRuns?: number | null; runSeconds?: number | null; sha?: string; at?: number }>(r.calibration_json);
     const replacedBy = rows.find((x) => x.replaces === r.id)?.id ?? null;
     const entry = entries[r.entry];
@@ -129,7 +133,8 @@ export function remoteView(engine: Engine, s: StudyRow, spec: StudySpec | null):
       phase: r.phase,
       cores: r.cores,
       memoryGb: r.memory_gb,
-      shape: info ? { os: info.os ?? "?", arch: info.arch ?? "?", cpuModel: info.cpuModel ?? null, nproc, quota, memoryGb: info.memoryBytes ? Math.round((info.memoryBytes / 2 ** 30) * 10) / 10 : null } : null,
+      shape: info ? { os: info.os ?? "?", arch: info.arch ?? "?", cpuModel: info.cpuModel ?? null, nproc, quota, memoryGb: info.memoryBytes ? Math.round((info.memoryBytes / 2 ** 30) * 10) / 10 : null, extra: info.extra ?? {} } : null,
+      machine: safeJson<Record<string, string | number | boolean>>(r.machine_json),
       shapeWarning,
       createdAt: r.created_at,
       readyAt: r.ready_at,
@@ -160,6 +165,7 @@ export function remoteView(engine: Engine, s: StudyRow, spec: StudySpec | null):
         hosts: e.hosts,
         cores: e.cores,
         memoryGb: e.memory_gb ?? null,
+        machine: e.machine && Object.keys(e.machine).length ? { ...e.machine } : null,
         lifetimeMinutes: e.lifetime_minutes,
         rotateLeadMinutes: Math.round(engine.fleet.rotationLeadMs(s, i, e) / 6_000) / 10,
         gates: e.gates,
@@ -194,6 +200,7 @@ export function remoteLines(v: RemoteView, now: number): string[] {
     out.push(
       `Remote bench ${e.index + 1}: ${e.provider} · ${e.hosts} machine(s) × ${e.cores} cores${e.memoryGb ? `, ${e.memoryGb} GB` : ""} · ${e.lifetimeMinutes} min each, replaced ${e.rotateLeadMinutes} min before the end${e.gates ? " · gates run there" : ""}${e.seed ? ` · seed ${e.seed.state}${e.seed.bytes !== null ? ` (${e.seed.bytes < 10_240 ? `${e.seed.bytes} B` : `${Math.round(e.seed.bytes / 1024)} KiB`})` : ""}` : ""}`,
     );
+    if (e.machine) out.push(`  machine: ${machineText(e.machine)}`);
     if (e.seed?.detail) out.push(`  seed: ${e.seed.detail}`);
     if (e.blocked) out.push(`  no new machine: ${e.blocked}`);
   }
@@ -201,9 +208,21 @@ export function remoteLines(v: RemoteView, now: number): string[] {
     const cal = m.calibration?.noiseFloor !== null && m.calibration?.noiseFloor !== undefined ? ` · noise ${(m.calibration.noiseFloor * 100).toFixed(2)}%, win threshold ${((m.calibration.mde ?? 0) * 100).toFixed(2)}%` : "";
     const exp = m.expiresAt !== null ? ` · ends in ${minutes(Math.max(0, m.expiresAt - now))}` : "";
     out.push(`  ${m.name} (slot ${m.slot}, ${m.cores} cores${m.shape?.nproc ? `, ${m.shape.nproc} CPUs visible` : ""}): ${m.stateText}${exp}${cal}${m.rotation ? ` · ${m.rotation}` : ""} · measured ${m.measured}`);
+    if (m.shape) out.push(`    reports: ${shapeText(m.shape)}`);
     if (m.shapeWarning) out.push(`    note: ${m.shapeWarning}`);
   }
   const gone = v.machines.filter((x) => x.state === "gone").slice(0, 5);
   if (gone.length) out.push(`  recently gone: ${gone.map((m) => `#${m.id} (${m.leftReason ?? "left"})`).join("; ")}`);
   return out;
+}
+
+/** Machine options in one line: "machine_type=c3-standard-8, smt=false". */
+export function machineText(m: Record<string, string | number | boolean>): string {
+  return Object.entries(m).map(([k, v]) => `${k}=${String(v)}`).join(", ");
+}
+
+/** What a machine reported (`benchProvider.info`) in one line. */
+export function shapeText(s: NonNullable<RemoteMachineView["shape"]>): string {
+  const extra = Object.entries(s.extra).slice(0, 12).map(([k, v]) => `${k}=${v.length > 80 ? `${v.slice(0, 80)}…` : v}`);
+  return [`${s.os}/${s.arch}`, s.cpuModel, s.nproc !== null ? `${s.nproc} CPUs` : null, s.quota !== null ? `quota ${s.quota}` : null, s.memoryGb !== null ? `${s.memoryGb} GB` : null, ...extra].filter(Boolean).join(", ");
 }

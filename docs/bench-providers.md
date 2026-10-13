@@ -16,7 +16,10 @@ handlers)`. [`examples/bench-provider-local/`](../examples/bench-provider-local/
 is a complete provider against local temp directories and child processes.
 
 This is contract version **1**. A change to the contract needs a new
-`contractVersion`.
+`contractVersion`. bb-autoresearch 1.0 completed v1 with two optional fields,
+`create`'s `machine` and `describe`'s `machineOptions`: it sends `machine`
+only when a study sets machine options, and a provider that returns
+`machineOptions` needs bb-autoresearch 1.0 or newer.
 
 ## Rules for providers
 
@@ -36,6 +39,19 @@ This is contract version **1**. A change to the contract needs a new
   home unless absolute. Create missing parent directories as the remote user.
 - **Labels.** Every machine carries the caller's `labels`, so `list` can find
   orphans.
+- **Machine options.** `create` may carry `machine`: what machine the study
+  wants (machine type, SMT off, CPU platform, image, …), as provider-specific
+  keys with string, number or boolean values. It is the study's choice, per
+  machine, not a provider-wide setting. List the keys you accept in
+  `describe`'s `machineOptions` (`[{ name, description }]`; bb-autoresearch
+  checks a spec's keys against it when the study is calibrated). Apply them
+  when the machine is created. Reject any key you don't understand with
+  `[invalid] unknown machine option <key>`, so a typo fails loudly instead of
+  benching on the wrong machine; an absent or empty `machine` means your
+  default. `info` reports what the machine actually is (its `extra` is the
+  place for the machine type, SMT state, CPU platform, image), and
+  bb-autoresearch records it next to what was asked for. `cores` stays the
+  cores bb-autoresearch plans threads for and checks against `info`.
 
 ## Methods
 
@@ -43,8 +59,8 @@ All JSON in, JSON out.
 
 | Method | Input | Output |
 |---|---|---|
-| `benchProvider.describe` | `{}` | `{ contractVersion: 1, displayName, available, reason?, maxHosts: number \| null, maxLifetimeSeconds: number \| null, cores: { min, max } \| null }` |
-| `benchProvider.create` | `{ key, cores, memoryGb?, lifetimeSeconds, labels }`; `key` is an idempotency key: the same key returns the same machine | `{ hostId, state, expiresAt: string \| null }` |
+| `benchProvider.describe` | `{}` | `{ contractVersion: 1, displayName, available, reason?, maxHosts: number \| null, maxLifetimeSeconds: number \| null, cores: { min, max } \| null, machineOptions?: [{ name, description }] }` |
+| `benchProvider.create` | `{ key, cores, memoryGb?, lifetimeSeconds, labels, machine? }`; `key` is an idempotency key: the same key returns the same machine; `machine` has at most 32 keys matching `^[a-zA-Z][a-zA-Z0-9_]{0,63}$`, each a string (at most 256 characters), number or boolean | `{ hostId, state, expiresAt: string \| null }` |
 | `benchProvider.status` | `{ hostId }` | `{ state, expiresAt: string \| null, detail? }` |
 | `benchProvider.list` | `{ labels }` (match all given labels) | `{ hosts: [{ hostId, state, expiresAt, labels }] }` |
 | `benchProvider.destroy` | `{ hostId }` | `{ ok }`; idempotent, `ok: true` if already gone |
@@ -100,8 +116,8 @@ replacement):
    it is scanned for credentials and packed (cached by content hash). A
    shallow git bundle of the study base is built once. A refused seed costs no
    machine.
-2. `create` with labels `owner`, `study` and `slot`, then `status` until
-   `ready`, then `info`.
+2. `create` with labels `owner`, `study` and `slot` and the entry's
+   `machine` options (verbatim), then `status` until `ready`, then `info`.
 3. `putFile` the seed and unpack it under `~/bb-autoresearch/seed/<sha256>`;
    `putFile` the base bundle and fetch it into a bare repository at
    `~/bb-autoresearch/repo.git` (shallow at the base). Best and every

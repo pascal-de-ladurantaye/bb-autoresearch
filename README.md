@@ -66,7 +66,20 @@ this machine (single-machine mode keeps tests out of the way of timing runs),
 on another BB machine, or on short-lived remote machines lent by a
 [bench provider](docs/bench-providers.md) plugin;
 [`examples/bench-provider-local/`](examples/bench-provider-local/) is one for
-local temp directories. Each bench host decides with its own win threshold,
+local temp directories. The study picks the remote machine itself, per
+`[[oracle.remote_bench]]` entry: `cores` plus a `machine` table of provider
+options (machine type, SMT off, CPU platform, image, …) passed to the provider
+as is, so it can bench on the node shape its workload runs on in production:
+
+```toml
+[[oracle.remote_bench]]
+provider = "my-cloud-provider"
+hosts = 2
+cores = 8
+machine = { machine_type = "c3-standard-8", threads_per_core = 1, image = "bench-2026-10" }
+```
+
+Each bench host decides with its own win threshold,
 and one much noisier than the others is left out. The plugin never pushes:
 your agent publishes when you ask. Every candidate stays under
 `refs/studies/<slug>/c/<n>`.
@@ -85,7 +98,7 @@ your agent publishes when you ask. Every candidate stays under
 | `bb study concurrency <slug> <n\|auto>` | Lower max workers (clamped to the spec) |
 | `bb study ideas add <slug> "<title>" [...]` / `ideas list <slug>` | The idea board |
 | `bb study workers <slug>` | Worker threads |
-| `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration), health checks, bundle transfers, drift checks, segments, seeds and base bundles on disk |
+| `bb study bench <slug>` | Bench hosts (remote machines too: state, expiry, rotation, own calibration, the machine options asked for and what each machine reports), health checks, bundle transfers, drift checks, segments, seeds and base bundles on disk |
 | `bb study drift <slug>` | Request an A/A drift check on every bench host |
 | `bb study harvest <slug> [--wait] [--harvest N]` | Freeze best for harvest, or show the current (or an older) harvest |
 | `bb study evidence <slug> [--samples] [--candidates 3,7]` | Everything an agent needs to harvest, as stable JSON with `--json` (`bb-autoresearch/evidence` v1) |

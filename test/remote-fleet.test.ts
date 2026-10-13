@@ -18,6 +18,7 @@ import { liveView } from "../src/live.ts";
 import { remoteLines } from "../src/remote/view.ts";
 import { benchView } from "../src/views.ts";
 import { artifactLine } from "../src/cli.ts";
+import { studyEvidence } from "../src/evidence.ts";
 import { Clock, localRunner, makeCtx, waitFor, type FakePort } from "./helpers.ts";
 
 const SLUG = "toy-remote";
@@ -814,6 +815,54 @@ describe("remote bench hosts (example provider, real git)", () => {
     provider.kill(target.remote_id!);
     await until(() => ["done", "failed"].includes(store.adhocRun(pinned.id)!.state));
     expect(store.adhocRun(pinned.id)).toMatchObject({ state: "failed", error: expect.stringContaining("left during the measurement") });
+  });
+
+  it("1.0: machine options from the spec are checked against describe, passed verbatim to create, and recorded with what info reports", async () => {
+    setup();
+    // A provider with machine options (the example lists none): it records what create got and reports it back in info.
+    const asked = new Map<string, Record<string, unknown> | undefined>();
+    port.plugins.set("bench-provider-local", async (method, input) => {
+      const m = method as BenchProviderMethod;
+      const parsed = benchProviderContract[m].input.parse(input) as Record<string, unknown>;
+      const call = (i: unknown) => (provider.handlers[m] as (i: unknown, c: typeof CALLER) => Promise<unknown>)(i, CALLER);
+      if (m === "benchProvider.describe") return { ...((await call(parsed)) as object), machineOptions: [{ name: "machine_type", description: "The machine type" }, { name: "smt", description: "Simultaneous multithreading" }] };
+      if (m === "benchProvider.create") {
+        const { machine, ...rest } = parsed;
+        const out = (await call(rest)) as { hostId: string };
+        asked.set(out.hostId, machine as Record<string, unknown> | undefined);
+        return out;
+      }
+      if (m === "benchProvider.info") {
+        const out = (await call(parsed)) as { extra?: Record<string, string> };
+        const machine = asked.get(parsed.hostId as string) ?? {};
+        return { ...out, extra: { ...out.extra, ...Object.fromEntries(Object.entries(machine).map(([k, v]) => [k, String(v)])) } };
+      }
+      return await call(parsed);
+    });
+    // A typo fails calibration and names the keys the provider accepts; no machine is created.
+    await calibrated(spec({ remote: 'machine = { machine_typ = "toy-standard-4", smt = false }' }));
+    const failed = store.study(SLUG)!;
+    expect(failed.calibration_status).toBe("failed");
+    expect((JSON.parse(failed.calibration_json!) as { problems: string[] }).problems.join("\n")).toMatch(/remote bench 1 \(bench-provider-local\): unknown machine option machine_typ; .* accepts machine_type, smt/u);
+    expect(provider.calls()["benchProvider.create"] ?? 0).toBe(0);
+    // Fixed: both machines are created with exactly those options, and record them next to what they report.
+    await started(spec({ remote: 'machine = { machine_type = "toy-standard-4", smt = false }' }));
+    const sid = studyId();
+    const rows = ready();
+    expect(rows).toHaveLength(2);
+    for (const r of rows) {
+      expect(asked.get(r.remote_id!)).toEqual({ machine_type: "toy-standard-4", smt: false });
+      expect(JSON.parse(r.machine_json!)).toEqual({ machine_type: "toy-standard-4", smt: false });
+      expect(JSON.parse(r.info_json!).extra).toMatchObject({ machine_type: "toy-standard-4", smt: "false" });
+    }
+    const lines = remoteLines(benchView(engine, store.study(SLUG)!).remote, clock.now()).join("\n");
+    expect(lines).toMatch(/^  machine: machine_type=toy-standard-4, smt=false$/mu);
+    expect(lines).toMatch(/^    reports: .*machine_type=toy-standard-4, smt=false$/mu);
+    const ev = await studyEvidence(engine.ctx, store.study(SLUG)!, store.spec(store.study(SLUG)!));
+    expect(ev.study.remoteBench).toEqual([{ provider: "bench-provider-local", hosts: 2, cores: 1, memoryGb: null, machine: { machine_type: "toy-standard-4", smt: false } }]);
+    const host = ev.benchHosts.find((h) => h.id === rows[0]!.bench_host_id)!;
+    expect(host.remote).toMatchObject({ provider: "bench-provider-local", cores: 1, machine: { machine_type: "toy-standard-4", smt: false }, reported: { extra: { machine_type: "toy-standard-4" } } });
+    expect(store.segment(sid, 1)).toBeTruthy();
   });
 
   it("measures on local and remote hosts together, each with its own calibration", async () => {
