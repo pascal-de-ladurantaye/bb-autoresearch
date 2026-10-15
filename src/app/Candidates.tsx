@@ -103,7 +103,7 @@ function Table({ rows, metric, selected, onSelect }: { rows: CandidateView[]; me
               <td className="whitespace-nowrap px-3 py-2">
                 <VerdictBadge verdict={c.verdict} stage={c.stage} />
                 {c.rebases ? <span className="text-xs text-muted-foreground"> · rebased</span> : null}
-                {c.cause ? <div className="max-w-56 truncate text-xs text-muted-foreground" title={c.cause}>{c.cause}</div> : null}
+                {c.cause ? <div className="max-w-56 whitespace-normal break-words text-sm leading-relaxed text-muted-foreground">{c.cause}</div> : null}
               </td>
               <td className="px-3 py-2 text-right tabular-nums" title={c.effectText ?? undefined}>
                 {pct(c.effect)}

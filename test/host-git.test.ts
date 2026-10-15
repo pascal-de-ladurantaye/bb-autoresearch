@@ -145,7 +145,7 @@ describe("end to end with real git (LocalHostRunner)", () => {
     // Second submission from the same worktree after its own promotion.
     writeFileSync(join(wt, "bench/measure.sh"), "echo METRIC size=1\n");
     const rejected = await engine.submit("thr_w1", { title: "Edit the benchmark (should be rejected)" });
-    expect(rejected).toContain("REJECTED (scope)");
+    expect(rejected).toContain("Rejected (scope)");
     // Hermetic: every health check used the injected readings, never the machine's load.
     expect(runner.probes).toBeGreaterThan(0);
     expect(store.healthChecks(study.id).every((h) => h.ok === 1)).toBe(true);

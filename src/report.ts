@@ -12,7 +12,7 @@ import { changeWords, headroomWords, relativeWords, invertRegression, promotionC
 import { bestGuardrailPositions, guardrailChainBase, segmentGuardrailCalibration } from "./pipeline.ts";
 import { metricSnapshotOf } from "./snapshot.ts";
 import { hostThresholdsText } from "./host-choice.ts";
-import { amountText, bestHeadlineText, ciRangeText, ciText, clipWords, segmentRawText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
+import { amountText, bestHeadlineText, ciRangeText, ciText, clipWords, segmentRawText, compound, improvementText, magnitudePct, shareOfGain, sharePct, signedPct, verdictCause, vsBaseFromVsBest, type MetricInfo } from "./present.ts";
 import { clip, formatDuration, safeJson } from "./prompts.ts";
 import type { StudySpec } from "./spec.ts";
 
@@ -157,7 +157,8 @@ export function studyReport(ctx: Ctx, study: StudyRow, spec: StudySpec, harvest:
   for (const c of losses) {
     const reasons = safeJson<string[]>(c.reasons_json) ?? [];
     const finding = store.findings(study.id, { limit: 200 }).find((f) => f.candidate_id === c.id);
-    lines.push(`- c/${c.n} ${mdText(titles.get(c.idea_id ?? -1) ?? "", 100)}: **${c.verdict}** ${signedPct(c.effect)}${reasons[0] ? ` — ${mdText(reasons[0], 200)}` : ""}${finding ? `. Learned: ${mdText(finding.learned, 300)}` : ""}`);
+    const cause = verdictCause(c.verdict, reasons) ?? reasons[0];
+    lines.push(`- c/${c.n} ${mdText(titles.get(c.idea_id ?? -1) ?? "", 100)}: **${c.verdict}** ${signedPct(c.effect)}${cause ? ` — ${mdText(cause, 200)}` : ""}${finding ? `. Worker finding: ${mdText(finding.learned, 300)}` : ""}`);
   }
   if (spec.guardrail.length) lines.push("", ...guardrailSection(ctx, study, spec));
   lines.push("", "## Dossier", "");

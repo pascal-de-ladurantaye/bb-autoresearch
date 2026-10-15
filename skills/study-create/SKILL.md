@@ -34,7 +34,7 @@ Pick the noise class:
 
 Pick the bench hosts (`oracle.bench_hosts`): `["local"]` (default) measures in plugin checkouts on this machine. Any other entry is a BB machine name or host id (see `bb host list`); that machine keeps its own clone and receives commits as git bundles. A dedicated, quiet machine of the production architecture is best. When the bench host is this machine (the laptop case), **single-machine mode** (`oracle.single_machine`, default `"auto"`) turns on: gates take the same bench lock as measurements, one at a time, so tests never run while a candidate is timed. Size the gate for that: its time now counts as bench time per candidate. `quiet_bench = true` also holds new worker turns while a measurement runs. Ask whether there is a **holdout** workload that lives only on the bench host (a different input set): it is run on every win before promotion, and agents only learn pass/fail.
 
-**Remote machines** (`[[oracle.remote_bench]]`): when a bench provider plugin is installed (a BB plugin that lends short-lived machines; see docs/bench-providers.md in the bb-autoresearch repo, and `bb plugin list`), the study can measure on `hosts` machines from it at a time, each its own bench host with its own calibration. Ask which production node shape the workload runs on (machine type, cores, SMT on or off, CPU platform, image) and match it: set `cores` to its core count (code that sizes thread pools from the CPU count otherwise behaves differently there; every command gets `AUTORESEARCH_CORES`), and put the rest in `machine = { ... }`, an inline table of the provider's own options, passed to it verbatim. Use only keys the provider lists (its `describe` answer, or its README); calibration rejects unknown keys and names the valid ones. `machine` is part of the oracle hash. Machines live `lifetime_minutes` (capped by the provider) and are replaced before they end. They start from nothing: a shallow copy of the study base, plus what `seed` ships (a command run here in a checkout of best that prints the path of a directory or tarball: toolchains, dependency caches, vendored packages) and what `setup` does there (run in a checkout of best after the seed is unpacked, with `AUTORESEARCH_SEED` pointing at it). The seed is scanned for credentials before any upload and refused if anything matches: never put tokens, `.netrc`, SSH keys, cloud CLI configs or `.env` files in it; list known test fixtures in `seed_allow`. With `gates = true` the gates run on those machines too (so single-machine mode no longer serializes them here). With remote machines and no `bench_hosts`, only the remote machines measure; add `"local"` to measure here too. The holdout, if any, must reach the machines through the seed.
+**Remote machines:** read [remote bench setup](references/remote-bench.md) before choosing a provider or drafting `[[oracle.remote_bench]]`. It covers production hardware matching, credentials/seed safety, setup, holdout delivery, rotation and gate placement.
 
 Run `measure` once yourself to check the METRIC lines parse. If the harness lives in the repo, list its paths under `protected` (its content hash becomes part of the oracle).
 
@@ -42,106 +42,33 @@ Run `measure` once yourself to check the METRIC lines parse. If the harness live
 
 ```toml
 [study]
-slug = "parser-speed"            # 2-48 chars: lowercase, digits, dashes
+slug = "parser-speed"
 objective = "Reduce the time to parse the fixture corpus."
 base = "main"
 
 [metric]
 name = "parse_ms"
 unit = "ms"
-direction = "lower"              # lower | higher
-
-[[guardrail]]
-name = "rss_mb"
-max_regression = "5%"            # per step: vs the current best
-max_total_regression = "10%"     # in total: best vs the segment base (default: max_regression)
-direction = "lower"              # direction of "better" for this metric
+direction = "lower"
 
 [scope]
 editable = ["src/parser/**"]
 protected = ["bench/**", "test/**"]
-max_files = 20                   # optional, default 50
-max_lines = 800                  # optional, default 2000
-# optional: untracked build outputs and caches the snapshot never commits
-# (gitignore-style; setting it replaces the defaults below; [] turns it off)
-ignore = ["__pycache__/", "*.pyc", "*.pyo", ".pytest_cache/", "node_modules/", "dist/", "build/", "target/", ".DS_Store", "coverage/", ".coverage", ".nyc_output/", "htmlcov/"]
 
 [oracle]
-build = "make release"           # optional
+build = "make release"
 gate = ["make test-parser"]
 measure = "bench/parse.sh"
-noise = "noisy"                  # deterministic | noisy | expensive
-bench_hosts = ["local"]          # or BB machine names/ids: own clone, git bundles
-timeout_minutes = 20             # per command (runs as a host job; up to 1440)
-max_bundle_mib = 256             # optional: largest git bundle sent to a bench host
-offline_grace_minutes = 10       # optional: notify when a bench host stays offline
-single_machine = "auto"          # optional: auto | on | off. On: gates share the bench lock with measurements (auto: when a bench host is this machine)
-quiet_bench = false              # optional: hold new worker turns on the bench machine while a measurement runs
-
-[[oracle.remote_bench]]          # optional, repeatable: machines from a bench provider plugin
-provider = "bench-provider-local" # the provider plugin's id
-hosts = 2                        # machines measuring at a time (+1 replacement per slot while rotating)
-cores = 8                        # match the production machine
-machine = { machine_type = "c3-standard-8", threads_per_core = 1 }   # provider-specific options: the production node shape (optional)
-memory_gb = 16                   # optional
-lifetime_minutes = 120           # capped by the provider; replaced before the end
-rotate_before_minutes = 20       # optional: when the replacement starts (default: a fifth of the lifetime, at least 1.5x a join)
-seed = "scripts/build_seed.sh"   # optional: runs here in a checkout of best; prints a directory or tarball to ship
-seed_allow = ["vendor/cache/**"] # optional: seed paths the credential scan ignores (known test fixtures)
-setup = "scripts/remote_setup.sh" # optional: runs on each machine in a checkout of best, after the seed is unpacked
-env = { LANG = "C.UTF-8" }       # optional: environment for every command there
-gates = false                    # optional: run the gates on these machines too
-
-[oracle.holdout]                 # optional: hidden workload on the bench host
-measure = "/srv/holdout/parse.sh"   # prints METRIC lines like measure
-runs = 3                         # paired best/candidate runs
-max_regression = "1%"            # fail when the candidate is worse than this
-
-[oracle.health]                  # optional: checked before every measurement
-max_load = 0.8                   # 1-minute load per CPU
-max_process_cpu = 60             # % of one core for the busiest other process
-require_ac_power = true          # where detectable (laptops)
-retry_seconds = 60               # a deferred host waits this long
-
-[oracle.drift]                   # optional: A/A on best while running
-every = 10                       # evaluations per bench host (0 = off)
-pairs = 6
-max_ratio = 2                    # pause when noise > 2x calibrated
-recalibrate_below = 0.6          # best's runs under 60% of their calibrated time: recalibrate (no pause)
-
-[oracle.protocol]                # all optional
-n_min = 6                        # noisy: pairs before an early stop
-n_max = 20                       # noisy: pairs before inconclusive
-min_effect = "1%"                # floor for the win threshold
-max_mde = "20%"                  # calibration fails above this
-tolerance = "0%"                 # deterministic: required improvement
-confirm = true                   # noisy: re-measure wins before promotion
-skip_confirm_factor = 3          # noisy: no confirmation when the CI's low end is >= 3x the win threshold (0 = always)
-futility = true                  # noisy: stop as inconclusive once the CI's high end is below the win threshold
-early_lose_from = 3              # noisy: a clear loss stops from 3 pairs (0 = off)
-early_lose_confidence = 0.99     # ... when a t interval at this confidence is entirely below 0
-side_runs = "auto"               # noisy: measure runs per side (best per metric); "auto": >= min_side_seconds a side
-min_side_seconds = 5
-confirm_runs = 3                 # expensive: k confirmation runs
-calibration_runs = 5             # expensive: baseline runs at calibration
+noise = "noisy"
+bench_hosts = ["local"]
 
 [budget]
-max_workers = 3                  # W adapts up to this: min(max, ceil(think/eval)+1)
+max_workers = 3
 max_candidates = 50
 max_bench_hours = 8
-deadline = "2026-12-31"          # optional
-max_tokens = 5000000             # optional: tokens across the study's threads (as BB reports them)
-notify_at = [50, 80]             # budget shares (%) that raise a notice once
-
-[agents]
-worker = { permission_mode = "full" }   # optional: provider, model, permission_mode
-max_submissions_per_worker = 3
-max_rate_limit_retries = 3       # rate-limited turns retried at the window reset
-usage_tight_percent = 90         # a provider window at this % halves W
-
-[git]
-identity = "repo"                # optional: "repo" commits as the repo's git identity (falls back to the plugin's); "plugin" as autoresearch <autoresearch@bb.local>
 ```
+
+Replace the example paths and commands with ones verified in this repository. Read [spec options](references/spec-options.md) when adding guardrails, holdout, remote machines, health/drift settings, protocol overrides or advanced budgets. Include only what this study needs; omitted keys use the plugin’s defaults.
 
 The plugin commits each worker's worktree for it (`git add`), so a repo without a complete `.gitignore` would otherwise get build outputs committed into candidates, where they conflict. `[scope] ignore` lists them, gitignore-style: a pattern without a slash matches at any depth (`*.pyc`, `__pycache__/`), one with a slash is anchored at the repo root (`/out/`), and a trailing slash means a directory. Untracked files matching it are never committed; changes to tracked files always are; a candidate that adds a matching file anyway (the worker committed it itself) is rejected with instructions. If the repo keeps sources in a directory the defaults name (a `build/` of scripts, say), set `ignore` without that pattern; calibration warns when the base tracks files that match.
 
@@ -155,9 +82,10 @@ Call `study_propose` with the full TOML. If it returns errors, fix them and call
 
 Then tell the human, in two or three lines, that the study waits for them on the **Studies** page (sidebar → Studies → `<slug>`; the header badge of this thread links there):
 
-1. **Needs you → Approve spec vN and calibrate**: they review the spec on the Oracle tab and approve it in the app (CLI: `bb study calibrate <slug>`). Calibration runs the gates on the base commit, then A/A measurements, and reports the smallest win it can detect and the cost per evaluation.
-2. **Needs you → Approve and start** once calibration is ready (CLI: `bb study start <slug>`).
-3. Ideas can be seeded on the Ideas tab (or `bb study ideas add <slug> "<idea>"`) at any time.
+1. **Now — review the spec:** Studies → `<slug>` → Oracle. The human approves calibration (`bb study calibrate <slug>`); tests and baseline measurements run, but no worker starts yet.
+2. **Next — review calibration:** only when ready, the human approves starting workers (`bb study start <slug>`), which spends tokens and bench time.
+
+Keep optional idea seeding out of that handoff unless asked. Ideas can be added later on the Ideas tab or with `bb study ideas add`.
 
 Keep numbers in the plugin's convention: better is positive, in the metric's own terms ("12% lower p99", "+12%").
 

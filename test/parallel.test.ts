@@ -241,7 +241,7 @@ describe("M1 parallel study (fake host)", () => {
     const b = store.candidateByN(id, 2)!;
     expect(b.verdict).toBe("conflict");
     const msg = port.sent.filter((m) => m.threadId === "thr_w2").at(-1)!.text;
-    expect(msg).toContain("CONFLICT");
+    expect(msg).toContain("Conflict: no longer applies to best");
     expect(msg).toContain("git rebase studies/toy-noisy/best");
     expect(store.threadById("thr_w2")).toMatchObject({ submissions: 0, conflict_refunds: 1 });
     // The worker rebases onto best (its worktree head now descends from best) and resubmits.

@@ -146,7 +146,7 @@ describe("pipeline: the ignore list reaches the snapshot; the worker hears what 
     await engine.settle();
     host.nextSnapshot = { tree: "T2", changedPaths: ["src/a.py", "src/__pycache__/a.pyc"], addedPaths: ["src/__pycache__/a.pyc"] };
     const rejected = await engine.submit("thr_w1", { title: "second" });
-    expect(rejected).toContain("REJECTED (scope)");
+    expect(rejected).toContain("Rejected (scope)");
     expect(rejected).toContain("adds files the study ignores as build outputs or caches");
   });
 });

@@ -857,7 +857,7 @@ function CalmState({ v, onOpenOverview, onOpenCandidate, onReplay, now, compact 
       : v.state === "draft" || v.state === "calibrating"
         ? "The study hasn't started yet. Workers, candidates and the bench show up here once it runs."
         : v.state === "harvesting"
-          ? "The study is harvesting its wins into PRs; no worker is running."
+          ? "Harvest requested; no worker is running. Check the freeze on the Harvest tab, then ask an agent to prepare PRs. Nothing is published without your approval."
           : v.state === "archived"
             ? "The study is archived."
             : "Nothing is running right now.";

@@ -168,7 +168,7 @@ describe("v1 measurement quality (fake hosts)", () => {
 
   async function calibrated(toml: string) {
     const r = await engine.proposeStudy("thr_study", "proj_1", toml);
-    expect(r).toContain("drafted");
+    expect(r).toContain("Draft ready:");
     await engine.calibrate(SLUG, "human");
     await engine.waitForCalibration(SLUG, 10_000);
     return store.study(SLUG)!;

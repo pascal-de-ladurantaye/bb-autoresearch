@@ -1,6 +1,6 @@
 // In-app approval, start, harvest (a freeze) and archive (RPC), the
 // Needs-you derivation behind them, notices with actions, and the study
-// thread messages (one-line summary, agent-only detail).
+// thread messages (short summary, agent-only detail).
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAutoresearchPlugin } from "../server.ts";
@@ -192,7 +192,7 @@ describe("human interface: in-app actions and Needs you", () => {
     expect(noticeAction("harvest.frozen", study())).toMatchObject({ tab: "harvest" });
   });
 
-  it("study thread and worker messages: one-line summary for the human, the full detail agent-only", async () => {
+  it("study thread and worker messages: outcome and measurement for the human, the full detail agent-only", async () => {
     await harness.behavior.runCli(["calibrate", "toy-size", "--wait"]);
     await harness.behavior.runCli(["ideas", "add", "toy-size", "Shrink the output", "--theme", "size"]);
     await harness.behavior.runCli(["start", "toy-size"]);
@@ -202,7 +202,7 @@ describe("human interface: in-app actions and Needs you", () => {
     await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1" && m.text.includes("Verdict")));
     const verdict = port.sent.find((m) => m.threadId === "thr_w1" && m.text.includes("Verdict"))!;
-    expect(verdict.summary).toBe("[autoresearch] Verdict for c/1: WIN: promoted to best, 20.0% lower size than best.");
+    expect(verdict.summary).toBe("[autoresearch] Verdict for c/1: Win: promoted to best.\nEstimate: 20.0% lower size vs previous best (single run, no CI).");
     expect(verdict.agentOnly).toContain("study_record_finding");
     expect(verdict.agentOnly).toContain("Effect (better is positive): +20.00%");
     const round = port.sent.find((m) => m.threadId === "thr_study" && m.summary.startsWith("[autoresearch] Strategist round"))!;

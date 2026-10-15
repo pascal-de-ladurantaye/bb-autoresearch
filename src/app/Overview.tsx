@@ -15,6 +15,7 @@ import { ago, duration, formatValue, frac, nowHint, ratio, shortSha } from "./fo
 import { BenchHostList } from "./BenchHosts.tsx";
 import { Sparkline, TrajectoryChart } from "./TrajectoryChart.tsx";
 import { ordinal } from "../live-model.ts";
+import { bestCalculationText } from "../present.ts";
 import { EmptyState, GuardrailBadge, Mono, Section, Stat } from "./ui.tsx";
 import type { Tab } from "./StudiesPage.tsx";
 
@@ -55,6 +56,10 @@ export function OverviewTab({ o, rpc, onChanged, onOpenCandidate, go }: { o: Ove
                 {o.best.raw ? <span className="text-foreground">{o.best.raw}</span> : null}
                 {o.best.raw && o.best.ciText ? " · " : null}
                 {o.best.ciText}
+                <details className="mt-2 text-sm leading-relaxed">
+                  <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">How this gain is calculated</summary>
+                  <p className="mt-1 max-w-prose">{bestCalculationText(o.metric.direction, o.best.segments)}</p>
+                </details>
               </>
             ) : o.best.base !== null ? (
               `base ${formatValue(o.best.base)}${o.metric.unit ? ` ${o.metric.unit}` : ""}`

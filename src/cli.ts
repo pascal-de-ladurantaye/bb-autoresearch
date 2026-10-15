@@ -263,12 +263,14 @@ export function studyCli(engine: Engine): PluginCliRegistration {
     summary: "Autoresearch studies: measured, agent-driven code optimization",
     commands: {
       list: cliCommand({
-        summary: "List studies (active first): state, what needs you, best vs base, candidates, bench time",
+        summary: "List studies and what needs you.",
+        description: "List studies (active first): state, what needs you, best vs base, candidates, bench time",
         options: { ...jsonOpt },
         run: (input) => wrap(engine, undefined, () => listStudies(engine, input.options.json)),
       }),
       needs: cliCommand({
-        summary: "What needs you (approvals, system pauses, failures, a frozen harvest), with the command for each",
+        summary: "List decisions and fixes waiting for you.",
+        description: "What needs you (approvals, system pauses, failures, a frozen harvest), with the command for each",
         positionals: [{ name: "slug", description: "Only this study (default: every active study)" }] as const,
         options: { ...jsonOpt },
         run: (input) =>
@@ -284,7 +286,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       show: cliCommand({
-        summary: "Show a study: what needs you, best vs base, spec, bench, calibration, ideas, candidates, workers, recent events",
+        summary: "Show a study’s progress, evidence and next steps.",
+        description: "Show a study: what needs you, best vs base, spec, bench, calibration, ideas, candidates, workers, recent events",
         positionals: slugArg,
         options: { ...jsonOpt, events: { type: "integer", min: 0, max: 200, default: 12, description: "Recent events to show (max 200)" } },
         run: (input) =>
@@ -297,7 +300,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           ),
       }),
       calibrate: cliCommand({
-        summary: "Approve the current spec and run calibration (gates on base, A/A noise measurement)",
+        summary: "Approve the spec and calibrate; workers do not start yet.",
+        description: "Approve the current spec and run calibration (gates on base, A/A noise measurement)",
         positionals: slugArg,
         options: { ...jsonOpt, wait: { type: "boolean", description: "Wait for calibration to finish (up to --timeout)" }, timeout: { type: "duration", defaultUnit: "m", min: 1_000, max: 30 * 60_000, default: 25 * 60_000, description: "Max wait with --wait (default 25m, max 30m)" } },
         run: (input, ctx) =>
@@ -312,7 +316,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       start: cliCommand({
-        summary: "Approve calibration and start running (or resume)",
+        summary: "Approve calibration and start workers, or resume.",
+        description: "Approve calibration and start running (or resume)",
         positionals: slugArg,
         options: { ...jsonOpt },
         run: (input, ctx) =>
@@ -323,7 +328,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       approve: cliCommand({
-        summary: "Apply a pending spec whose oracle is unchanged (budget, agents); oracle changes need `calibrate`",
+        summary: "Apply a pending spec without changing the oracle.",
+        description: "Apply a pending spec whose oracle is unchanged (budget, agents); oracle changes need `calibrate`",
         positionals: slugArg,
         options: { ...jsonOpt },
         run: (input, ctx) =>
@@ -405,7 +411,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       archive: cliCommand({
-        summary: "Stop a study for good: stop workers, archive their threads, remove bench checkouts (refs are kept); --archive-thread also archives the study thread",
+        summary: "Archive a study permanently; keep its refs and history.",
+        description: "Stop a study for good: stop workers, archive their threads, remove bench checkouts (refs are kept); --archive-thread also archives the study thread",
         positionals: slugArg,
         options: { ...jsonOpt, "archive-thread": { type: "boolean", description: "Also archive the study thread (the conversation that created the study)" } },
         run: (input, ctx) =>
@@ -497,7 +504,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       harvest: cliCommand({
-        summary: "Freeze best for harvest (no new workers, submissions closed), or show the current harvest when it is already frozen (changes nothing); an agent then harvests it with the study-harvest skill",
+        summary: "Freeze best for an agent to harvest, or show the existing freeze.",
+        description: "Freeze best for harvest (no new workers, submissions closed), or show the current harvest when it is already frozen (changes nothing); an agent then harvests it with the study-harvest skill",
         positionals: slugArg,
         options: {
           ...jsonOpt,
@@ -543,7 +551,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       measure: cliCommand({
-        summary: "Measure B against A (any two commits) with the study's protocol, guardrails and bench hosts; counts as bench time",
+        summary: "Measure B against A using the study’s bench and budget.",
+        description: "Measure B against A (any two commits) with the study's protocol, guardrails and bench hosts; counts as bench time",
         positionals: [
           { name: "slug", description: "Study slug", required: true },
           { name: "a", description: "Reference side A: a sha, branch, tag, best, base, c/<n>, or rev syntax (best~1)", required: true },
@@ -616,7 +625,8 @@ export function studyCli(engine: Engine): PluginCliRegistration {
           }),
       }),
       evidence: cliCommand({
-        summary: "Everything an agent needs to harvest: candidates, commit messages, diffs, verdicts, guardrails, findings, segments, base/best, runs (stable JSON with --json)",
+        summary: "Read the evidence for harvesting; use --json for the full record.",
+        description: "Everything an agent needs to harvest: candidates, commit messages, diffs, verdicts, guardrails, findings, segments, base/best, runs (stable JSON with --json)",
         positionals: slugArg,
         options: {
           ...jsonOpt,

@@ -378,8 +378,15 @@ export type StudySpec = z.output<typeof specSchema>;
 
 export type SpecResult = { ok: true; spec: StudySpec; warnings: string[] } | { ok: false; errors: string[] };
 
+/** A bounded tool response: preserve the repair instructions and name omitted issues. */
+export function specIssueText(errors: readonly string[]): string {
+  const shown = errors.slice(0, 6).map((e) => `- ${e.length > 500 ? `${e.slice(0, 499)}…` : e}`);
+  if (errors.length > shown.length) shown.push(`- ${errors.length - shown.length} further entries omitted; fix these and resubmit to see the rest.`);
+  return shown.join("\n");
+}
+
 export function parseSpec(toml: string): SpecResult {
-  if (toml.length > 64 * 1024) return { ok: false, errors: ["spec is larger than 64 KiB"] };
+  if (toml.length > 64 * 1024) return { ok: false, errors: ["spec exceeds the 64 KiB text limit; shorten it before resubmitting"] };
   let raw: unknown;
   try {
     raw = parseToml(toml);
@@ -390,7 +397,15 @@ export function parseSpec(toml: string): SpecResult {
   if (!parsed.success) {
     return {
       ok: false,
-      errors: parsed.error.issues.slice(0, 20).map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`),
+      errors: [
+        ...parsed.error.issues.slice(0, 20).map((i) => {
+          const path = i.path.map((part, n) => typeof part === "number" ? `[${part}]` : `${n ? "." : ""}${String(part)}`).join("") || "(root)";
+          return i.code === "unrecognized_keys"
+            ? `${path}: unknown ${i.keys.length === 1 ? "key" : "keys"} ${i.keys.map((k) => JSON.stringify(k)).join(", ")}. Remove or correct them; see the study-create spec reference.`
+            : `${path}: ${i.message}`;
+        }),
+        ...(parsed.error.issues.length > 20 ? [`${parsed.error.issues.length - 20} more issues omitted; fix these and resubmit to see the rest.`] : []),
+      ],
     };
   }
   return validateSemantics(parsed.data);
@@ -401,13 +416,13 @@ export function validateSemantics(spec: StudySpec): SpecResult {
   const errors: string[] = [];
   const warnings: string[] = [];
   const p = spec.oracle.protocol;
-  if (p.n_min > p.n_max) errors.push("oracle.protocol: n_min must be <= n_max");
+  if (p.n_min > p.n_max) errors.push(`oracle.protocol.n_min: ${p.n_min} exceeds n_max (${p.n_max}). Set n_min to ${p.n_max} or less, or raise n_max to at least ${p.n_min}.`);
   if (spec.agents.idle_abandon_minutes <= spec.agents.idle_nudge_minutes) {
-    errors.push("agents: idle_abandon_minutes must be greater than idle_nudge_minutes");
+    errors.push(`agents.idle_abandon_minutes: ${spec.agents.idle_abandon_minutes} must exceed idle_nudge_minutes (${spec.agents.idle_nudge_minutes}). Raise the abandon time or lower the nudge time.`);
   }
   const names = new Set([spec.metric.name]);
   for (const g of spec.guardrail) {
-    if (names.has(g.name)) errors.push(`guardrail ${g.name}: duplicates another metric name`);
+    if (names.has(g.name)) errors.push(`guardrail ${g.name}: duplicates another metric name. Give each metric a unique name and update its METRIC output to match.`);
     names.add(g.name);
     if (g.max_total_regression < g.max_regression) {
       warnings.push(`guardrail ${g.name}: max_total_regression ${(g.max_total_regression * 100).toFixed(1)}% is below max_regression ${(g.max_regression * 100).toFixed(1)}%, so the total limit is the one that binds`);
@@ -415,19 +430,19 @@ export function validateSemantics(spec: StudySpec): SpecResult {
   }
   for (const e of spec.scope.editable) {
     for (const pr of spec.scope.protected) {
-      if (e === pr) errors.push(`scope: ${e} is both editable and protected`);
+      if (e === pr) errors.push(`scope: ${e} is both editable and protected. Remove it from one list; benchmark and test paths should stay protected.`);
     }
   }
   const seen = new Set<string>();
   for (const h of spec.oracle.bench_hosts) {
     const k = h.toLowerCase();
-    if (seen.has(k)) errors.push(`oracle.bench_hosts: ${h} is listed twice`);
+    if (seen.has(k)) errors.push(`oracle.bench_hosts: ${h} is listed twice. Keep one entry (names are case-insensitive).`);
     seen.add(k);
   }
   const remote = spec.oracle.remote_bench ?? [];
   remote.forEach((r, i) => {
     const where = `oracle.remote_bench[${i}] (${r.provider})`;
-    if (r.rotate_before_minutes !== undefined && r.rotate_before_minutes >= r.lifetime_minutes) errors.push(`${where}: rotate_before_minutes must be below lifetime_minutes`);
+    if (r.rotate_before_minutes !== undefined && r.rotate_before_minutes >= r.lifetime_minutes) errors.push(`${where}.rotate_before_minutes: ${r.rotate_before_minutes} must be below lifetime_minutes (${r.lifetime_minutes}). Lower the rotation lead or increase the lifetime.`);
     else if (r.rotate_before_minutes !== undefined && r.rotate_before_minutes > r.lifetime_minutes / 2) {
       // A replacement joins and calibrates before the old machine retires; with a lead this long it is due again soon after.
       warnings.push(`${where}: rotate_before_minutes = ${r.rotate_before_minutes} is more than half of lifetime_minutes = ${r.lifetime_minutes}: each machine is replaced ${+(r.lifetime_minutes - r.rotate_before_minutes).toFixed(1)} min after it was created, so machines rotate almost continuously (each rotation costs a join and a calibration)`);

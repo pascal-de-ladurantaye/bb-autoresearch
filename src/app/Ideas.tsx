@@ -59,7 +59,7 @@ export function IdeasTab({ slug, state, ideas, rpc, onChanged, onOpenCandidate }
           const list = byStatus(col.key);
           return (
             <div key={col.key} className="min-w-0 space-y-2">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              <h3 className="text-sm font-semibold text-muted-foreground">
                 {col.title} · {list.length}
               </h3>
               {list.length === 0 ? <EmptyState>None</EmptyState> : null}

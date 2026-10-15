@@ -118,7 +118,7 @@ function FindingItem({ f, onOpenCandidate }: { f: FindingsView["findings"][numbe
   return (
     <li className="space-y-1 rounded-lg border border-border bg-card px-3 py-2 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium">{f.outcome}</span>
+        <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium">Worker finding: {f.outcome.replace(/_/gu, " ")}</span>
         <span className="min-w-0 flex-1 truncate">
           {f.ideaId !== null ? `#${f.ideaId} ${f.ideaTitle ?? ""}` : <span className="text-muted-foreground">not tied to an idea</span>}
           <span className="ml-1 text-xs text-muted-foreground">· {f.theme ?? "no theme"}</span>
@@ -128,7 +128,7 @@ function FindingItem({ f, onOpenCandidate }: { f: FindingsView["findings"][numbe
             c/{f.candidate}
           </button>
         ) : null}
-        {f.verdict ? <VerdictBadge verdict={f.verdict} /> : null}
+        {f.verdict ? <span className="inline-flex flex-wrap items-center gap-1 text-xs">Plugin verdict: <VerdictBadge verdict={f.verdict} /></span> : null}
         {f.effect !== null ? (
           <span className="text-xs tabular-nums" title={f.effectText ?? undefined}>
             {pct(f.effect)}

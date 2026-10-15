@@ -133,7 +133,7 @@ describe("v0.2.4 engine (fake hosts)", () => {
 
   async function running(o: { protocol?: string; drift?: string } = {}) {
     const r = await engine.proposeStudy("thr_study", "proj_1", v024Spec(o));
-    expect(r).toContain("drafted");
+    expect(r).toContain("Draft ready:");
     await engine.calibrate(SLUG, "human");
     await engine.waitForCalibration(SLUG, 5_000);
     const s = store.study(SLUG)!;

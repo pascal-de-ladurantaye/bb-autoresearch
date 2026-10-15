@@ -134,7 +134,7 @@ describe("frontend: v0.2.4 fixes", () => {
     const p = await page("toy-size/live", { "study.live": async () => fixture({ bands: [b], cards: [] }) });
     const m = await p.findByRole("article", { name: "CI band of c/2" });
     expect(m.querySelector("[data-decision]")?.textContent).toBe("6 of 20 · can't win");
-    expect(m.textContent).toMatch(/futility: it can no longer win/u);
+    expect(m.textContent).toMatch(/futility: CI upper bound below the win threshold/u);
   });
 
   it("B10: guardrail sentences wrap; a region legend replaces a label that can't fit; 'no win yet' lines up", async () => {

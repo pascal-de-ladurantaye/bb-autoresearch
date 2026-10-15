@@ -22,7 +22,7 @@ export function ApproveSpecDialog({ o, version, changesOracle, rpc, open, onOpen
       open={open}
       onOpenChange={onOpenChange}
       title={draft ? `Approve spec v${version} and calibrate` : changesOracle ? `Approve spec v${version} and recalibrate` : `Apply spec v${version}`}
-      description="This is a human control. It is recorded in the study's audit log and raises a notice, the same as the CLI command."
+      description={draft ? "Review the spec, then approve calibration. This runs tests and baseline measurements; workers do not start yet." : changesOracle ? "Approving cancels in-flight measurements and recalibrates best. Workers keep editing; starting the new segment needs another approval." : "Apply the reviewed spec now. The oracle is unchanged, so measurements continue without recalibration."}
       confirmLabel={draft ? "Approve and calibrate" : changesOracle ? "Approve and recalibrate" : "Apply spec"}
       onConfirm={async () => {
         const r = await rpc.call("study.spec.approve", { slug: o.slug, version, confirm: true });
@@ -51,7 +51,7 @@ export function ApproveSpecDialog({ o, version, changesOracle, rpc, open, onOpen
         )}
       </ul>
       <p className="text-xs text-muted-foreground">
-        CLI equivalent: <Mono>{draft || changesOracle ? `bb study calibrate ${o.slug}` : `bb study approve ${o.slug}`}</Mono>
+        CLI equivalent (same approval and audit log): <Mono>{draft || changesOracle ? `bb study calibrate ${o.slug}` : `bb study approve ${o.slug}`}</Mono>
       </p>
     </ConfirmDialog>
   );
@@ -64,7 +64,7 @@ export function StartDialog({ o, rpc, open, onOpenChange, onDone }: { o: Overvie
       open={open}
       onOpenChange={onOpenChange}
       title="Approve the calibration and start"
-      description="This is a human control. It is recorded in the study's audit log and raises a notice, the same as the CLI command."
+      description="Starting authorizes workers to edit code and spend tokens and bench time. Nothing is pushed."
       confirmLabel="Approve and start"
       onConfirm={async () => {
         const r = await rpc.call("study.start", { slug: o.slug, confirm: true });
@@ -74,7 +74,7 @@ export function StartDialog({ o, rpc, open, onOpenChange, onDone }: { o: Overvie
     >
       <p className="font-medium">Calibration</p>
       <p className="text-muted-foreground">
-        Noise floor {frac(c.noiseFloor)} per pair · a win must clear {frac(c.mde)} (MDE) · about {duration(c.evalSeconds)} per evaluation.
+        {o.noise === "deterministic" ? "Single runs; no confidence interval" : `Noise floor ${frac(c.noiseFloor)} ${o.noise === "expensive" ? "(σ of one run)" : "per pair"}`} · win threshold {c.thresholds || frac(c.mde)} · about {duration(c.evalSeconds)} per evaluation.
       </p>
       <p className="font-medium">What happens</p>
       <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
@@ -87,7 +87,7 @@ export function StartDialog({ o, rpc, open, onOpenChange, onDone }: { o: Overvie
         <li>Nothing is pushed anywhere. You can pause, steer the ideas, or lower concurrency at any time.</li>
       </ul>
       <p className="text-xs text-muted-foreground">
-        CLI equivalent: <Mono>bb study start {o.slug}</Mono>
+        CLI equivalent (same approval and audit log): <Mono>bb study start {o.slug}</Mono>
       </p>
     </ConfirmDialog>
   );
