@@ -11,7 +11,8 @@ Never push, open a PR, or post anywhere until the human says so. Never edit `stu
 
 ## 1. Find the study and check it is frozen
 
-- `bb study list`, then `bb study harvest <slug>`. You want **Harvesting** with harvest h<N> **frozen**: best is pinned as `refs/studies/<slug>/harvest/h<N>` and stays there even if the study resumes. Use that ref (or its sha), not `studies/<slug>/best`, as "best" from now on.
+- **Inspect first:** `bb study list`, then `bb study show <slug> --json`. Check `state` and `harvest.state` before invoking harvest: on an unfrozen study, `bb study harvest` is a human control, not a status query.
+- **Already frozen:** use `bb study harvest <slug>` to read the freeze. You want **Harvesting** with harvest h<N> **frozen** (or a legacy **ready** harvest). Best is pinned as `refs/studies/<slug>/harvest/h<N>` and stays there if the study resumes. Use that ref or its sha, not the moving `studies/<slug>/best`, from now on.
 - `bb study harvest <slug>` on a frozen study only shows the freeze; it never starts another. A ready harvest from before 1.0 counts as frozen but has no `refs/studies/<slug>/harvest/h<N>` ref: use its best sha (`harvest.bestSha` in `bb study harvest <slug> --json`), or ask the human for `bb study harvest <slug> --refreeze`, which pins it as h<N+1>.
 - Not frozen yet? Freezing stops the study's workers, so it is the human's call: ask them to press **Freeze best for harvest** on the Harvest tab (or run `bb study harvest <slug>`). A Paused study also takes measurements, but its best can move if it resumes, and a paused study whose bench is remote only has no machines until it is frozen.
 - A harvest the plugin drafted before 1.0 (it shows changesets, contributions and PR drafts, marked "before 1.0") is a fine starting point: reuse its grouping and branches `studies/<slug>/harvest/h<N>/*` if they still make sense, and re-measure anything you change.
@@ -22,7 +23,7 @@ Never push, open a PR, or post anywhere until the human says so. Never edit `stu
 bb study evidence <slug> --json > /tmp/<slug>-evidence.json   # if it prints {"file": ...}, read that file instead
 ```
 
-The document (format `bb-autoresearch/evidence`, version 1) has: `study` (objective, metric and direction, noise class, guardrails, scope, gates), `git` (`base`, `best`, `frozen.ref`/`frozen.best`), `promotions` (first-parent commits base..best, oldest first: `sha`, candidate `n`, the worker's commit `title`/`body`, `paths`), `candidates` (every candidate: refs and shas, `commit` message, `stats`, `verdict`, `reasons`, `effect` with `ciLo`/`ciHi` against the best it was measured on, `guardrails`, `findings`), `findings` (what workers learned and why things won or lost), `segments` (calibration per oracle segment: `threshold`, `evalSeconds`), `benchHosts`, `harvests`, and `runs` (measurements and gates already asked for). Effects are better-is-positive in the metric's own direction.
+Read [evidence fields](references/evidence.md) when interpreting this document. Start with the frozen ref, promotions and their commit messages, candidate verdicts, guardrails and worker findings. Distinguish plugin measurements from workers’ explanations.
 
 For each promotion, read the diff: `git show --stat <sha>` then `git show <sha>`. Its effect in `candidates` was measured against the best before it, so it is a step, not a standalone number.
 
@@ -88,16 +89,9 @@ No raw JSON, no numbers you computed yourself, no claims beyond what was measure
 
 When the human approves, publish with the repository's own tool, as drafts unless told otherwise: `gh pr create --draft --base <base> --head <branch>` per layer (bottom first), `gt submit --draft`, `sl pr submit`, `git push origin HEAD:refs/for/<target>` for Gerrit, `arc diff`, or whatever this repository uses. Push only your harvest branches. Then give the human the links. Archiving or resuming the study is their call (`bb study archive <slug>`, `bb study resume <slug>`).
 
-## Several studies on one repository: one stack
+## Several studies
 
-Two studies on the same repository (say one on latency, one on memory) each freeze their own best, on their own base, with their own oracle. To ship them as one stack:
-
-1. **Freeze both** and read both evidence documents. Their commits are told apart by the `Autoresearch-Study` trailer; refs are shared across the repository's worktrees (fetch first if the studies use different clones).
-2. **Pick one base**: the target branch's current tip, usually newer than either study's base.
-3. **Plan one stack across both**: order by dependency and file overlap (changes from both studies touching the same code go in one PR or adjacent layers); merge duplicates (two studies often find the same fix: keep one, from whichever study's version is simpler, and say so); keep the rest independent where possible.
-4. **Build it** on the common base (cherry-pick or rebuild per PR, as above), and check nothing was lost against each study's frozen best (diff per study, since neither frozen tree contains the other's changes).
-5. **Measure each layer with the study whose metric it targets**: `bb study measure <latency-study> <layer-base> <layer-head>`. Then check cross-effects: measure each layer (or at least the stack top against the common base) with the other study's oracle too, because a latency win can cost memory. Each study measures on its own bench hosts with its own protocol and guardrails; both must be frozen or paused (or idle) to take measurements. Gate each layer with every study whose gates apply.
-6. **Describe** each PR with the measurements of both studies that apply to it, naming each study and run (`latency r4`, `memory r2`).
+Read [combining studies](references/several-studies.md) before grouping wins from multiple studies. It covers frozen provenance, duplicate changes, shared bases, cross-metric measurements and gates.
 
 ## Don't
 

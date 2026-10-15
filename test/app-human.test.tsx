@@ -110,6 +110,23 @@ describe("frontend: human interface", () => {
     await waitUntil(() => engine.study("toy-size").state === "running");
   });
 
+  it("exposes calculation detail and glossary help without hover", async () => {
+    await runningWithWin();
+    const page = await open("toy-size/overview");
+    const summary = await page.findByText("How this gain is calculated");
+    const details = summary.closest("details")!;
+    expect(details.open).toBe(false);
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+    expect(details.textContent).toContain("1 − product(1 − each improvement)");
+    const help = page.getAllByRole("button", { name: "What is improvement?" })[0]!;
+    help.focus();
+    expect(document.activeElement).toBe(help);
+    fireEvent.click(help);
+    expect((await page.findByText(/Every number is “better is positive”/u)).textContent).toContain("Raw values");
+    expect(help.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("tabs are a keyboard tablist", async () => {
     const page = await open("toy-size/overview");
     const tab = await page.findByRole("tab", { name: /overview/iu });
@@ -192,9 +209,9 @@ describe("frontend: human interface", () => {
     for (const p of pages.splice(0)) p.lifecycle.unmount();
     store.updateCandidate(c.id, { metrics_json: JSON.stringify({ best: { size: 1000, rss: 100, wall_ms: 10 }, candidate: { size: 800, rss: 110, wall_ms: 12 }, guardrails: { rss: 0.1 } }) });
     const broken = await open("toy-size/candidates/1");
-    expect((await broken.findByLabelText("Candidates")).textContent).toContain("rss BROKEN");
+    expect((await broken.findByLabelText("Candidates")).textContent).toContain("rss broken");
     const metrics = await broken.findByLabelText("Metrics");
-    expect(metrics.textContent).toMatch(/rssguardrail · lower is better100110.*BROKEN/u);
+    expect(metrics.textContent).toMatch(/rssguardrail · lower is better100110.*broken/u);
     expect(metrics.textContent).toMatch(/wall_msinformational1012\+20\.0% \(informational, no direction\)/u);
   });
 

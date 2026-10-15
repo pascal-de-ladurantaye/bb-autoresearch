@@ -195,7 +195,7 @@ function StudyList() {
         <Skeleton lines={4} label="Loading studies…" />
       ) : !active.length ? (
         <EmptyState>
-          No active studies. <span className="text-foreground">New study</span> opens a thread where the <code>study-create</code> skill interviews you, drafts the spec and submits it; the study then shows up here for your approval.
+          No active studies. Choose <span className="text-foreground">New study</span> to draft one with an agent. You review the spec here before approving calibration or starting workers.
         </EmptyState>
       ) : (
         <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card" aria-label="Active studies">

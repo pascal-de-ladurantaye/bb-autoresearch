@@ -285,7 +285,7 @@ function RunPanel({ band, run, domain, title, compact }: { band: NoisyBand; run:
       </div>
       {labels.regions.length < 3 ? (
         // A region name didn't fit next to its region (the threshold sits next to 0): say the regions in words.
-        <p className="text-[11px] text-muted-foreground" data-region-legend>
+        <p className="text-xs leading-relaxed text-muted-foreground" data-region-legend>
           Regions: <span className="text-destructive">lose</span> below 0 · continue from 0 to {pct(band.mde)} · <span className="text-success">win</span> above {pct(band.mde)}
         </p>
       ) : null}
@@ -339,7 +339,7 @@ function RunWords({ band, run }: { band: NoisyBand; run: BandRun }) {
         {stop ? (
           <>
             Decided after {stop.n} of {band.nMax} pairs: <span className={DECISION_WORD[stop.decision].tone}>{DECISION_WORD[stop.decision].label}</span>
-            {stop.reason === "futility" ? <span className="font-normal"> (futility: it can no longer win)</span> : stop.reason === "early" ? <span className="font-normal"> (early: clearly worse)</span> : null}
+            {stop.reason === "futility" ? <span className="font-normal"> (futility: CI upper bound below the win threshold)</span> : stop.reason === "early" ? <span className="font-normal"> (early: clearly worse)</span> : null}
             {last ? <span className="font-normal text-muted-foreground"> · {stopCi(band, last, stop.reason)}</span> : null}
           </>
         ) : (
@@ -482,7 +482,7 @@ function ExpensiveView({ band, compact }: { band: ExpensiveBand; compact: boolea
 const GUARD_WORD: Record<string, { label: string; icon: string; tone: string }> = {
   ok: { label: "ok", icon: "Check", tone: "text-success" },
   inconclusive: { label: "inconclusive", icon: "AlertTriangle", tone: "text-warning-text" },
-  broken: { label: "BROKEN", icon: "X", tone: "text-destructive" },
+  broken: { label: "broken", icon: "X", tone: "text-destructive" },
   missing: { label: "not measured", icon: "Minus", tone: "text-muted-foreground" },
 };
 
@@ -518,7 +518,7 @@ function GuardrailRow({ g, compact }: { g: BandGuardrailState; compact: boolean 
         </span>
       </span>
       {/* Wraps instead of truncating: two bands side by side leave little room, and the limit is the point of the sentence. */}
-      <span className="col-span-2 break-words text-[11px] leading-snug text-muted-foreground" data-guardrail-text>
+      <span className="col-span-2 break-words text-sm leading-relaxed text-muted-foreground" data-guardrail-text>
         {text}
       </span>
     </li>

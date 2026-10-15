@@ -93,7 +93,7 @@ export function feedItems(
         // Deterministic measurements are one run each side; expensive ones count candidate runs; noisy ones pairs.
         const what = ctx.noise === "deterministic" ? "one run each" : m === null ? null : ctx.noise === "expensive" ? plural(m, "run") : `${plural(m, "pair")}${c ? `, then ${plural(c, "confirmation pair")}` : ""}`;
         // Why the sequential test stopped when it wasn't the plain rule, and a skipped confirmation.
-        const why = d.confirm_skipped === true ? " (confirmation skipped: far beyond the win threshold)" : d.stop === "futility" ? " (stopped: it could no longer win)" : d.stop === "early" ? " (stopped early: clearly worse)" : "";
+        const why = d.confirm_skipped === true ? " (confirmation skipped: far beyond the win threshold)" : d.stop === "futility" ? " (stopped early: CI upper bound below the win threshold)" : d.stop === "early" ? " (stopped early: clearly worse)" : "";
         push(`c/${n} measured${what ? `: ${what}` : ""}${typeof d.seconds === "number" ? ` in ${seconds(d.seconds * 1000)}` : ""}${why}`);
         break;
       }
@@ -111,7 +111,7 @@ export function feedItems(
             push(cause ? `c/${n} ${cause}${eff && typeof d.effect === "number" && d.effect > 0 ? `, despite ${eff}` : ""}` : `c/${n} lost${eff ? `: ${eff}` : reason ? `: ${reason}` : ""}`, "lose");
             break;
           case "inconclusive":
-            push(`c/${n} inconclusive${eff ? `: ${eff}, within the noise` : ""}`, "info");
+            push(`c/${n} inconclusive: not promoted${eff ? `. Estimate: ${eff} vs previous best` : ""}`, "info");
             break;
           case "gate_failed":
             push(`c/${n} failed the tests`, "lose");

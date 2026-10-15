@@ -19,7 +19,7 @@ import { ciText, compound, improvementText, type MetricInfo } from "./present.ts
 import { clip, formatDuration, nudgeMessage, safeJson, strategistDigest, workerBrief, type CodeInfo } from "./prompts.ts";
 import { actionLabel, itemLabel } from "./action.ts";
 import { budgetExhausted, budgetShares, idleAction, newBudgetThresholds, rateLimitedTarget, meanThinkSeconds, pickIdea, repeatsLostIdea, roundTrigger, spawnSlots, targetWorkers, titleKey, type RoundTrigger, type ThinkSample } from "./scheduler.ts";
-import { bestBranch, formatPct, oracleHash, parseSpec, type StudySpec } from "./spec.ts";
+import { bestBranch, formatPct, oracleHash, parseSpec, specIssueText, type StudySpec } from "./spec.ts";
 
 export type Role = "worker" | "strategist" | "creator";
 
@@ -187,7 +187,7 @@ export class Engine {
 
   async proposeStudy(threadId: string, projectId: string, toml: string): Promise<string> {
     const parsed = parseSpec(toml);
-    if (!parsed.ok) throw new EngineError(`Spec is invalid:\n${parsed.errors.map((e) => `- ${e}`).join("\n")}`);
+    if (!parsed.ok) throw new EngineError(`Spec not saved. Fix these fields and resubmit with study_propose:\n${specIssueText(parsed.errors)}`);
     const { spec, warnings } = parsed;
     const existingRow = this.store.threadById(threadId);
     let study: StudyRow | undefined;
@@ -207,7 +207,7 @@ export class Engine {
       hostId = primary;
     }
     const resolved = resolveBenchHosts(spec.oracle.bench_hosts, await this.ctx.bb.listHosts().catch(() => []), hostId, { remote: (spec.oracle.remote_bench ?? []).length > 0 });
-    if (!resolved.ok) throw new EngineError(`Spec is invalid:\n${resolved.errors.map((e) => `- ${e}`).join("\n")}`);
+    if (!resolved.ok) throw new EngineError(`Spec not saved. Fix the bench hosts and resubmit with study_propose:\n${specIssueText(resolved.errors)}`);
     if (!study) {
       const repo = await this.ctx.bb.projectCheckout(projectId, hostId);
       if (!repo) throw new EngineError("This project has no checkout on the server's machine; the edit host must be the server's machine.");
@@ -244,12 +244,12 @@ export class Engine {
     if (study.state === "calibrating") this.store.setStudyState(study.id, "draft", threadId, { reason: "spec revised" });
     this.publish(study.id);
     return [
-      `Study \`${spec.study.slug}\` drafted with spec v${version} (oracle ${oracleHash(spec)}), repo ${study.repo_path} on this machine. Bench: ${benchText}.`,
-      ...warnings.map((w) => `Warning: ${w}`),
+      `Draft ready: \`${spec.study.slug}\` · spec v${version}.`,
+      `Needs you (human): review the spec and approve calibration. Studies → ${spec.study.slug} → Oracle, or \`bb study calibrate ${spec.study.slug}\`.`,
+      `Calibration runs tests and baseline measurements; workers do not start yet. After it finishes, review the result, then approve starting workers with \`bb study start ${spec.study.slug}\`.`,
       "",
-      "Next steps are the human's, on the Studies page (sidebar → Studies → " + spec.study.slug + "): the Overview shows \"Needs you: Approve spec v" + version + " and calibrate\".",
-      "Calibration runs the gates on the base commit and repeated A/A measurements on every bench host to find the noise floor; then the human reviews it and starts the study from the same page.",
-      "CLI equivalents: `bb study calibrate " + spec.study.slug + "`, then `bb study start " + spec.study.slug + "`. Ideas can be seeded on the Ideas tab or with `bb study ideas add`.",
+      `Details: oracle ${oracleHash(spec)} · repo ${study.repo_path} on this machine · bench ${benchText}.`,
+      ...warnings.map((w) => `Accepted with warning: ${w}`),
     ].join("\n");
   }
 
@@ -389,7 +389,11 @@ export class Engine {
     if (study.state === "paused") return this.resume(slug, actor);
     if (study.state === "running") return `${slug} is already running.`;
     if (study.state !== "calibrating" || study.calibration_status !== "ready") {
-      throw new EngineError(`${slug} needs a finished calibration first (state ${study.state}, calibration ${study.calibration_status ?? "none"}); run \`bb study calibrate ${slug}\``);
+      if (study.state === "archived") throw new EngineError(`Cannot start ${slug}: it is archived and cannot resume. Review its history with \`bb study show ${slug}\`.`);
+      if (study.calibration_status === "running") throw new EngineError(`Cannot start ${slug}: calibration is still running. Check progress with \`bb study show ${slug}\`; after it finishes, review the result before starting.`);
+      if (study.calibration_status === "failed") throw new EngineError(`Cannot start ${slug}: calibration failed. Inspect the failure with \`bb study show ${slug}\`, fix the environment or revise the spec, then ask the human to approve calibration again.`);
+      if (study.state === "harvesting") throw new EngineError(`Cannot start ${slug}: it is harvesting. The human can keep exploring with \`bb study resume ${slug}\`.`);
+      throw new EngineError(`Cannot start ${slug}: calibration has not finished. The human must review the spec and approve calibration with \`bb study calibrate ${slug}\`.`);
     }
     const midRun = this.store.hasRun(study.id);
     this.store.tx(() => {

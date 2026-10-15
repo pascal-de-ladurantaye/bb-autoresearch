@@ -44,7 +44,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
 
   async function proposeAndRun() {
     const r = await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec() }, { threadId: "thr_study", projectId: "proj_1" });
-    expect(text(r)).toContain("drafted with spec v1");
+    expect(text(r)).toContain("Draft ready: `toy-size` · spec v1.");
     expect((await harness.behavior.runCli(["calibrate", "toy-size", "--wait"])).stdout).toContain("Calibration ready");
     expect((await harness.behavior.runCli(["ideas", "add", "toy-size", "Shrink the output", "--theme", "size"])).stdout).toContain("Idea #1 queued (pinned)");
     expect((await harness.behavior.runCli(["start", "toy-size"])).stdout).toContain("is running");
@@ -101,7 +101,7 @@ describe("plugin wiring: role-gated tools, CLI, reconciliation service", () => {
     const ticket = await harness.behavior.callAgentTool("study_submit_candidate", { title: "drop trailing whitespace" }, { threadId: "thr_w1" });
     expect(text(ticket)).toContain("Submitted as c/1");
     await waitFor(() => port.sent.some((m) => m.threadId === "thr_w1"));
-    expect(port.sent.find((m) => m.threadId === "thr_w1")?.text).toContain("WIN");
+    expect(port.sent.find((m) => m.threadId === "thr_w1")?.text).toContain("Win: promoted to best");
     const early = await harness.behavior.callAgentTool("study_finish", {}, { threadId: "thr_w1" });
     expect(isError(early)).toBe(true);
     await harness.behavior.callAgentTool("study_record_finding", { outcome: "improved", learned: "Whitespace was 20% of output." }, { threadId: "thr_w1" });

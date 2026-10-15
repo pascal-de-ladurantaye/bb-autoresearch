@@ -4,12 +4,12 @@
 import type { CandidateRow, FindingRow, IdeaRow, StudyRow, ThreadRow } from "./db/store.ts";
 import { formatPct, type StudySpec } from "./spec.ts";
 import type { RoundTrigger } from "./scheduler.ts";
-import { ciText as ciRange, improvementText, type MetricInfo, bestHeadlineText } from "./present.ts";
+import { ciText as ciRange, improvementText, type MetricInfo, bestHeadlineText, valueWithUnit, verdictOutcomeText, effectStatisticText } from "./present.ts";
 import { changeWords, headroom, headroomWords, rangeWords, relativeWords, type GuardrailJudgement, type Position } from "./guardrails.ts";
 
 /**
  * A message for an agent thread: a short `summary` a human skimming the
- * thread understands in one line, and the complete `detail` the agent needs.
+ * thread understands at a glance, and the complete `detail` the agent needs.
  * The BB adapter sends `detail` as an agent-only input block (hidden from the
  * human's timeline, still in the agent's context); the agent sees both.
  */
@@ -87,9 +87,14 @@ export function workerBrief(b: BriefInput): string {
   const lines = [
     `# Autoresearch worker · study \`${b.study.slug}\` · idea #${idea.id}`,
     "",
-    "You are a short-lived worker in a measured optimization study. You get one idea, a fresh worktree branched from the study's current best, and a few submissions. The plugin measures every submission on its own oracle and decides keep or discard. You never run the official benchmark yourself and you never decide what is kept.",
+    "Your task: try one idea in this worktree, run a fast local check, submit, then end your turn. The plugin measures it against best and decides whether to promote it.",
     "",
-    "## Objective",
+    "## Must not",
+    "- Never run the official benchmark, change protected paths, or decide what is kept.",
+    "- Never take human controls or try to discover the hidden holdout workload.",
+    "- After study_submit_candidate, end your turn. Record a finding before study_finish.",
+    "",
+    "## Objective (from the spec)",
     quoted(spec.study.objective, 1500),
     "",
     `Primary metric: ${metric}.${b.thresholds?.includes(" on ") ? ` A win must clear the win threshold of the bench host that measures it with confidence: ${b.thresholds}.` : b.mde !== null ? ` A win must clear about ${formatPct(b.mde)} with confidence.` : ""}`,
@@ -102,14 +107,14 @@ export function workerBrief(b: BriefInput): string {
     "## Scope (enforced at submission)",
     scopeBlock(spec),
     "",
-    "## Your idea",
+    "## Your idea (proposal, not measured evidence)",
     `**${quoted(idea.title, 200)}**${idea.theme ? ` (theme: ${quoted(idea.theme, 60)})` : ""}`,
     idea.rationale ? `Rationale: ${quoted(idea.rationale, 1200)}` : "",
     idea.start_ref ? `Starting point: \`${idea.start_ref}\`` : "",
     "",
   ];
   if (b.relatedFindings.length) {
-    lines.push("## Related findings from earlier workers");
+    lines.push("## Earlier worker observations", "Treat explanations as hypotheses unless backed by a plugin measurement. The plugin's verdict is separate from the worker's explanation.");
     for (const f of b.relatedFindings.slice(0, 6)) {
       lines.push(`- [${f.outcome}]${f.title ? ` ${quoted(f.title, 80)}:` : ""} ${quoted(f.learned, 300)}${f.revisit_if ? ` (revisit if: ${quoted(f.revisit_if, 120)})` : ""}`);
     }
@@ -147,33 +152,22 @@ export function verdictMessage(c: CandidateRow, opts: { submissionsLeft: number;
   const reasons = safeJson<string[]>(c.reasons_json) ?? [];
   const metrics = safeJson<{ best?: Record<string, number>; candidate?: Record<string, number>; guardrails?: Record<string, number>; guardrailJudgement?: Record<string, GuardrailJudgement> }>(c.metrics_json);
   const diag = safeJson<string[]>(c.diag_json) ?? [];
-  const head: Record<string, string> = {
-    win: "WIN: promoted to best",
-    lose: "LOSE",
-    inconclusive: "INCONCLUSIVE",
-    gate_failed: "GATE FAILED",
-    conflict: "CONFLICT",
-    rejected: "REJECTED (scope)",
-  };
   const metric = metricOf(opts.spec);
-  const effect = c.effect === null ? "" : `, ${improvementText(c.effect, metric, { digits: 1, factor: false })} than best${c.ci_lo !== null && c.ci_hi !== null && c.ci_lo !== c.ci_hi ? ` (${ciRange(c.ci_lo, c.ci_hi)})` : ""}`;
+  const effect = c.effect === null ? "" : `\nEstimate: ${improvementText(c.effect, metric, { digits: 1, factor: false })} vs previous best${c.ci_lo !== null && c.ci_hi !== null ? ` (${ciRange(c.ci_lo, c.ci_hi)})` : ""}.`;
   const judged = Object.values(metrics?.guardrailJudgement ?? {});
   const flagged = judged.filter((g) => g.state === "inconclusive").map((g) => g.name);
-  const brokeOnly = judged.filter((g) => g.state === "broken" || g.state === "missing").map((g) => g.name);
-  // The human-visible line stays short: guardrail names only; the details are in the agent-only block.
-  const guardrailNote = brokeOnly.length && c.verdict === "lose" && /^(initial )?primary metric improved/u.test(reasons[0] ?? "")
-    ? ` Broke guardrail ${brokeOnly.join(", ")}.`
-    : flagged.length && c.verdict === "win"
-      ? ` Guardrail ${flagged.join(", ")} inconclusive (flagged).`
-      : "";
-  const firstReason = reasons[0] && c.verdict !== "win" && !guardrailNote ? ` ${clip(reasons[0], 160)}` : "";
-  const summary = `[autoresearch] Verdict for c/${c.n}: ${head[c.verdict ?? ""] ?? c.verdict}${effect}.${firstReason}${guardrailNote}`;
+  const guardrailNote = flagged.length && c.verdict === "win" ? ` Guardrail ${flagged.join(", ")} inconclusive (flagged).` : "";
+  const summary = `[autoresearch] Verdict for c/${c.n}: ${verdictOutcomeText(c.verdict, reasons)}${guardrailNote}${effect}`;
   const lines = [`Effect (better is positive): ${c.effect !== null ? ciText(c) : "not measured"}`];
+  if (c.effect !== null) lines.push(`Effect statistic: ${effectStatisticText(opts.spec.oracle.noise)}.`);
   for (const r of reasons.slice(0, 8)) lines.push(`- ${clip(r, 400)}`);
   if (metrics?.best && metrics.candidate) {
     const keys = [opts.spec.metric.name, ...opts.spec.guardrail.map((g) => g.name)];
-    const parts = keys.filter((k) => metrics.best?.[k] !== undefined).map((k) => `${k}: best ${fmtNum(metrics.best![k]!)} → candidate ${fmtNum(metrics.candidate?.[k])}`);
-    if (parts.length) lines.push(`Metrics (median): ${parts.join("; ")}`);
+    const parts = keys.filter((k) => metrics.best?.[k] !== undefined).map((k) => {
+      const unit = k === opts.spec.metric.name ? opts.spec.metric.unit : "";
+      return `${k}${unit ? "" : " (unit not specified)"}: best ${valueWithUnit(metrics.best![k], unit)} → candidate ${valueWithUnit(metrics.candidate?.[k], unit)}`;
+    });
+    if (parts.length) lines.push(`Metrics (side medians): ${parts.join("; ")}`);
   }
   if (metrics?.guardrails && opts.spec.guardrail.length) {
     const parts = opts.spec.guardrail.map((g) => {
@@ -389,17 +383,21 @@ export function strategistDigest(d: DigestInput): AgentMessage {
   if (queued.length > 15) lines.push(`- … ${queued.length - 15} more queued`);
   if (d.bestDiag.length) lines.push("", "## Best diagnostics", "```", clip(d.bestDiag.join("\n"), 1200), "```");
   lines.push("", `## Dossier${d.dossier ? ` (v${d.dossier.version})` : ""}`, d.dossier ? clip(d.dossier.text, 1500) : "empty: write one with study_update_dossier once you have read the code.");
-  lines.push(
-    "",
+  // Reserve the instruction block before bounding historical evidence. A large
+  // digest must never lose role boundaries or the end-turn instruction.
+  const instructions = [
     "## This round",
     `- Keep at least ${d.w + 2} ready ideas, diverse across themes (at most ${Math.ceil(d.w / 2)} workers run one theme at once): \`study_queue_ideas\` (title, rationale, theme, priority, optional start_ref and variation_of).`,
     "- Lost ideas are not assigned again. To retry one differently, queue a new idea with `variation_of` set to the lost idea's id.",
     "- Retire dead directions with `study_retire_idea`; record what is known in `study_update_dossier`.",
     "- `study_search_findings` searches all findings and verdicts.",
     "- You do not edit code, run benchmarks, or decide verdicts. Concurrency, budget, oracle and pausing are human controls.",
-    "- Reply to the human in two or three short lines (what changed, what you queued, anything they should decide), then end your turn.",
-  );
-  return { summary, detail: clip(lines.join("\n"), 12_000) };
+    "- Reply in three short lines: Changed: one plugin-reported result; Queued: what you actually changed; Needs you: the human's decision, or nothing. Do not repeat the digest or present hypotheses as measured facts. Then end your turn.",
+  ].join("\n");
+  const evidence = lines.join("\n");
+  const omitted = "\n[Digest shortened; use study_search_findings for more evidence.]";
+  const room = 12_000 - instructions.length - 2;
+  return { summary, detail: `${instructions}\n\n${evidence.length <= room ? evidence : clip(evidence, room - omitted.length) + omitted}` };
 }
 
 export function safeJson<T>(text: string | null): T | null {
@@ -413,8 +411,3 @@ export function safeJson<T>(text: string | null): T | null {
 
 const STATE: Record<string, string> = { ok: "ok", inconclusive: "INCONCLUSIVE", broken: "BROKEN" };
 const pctAbs = (f: number) => `${(Math.abs(f) * 100).toFixed(1)}%`;
-
-function fmtNum(v: number | undefined): string {
-  if (v === undefined) return "n/a";
-  return Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : v.toPrecision(4);
-}

@@ -71,7 +71,7 @@ describe("primitives and evidence through the CLI (fake host)", () => {
     const fake = createFakePluginHost({ pluginId: "bb-autoresearch", agentSkillIds: ["study-create", "autoresearch", "study-harvest"] });
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0, harvestPollMs: 5 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
-    expect(text(await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec(spec) }, { threadId: "thr_study", projectId: "proj_1" }))).toContain("drafted with spec v1");
+    expect(text(await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec(spec) }, { threadId: "thr_study", projectId: "proj_1" }))).toContain("Draft ready: `toy-size` · spec v1.");
     await cli(["calibrate", "toy-size", "--wait"]);
     await cli(["ideas", "add", "toy-size", "Shrink the output"]);
     await cli(["start", "toy-size"]);

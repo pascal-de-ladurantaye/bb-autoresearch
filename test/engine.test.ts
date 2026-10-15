@@ -27,7 +27,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
 
   async function runningStudy() {
     const text = await engine.proposeStudy("thr_study", "proj_1", fakeHostSpec());
-    expect(text).toContain("drafted with spec v1");
+    expect(text).toContain("Draft ready: `toy-size` · spec v1.");
     expect(store.study(SLUG)!.state).toBe("draft");
     expect(port.threads.get("thr_study")!.metadata).toEqual({ study: SLUG, role: "strategist" });
     await engine.calibrate(SLUG, "human");
@@ -91,7 +91,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     expect(host.commits.get(best)!.message).toContain("Autoresearch-Candidate: c/1");
     expect(host.refs.get("refs/studies/toy-size/c/1")).toBe(c.sha);
     const verdict = port.sent.find((m) => m.threadId === "thr_w1" && m.text.includes("Verdict for c/1"));
-    expect(verdict?.text).toContain("WIN: promoted to best");
+    expect(verdict?.text).toContain("Win: promoted to best");
     expect(verdict?.text).toContain("1 submission(s) left");
 
     await expect(engine.finish("thr_w1")).rejects.toThrow(/record_finding/u);
@@ -131,7 +131,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     await runningStudy();
     host.nextSnapshot = { tree: "T4", changedPaths: ["bench/measure.sh"] };
     const text = await engine.submit("thr_w1", { title: "Tweak the benchmark harness" });
-    expect(text).toContain("REJECTED (scope)");
+    expect(text).toContain("Rejected (scope)");
     expect(text).toContain("protected paths changed: bench/measure.sh");
     const c = store.candidateByN(store.study(SLUG)!.id, 1)!;
     expect(c).toMatchObject({ verdict: "rejected", stage: "decided" });
@@ -156,7 +156,7 @@ describe("study lifecycle and candidate pipeline (fake host)", () => {
     const c2 = store.candidateByN(s.id, 2)!;
     expect(c2.verdict).toBe("gate_failed");
     expect(c2.gate_output).toContain("FAIL test_x");
-    expect(port.sent.at(-1)!.text).toContain("GATE FAILED");
+    expect(port.sent.at(-1)!.text).toContain("Gate failed: gate run exited 1. Not promoted.");
   });
 
   it("conflict when the candidate no longer applies onto best", async () => {

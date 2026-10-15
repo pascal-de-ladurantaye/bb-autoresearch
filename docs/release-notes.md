@@ -4,6 +4,7 @@ How each version was built: what it added, the decisions taken on the way, every
 
 | Version | What it added |
 |---|---|
+| [1.0.2](#102) | Clearer decisions, verdicts and recovery instructions; action-first agent briefs, staged skills and more readable detail. No measurement or stable-contract changes. |
 | [1.0.1](#101) | Fix: `bb study harvest` on a study already frozen for harvest shows the freeze instead of starting a new one; `--refreeze` freezes again on purpose. |
 | [1.0.0](#100) | The plugin owns every measurement and verdict; agents own commit messages and harvest. Each bench host decides with its own win threshold, candidates go to the quietest host, and a much noisier host is left out; a guardrail that can't be judged fails calibration. Workers write their commit messages; harvest freezes best, and an agent turns it into PRs with `bb study evidence`, `measure` and `gate`. A study chooses its remote machines (`machine` options passed to the provider). Remote machines survive a plugin reload; unused seeds and base bundles are deleted; CI on every pull request; docs split into design, guide and release notes, with a stability policy. |
 | [v0.3.1](#v031-large-uploads-in-parts) | Large uploads to remote machines travel in 32 MiB parts (BB's 75-second RPC limit). |
@@ -14,6 +15,19 @@ How each version was built: what it added, the decisions taken on the way, every
 | [v0.2.1](#v021-fixes) | Wording and link fixes: the noise sentence per noise class, guardrail losses that say why, single-run wording for deterministic measurements, the status line's bench counts, a state-aware Overview, worker lanes linked to their candidates. |
 | [v0.2.0](#v020-live-view-part-2) | The read-only Live view (a Live tab and a panel beside the study thread) with live CI bands and replay, in two parts. |
 | [v0.1.0](#v010-guardrails-and-pre-release-fixes) | The first release: milestones M0 to M3, the human interface pass, and the guardrail and pre-release fixes. |
+
+## 1.0.2
+
+Text and readability fixes. Same minimum BB and SDK versions; no migration, oracle-hash change, new CLI mode or measurement-rule change.
+
+- **Decisions first.** Draft and approval messages distinguish reviewing the spec, running calibration and starting workers. Harvest asks an agent to prepare PRs rather than claiming that work has already started.
+- **Outcome, then measurement.** Worker verdicts lead with the result and deciding cause, followed by the estimate, reference and interval when measured. A missing guardrail, failed holdout or failed confirmation stays distinct. Inconclusive no longer automatically means “within the noise”; reports identify the deciding loss cause instead of leading with an improved primary metric.
+- **Recovery instructions.** Start refusals distinguish running or failed calibration, a harvest and an archived study. Invalid specs remain unsaved; errors name the field, supplied values and possible repairs. Bounded responses say when further entries were omitted.
+- **Agent instructions.** Worker boundaries come before background detail. Findings distinguish worker explanations from plugin evidence. Strategist instructions survive the digest size limit and request short Changed / Queued / Needs you replies.
+- **Skills and help.** Task routing comes first, with detailed rules in conditional references. Creation starts with a minimal local spec. Harvest inspects state before a command that could freeze the study. CLI summaries are shorter; command help retains the full consequences and flags.
+- **Inspectable numbers.** Known units accompany worker metrics; unspecified units are not guessed. The effect statistic is separate from side medians. Overview explains compounding behind an expander, and start confirmation uses the noise class’s own terminology.
+- **Readable detail.** Larger glossary targets, wrapping candidate causes, sentence-case state labels and clearer guardrail explanations. On narrow screens, action buttons wrap below a callout instead of squeezing its text into a thin column.
+- **Validation.** 515 tests passed, plus type-check and build. Browser fixture checks covered five surfaces at phone and desktop widths and a 200%-scale equivalent; these were exported components, not a full host-UI smoke test. A local install loaded the updated CLI, frontend and skills; existing study and candidate records were preserved, with only expected reload timestamps and the reconciliation event added.
 
 ## 1.0.1
 

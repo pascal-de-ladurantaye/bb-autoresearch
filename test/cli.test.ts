@@ -28,7 +28,7 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     await createAutoresearchPlugin({ port: () => port, seed: 1, config: { retryDelayMs: 0, harvestPollMs: 5 }, onEngine: (e) => (engine = e) })(fake.bb);
     harness = fake.harness;
     const r = await harness.behavior.callAgentTool("study_propose", { spec_toml: fakeHostSpec(spec) }, { threadId: "thr_study", projectId: "proj_1" });
-    expect(text(r)).toContain("drafted with spec v1");
+    expect(text(r)).toContain("Draft ready: `toy-size` · spec v1.");
   }
 
   const cli = (args: string[]) => harness.behavior.runCli(args);
@@ -122,6 +122,40 @@ describe("bb study CLI: --json everywhere, needs, wording, hints", () => {
     const pause = await cli(["pause", "toy-size"]);
     expect(pause.exitCode).not.toBe(0);
     expect(pause.stderr).toContain("bb study calibrate toy-size");
+  });
+
+  it("start refusals name the current state and a safe next step without changing it", async () => {
+    await setup();
+    const store = engine.ctx.store;
+    const study = engine.study("toy-size");
+    for (const [state, calibration, message, command] of [
+      ["calibrating", "running", "calibration is still running", "show"],
+      ["draft", "failed", "calibration failed", "show"],
+      ["harvesting", "ready", "it is harvesting", "resume"],
+      ["archived", "ready", "cannot resume", "show"],
+    ] as const) {
+      store.updateStudy(study.id, { state, calibration_status: calibration });
+      const r = await cli(["start", "toy-size", "--json"]);
+      expect(r.exitCode).not.toBe(0);
+      const error = JSON.parse(r.stdout).error;
+      expect(error.message).toContain(message);
+      expect(error.hint).toBe(`Run \`bb study ${command} toy-size\`.`);
+      expect(engine.study("toy-size").state).toBe(state);
+    }
+  });
+
+  it("invalid proposals remain unsaved and identify the repair; help separates summary from detail", async () => {
+    await setup();
+    const bad = fakeHostSpec(DETERMINISTIC_SPEC + "\n[oracle.protocol]\nn_min = 30\nn_max = 10\n");
+    const result = await harness.behavior.callAgentTool("study_propose", { spec_toml: bad }, { threadId: "thr_study", projectId: "proj_1" });
+    expect(text(result)).toContain("Spec not saved");
+    expect(text(result)).toContain("resubmit with study_propose");
+    expect(engine.study("toy-size").spec_version).toBe(1);
+    const help = await cli(["harvest", "--help"]);
+    expect(help.stdout).toContain("Freeze best for an agent to harvest, or show the existing freeze.");
+    expect(help.stdout).toContain("submissions closed");
+    expect(help.stdout).toContain("--refreeze");
+    expect((await cli(["show", "--help"])).stdout).not.toContain("--brief");
   });
 
   it("needs: text lines with the command; nothing when nothing waits", async () => {

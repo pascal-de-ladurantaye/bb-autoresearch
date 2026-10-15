@@ -56,7 +56,7 @@ export interface ProviderUsage {
   windows: Array<{ label: string; usedPercent: number; resetsAt: number | null }>;
 }
 
-/** A plugin message: a one-line summary for the human and the full detail for the agent (sent agent-only). */
+/** A plugin message: an outcome and short measurement for the human and the full detail for the agent (sent agent-only). */
 export interface PortMessage {
   summary: string;
   detail: string;

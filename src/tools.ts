@@ -54,7 +54,7 @@ export function registerTools(bb: BbPluginApi, engine: Engine): void {
   bb.agents.registerTool({
     name: "study_submit_candidate",
     description:
-      "Submit your worktree as a candidate. The plugin commits it with your title and body as the commit message (used verbatim, also for the commit on best if it wins), checks scope, runs gates and measures it against best. Returns a ticket; the verdict arrives later as a message. End your turn after submitting.",
+      "Submit your worktree, then end your turn. The plugin checks scope, runs gates and measures against best; a ticket returns now and the verdict arrives later. Your title and body are used verbatim for the candidate commit and, if promoted, the commit on best.",
     presentation: { label: { pending: "Submitting candidate", completed: "Submitted candidate" } },
     parameters: z.object({
       title: z
@@ -72,7 +72,7 @@ export function registerTools(bb: BbPluginApi, engine: Engine): void {
   });
   bb.agents.registerTool({
     name: "study_record_finding",
-    description: "Record what you learned: outcome, why it won or lost, when the idea would be worth revisiting, and evidence. Required before study_finish.",
+    description: "Record a finding before study_finish. Separate the plugin's measured result from your explanation of why it happened; cite the candidate and evidence, and say when the idea is worth revisiting.",
     presentation: { label: { pending: "Recording finding", completed: "Recorded finding" } },
     parameters: z.object({
       outcome: z.enum(["improved", "no_effect", "regressed", "broke_gate", "blocked", "not_attempted"]),

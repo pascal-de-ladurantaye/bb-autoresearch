@@ -94,7 +94,7 @@ describe("parseSpec", () => {
     expect(parseSpec(DETERMINISTIC_SPEC.replace("[budget]", "[budget]\nmax_tokens = 5")).ok).toBe(false);
     const p = parseSpec(DETERMINISTIC_SPEC.replace('noise = "deterministic"', 'noise = "noisy"\n[oracle.protocol]\nn_min = 30\nn_max = 10'));
     expect(p.ok).toBe(false);
-    if (!p.ok) expect(p.errors.join()).toContain("n_min must be <= n_max");
+    if (!p.ok) expect(p.errors.join()).toContain("n_min: 30 exceeds n_max (10). Set n_min to 10 or less, or raise n_max to at least 30.");
     expect(parseSpec(DETERMINISTIC_SPEC.replace('max_regression = "5%"', 'max_regression = "five"')).ok).toBe(false);
     // Remote bench host names parse here and are resolved against BB hosts by the engine.
     expect(parseSpec(DETERMINISTIC_SPEC.replace('noise = "deterministic"', 'noise = "deterministic"\nbench_hosts = ["bench-x86-01"]')).ok).toBe(true);

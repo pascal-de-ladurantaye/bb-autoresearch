@@ -1375,7 +1375,7 @@ export interface GuardrailStatus {
   /** How much of the binding limit is used (the larger of the step and total shares); null when not measured or no regression allowed. */
   used: number | null;
   state: GuardrailState;
-  /** "ok", "near limit", "inconclusive", "BROKEN", "not measured": text that carries the state without color. */
+  /** "ok", "near limit", "inconclusive", "broken", "not measured": text that carries the state without color. */
   label: string;
   /** One sentence: "0.4% worse than best (limit 5.0% worse) · 3.1% worse than the segment base (total limit 10.0% worse)". */
   text: string;
@@ -1455,7 +1455,7 @@ export function guardrailStatus(g: GuardrailInput): GuardrailStatus {
         : "pass";
   // For a candidate, say when only the total against the segment base is what's broken or inconclusive.
   const onlyTotal = g.against === "best" && cumulative !== null && (state === "broken" || state === "inconclusive") && check.state !== state && cumulative.state === state;
-  const label = (state === "broken" ? "BROKEN" : state === "inconclusive" ? "inconclusive" : state === "warn" ? "near limit" : "ok") + (onlyTotal ? " (total)" : "");
+  const label = (state === "broken" ? "broken" : state === "inconclusive" ? "inconclusive" : state === "warn" ? "near limit" : "ok") + (onlyTotal ? " (total)" : "");
   return { ...common, regression, improvement: -regression, used, state, label, text, check, cumulative };
 }
 

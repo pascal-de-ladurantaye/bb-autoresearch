@@ -108,7 +108,7 @@ describe("views: guardrail status (the one place the UI decides it)", () => {
   it("pass, warn within 20% of the limit, broken, missing", () => {
     expect(guardrailStatus({ ...base, reference: 100, value: 101 })).toMatchObject({ state: "pass", label: "ok" });
     expect(guardrailStatus({ ...base, reference: 100, value: 104.5 })).toMatchObject({ state: "warn", label: "near limit" });
-    expect(guardrailStatus({ ...base, reference: 100, value: 106 })).toMatchObject({ state: "broken", label: "BROKEN" });
+    expect(guardrailStatus({ ...base, reference: 100, value: 106 })).toMatchObject({ state: "broken", label: "broken" });
     expect(guardrailStatus({ ...base, reference: null, value: 106 })).toMatchObject({ state: "missing", label: "not measured", regression: null });
     expect(guardrailStatus({ ...base, reference: 100, value: 95 }).text).toBe("5.0% better than best (limit 5.0% worse)");
   });
@@ -156,7 +156,7 @@ describe("views: metrics table", () => {
     const warn = metricsTable(withGuardrail, JSON.stringify({ best: { size: 1000, rss: 100 }, candidate: { size: 800, rss: 104.5 }, guardrails: { rss: 0.045 } }));
     expect(warn[1]!.guardrail).toMatchObject({ state: "warn" });
     const broken = metricsTable(withGuardrail, JSON.stringify({ best: { size: 1000, rss: 100 }, candidate: { size: 800, rss: 110 }, guardrails: { rss: 0.1 } }));
-    expect(broken[1]!.guardrail).toMatchObject({ state: "broken", label: "BROKEN" });
+    expect(broken[1]!.guardrail).toMatchObject({ state: "broken", label: "broken" });
   });
   it("higher is better for both the primary metric and the guardrail", () => {
     const rows = metricsTable(higher, JSON.stringify({ best: { size: 1000, rss: 100 }, candidate: { size: 1200, rss: 95.8 } }));

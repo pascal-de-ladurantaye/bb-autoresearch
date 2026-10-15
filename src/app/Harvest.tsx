@@ -201,7 +201,7 @@ function AgentGuide({ guide, o }: { guide: HarvestView["guide"]; o: OverviewResu
       }
     >
       <p className="text-sm">
-        The <Mono>study-harvest</Mono> skill tells it how: read the evidence, group and split the changes (by hunk when needed), build branches or stacks, have the plugin measure and gate each one, write the PR descriptions in this repository's style, and publish only when you say so.
+        Ask an agent to propose a PR plan from the frozen best. You approve the grouping first; the agent then builds branches and uses the plugin to measure and gate them. Publishing needs your separate approval.
       </p>
       <blockquote className="mt-2 border-l-2 border-border pl-2 text-xs text-muted-foreground" data-testid="harvest-prompt">
         {guide.prompt}

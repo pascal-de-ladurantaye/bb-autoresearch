@@ -321,6 +321,30 @@ export function verdictCause(verdict: string | null | undefined, reasons: unknow
   }
 }
 
+/** Human-facing outcome; stored verdict keys and reasons remain unchanged. */
+export function verdictOutcomeText(verdict: string | null, reasons: readonly string[]): string {
+  const cause = verdictCause(verdict, reasons);
+  const short = (text: string) => clipWords(text.replace(/\s+/gu, " ").replace(/[.!]+$/u, ""), 160);
+  switch (verdict) {
+    case "win": return "Win: promoted to best.";
+    case "lose": {
+      const why = (cause === "lost on the holdout check" ? "holdout check failed" : cause?.replace(/^lost on /u, "")) ?? (reasons.some((r) => /^failed confirmation/u.test(r)) ? "confirmation failed" : reasons.some((r) => /^primary metric regressed/u.test(r)) ? "primary metric regressed" : null);
+      return `Lose${why ? `: ${short(why)}` : ""}. Not promoted.`;
+    }
+    case "inconclusive": return "Inconclusive: not promoted.";
+    case "gate_failed": return `Gate failed: ${short((cause ?? "tests failed").replace(/^gate failed:\s*/iu, ""))}. Not promoted.`;
+    case "conflict": return "Conflict: no longer applies to best. Rebase before resubmitting.";
+    case "rejected": return `Rejected (scope): ${short(cause ?? "outside the scope")}. Not promoted.`;
+    default: return verdict ?? "Not decided yet.";
+  }
+}
+
+/** Explain the existing headline calculation, not a fresh base-vs-best measurement. */
+export function bestCalculationText(direction: Direction, segments: number): string {
+  const formula = direction === "lower" ? "1 − product(1 − each improvement)" : "product(1 + each improvement) − 1";
+  return `Compounded from promoted candidates, each measured against the best before it: ${formula}. Percentages do not add. This is not a fresh measurement of base against best.${segments > 1 ? " Raw values shown here belong to the current segment, not the whole study." : " Raw values are supporting measurements; the headline uses the recorded verdict estimates."}`;
+}
+
 /**
  * Compound promoted improvements (each relative to the best before it) into
  * the improvement of best over base. Lower-is-better: 1 − Π(1 − e) (the
@@ -410,8 +434,8 @@ export function improvementOf(reference: number | null | undefined, candidate: n
 /** Plain-language help for the statistical terms the page uses (one or two sentences each). */
 export const GLOSSARY = {
   improvement: "Every number is “better is positive”: +10% means 10% better in the metric's own direction (10% lower for lower-is-better metrics). Raw values are shown next to it.",
-  ci: "Confidence interval: the range the true change very likely lies in, given the noise in the measurements. A narrow CI that excludes zero means the change is real.",
-  mde: "Minimum detectable effect: the smallest improvement a candidate must clear (with confidence) to win. Smaller changes are indistinguishable from noise on this bench.",
+  ci: "Confidence interval: uncertainty in the estimated change. Excluding zero is evidence of a change, not enough by itself to win: the study also checks its win threshold, guardrails and any required confirmation or holdout.",
+  mde: "Win threshold (minimum detectable effect): the improvement a candidate must clear with confidence. It depends on calibration and the configured minimum; a smaller improvement may be real but still not qualify as a win.",
   noiseFloor: "Noise floor: how much the metric moves between two runs of the same code (A/A), measured at calibration. The MDE is derived from it.",
   calibration: "Calibration runs the gates on the base commit, then measures the base against itself many times to learn the noise floor, the MDE and the cost of one evaluation.",
   ablation: "Ablation: best with this changeset reverted, measured against best. How much worse that gets is what the changeset contributes.",
@@ -421,9 +445,9 @@ export const GLOSSARY = {
   droppable: "Droppable: the contribution's CI reaches zero, so there's no evidence it helps. You decide whether to keep it (for example as a simplification).",
   unexplained: "Unexplained: the measured total gain minus the sum of the contributions. Within its CI the changes add up; beyond it they interact.",
   guardrail: "Guardrail: a secondary metric that may not regress beyond its limits: per step against the best before it, and in total against the segment base. Judged on a CI: broken only when the whole CI is beyond a limit; inconclusive (flagged, not a rejection) when it straddles one.",
-  drift: "Drift check: an A/A run on best while the study runs. Noise above the limit pauses the study, because verdicts would be random.",
+  drift: "Drift check: an A/A run on best while the study runs. Noise above the limit pauses the study because the calibration no longer describes the bench.",
   holdout: "Holdout: a hidden workload on the bench host. Wins must not regress on it; agents only learn pass or fail.",
-  segment: "Segment: a period with one fixed oracle version. Changing the oracle starts a new segment with a new calibration.",
+  segment: "Segment: a period with one calibration and baseline. An oracle change starts a new segment; automatic recalibration on shorter runs can also start one without changing the oracle.",
   utilization: "Bench utilization: the share of Running time the bench lock was held: measuring, and in single-machine mode also running gates. Low values mean workers think longer than the bench measures.",
 } as const;
 

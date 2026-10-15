@@ -59,7 +59,7 @@ export function createBbPort(bb: BbPluginApi, client: ExperimentalHostClient<Hos
       return { threadId: thread.id, environmentId: thread.environmentId };
     },
     async send(threadId, text) {
-      // A structured message: the human sees the one-line summary in the
+      // A structured message: the human sees the short summary in the
       // timeline; the detail is an agent-only block (still in the agent's context).
       const input =
         typeof text === "string"

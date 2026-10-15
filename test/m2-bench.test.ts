@@ -108,7 +108,7 @@ describe("M2 remote bench (fake hosts)", () => {
 
   async function running(o: SpecOpts = {}, ideas = [{ title: "Idea A", theme: "a" }, { title: "Idea B", theme: "b" }]) {
     const r = await engine.proposeStudy("thr_study", "proj_1", m2Spec(o));
-    expect(r).toContain("drafted");
+    expect(r).toContain("Draft ready:");
     await engine.calibrate(SLUG, "human");
     await engine.waitForCalibration(SLUG, 5_000);
     const s = store.study(SLUG)!;
@@ -130,7 +130,7 @@ describe("M2 remote bench (fake hosts)", () => {
     expect(bad).toContain('no BB machine named or with id "bench-x86-01"');
     expect(bad).toContain("bench-a (host_a)");
     const ok = await engine.proposeStudy("thr_study", "proj_1", m2Spec({ benchHosts: ["bench-a", "host_b"] }));
-    expect(ok).toContain("Bench: bench-a (own clone, git bundles), bench-b (own clone, git bundles)");
+    expect(ok).toContain("bench bench-a (own clone, git bundles), bench-b (own clone, git bundles)");
   });
 
   it("dispatches measurements across bench hosts, each fed only by bundles; nothing runs on the edit host's bench", async () => {
@@ -322,8 +322,7 @@ describe("M2 remote bench (fake hosts)", () => {
     expect(reasons[0]).toContain("primary metric improved");
     expect(reasons.some((r) => /guardrail rss: 30\.0% worse than best.*beyond the 5\.0% limit; 30\.0% worse than the segment base.*beyond the 5\.0% total limit/u.test(r))).toBe(true);
     const msg = port.sent.filter((m) => m.threadId === "thr_w1").at(-1)!.text;
-    expect(msg).toContain("LOSE");
-    expect(msg).toContain("Broke guardrail rss.");
+    expect(msg).toContain("Lose: guardrail rss (30.0% worse). Not promoted.");
     expect(msg).toMatch(/Guardrails \(per step vs best; in total vs the segment base, with this candidate\): rss 30\.0% worse than best \(limit 5\.0%\) BROKEN; 30\.0% worse than the segment base \(total limit 5\.0%\) BROKEN/u);
     // Within the limit it is a win.
     edit.rss.set("TB", 103);

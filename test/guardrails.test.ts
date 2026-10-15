@@ -144,7 +144,7 @@ describe("cumulative creep across kept wins (deterministic class, end to end)", 
     expect(1.049 ** 10 - 1).toBeCloseTo(0.613, 3);
     // The worker hears the remaining headroom (agent-only detail); the human line stays short.
     const msg = port.sent.filter((m) => m.threadId === "thr_w1" && m.text.includes("Verdict for c/4")).at(-1)!.text;
-    expect(msg.split("\n")[0]).toBe("[autoresearch] Verdict for c/4: LOSE, 1.0% lower size than best. Broke guardrail rss.");
+    expect(msg.split("\n")[0]).toBe("[autoresearch] Verdict for c/4: Lose: guardrail rss (21.1% worse than the segment base). Not promoted.");
     expect(msg).toContain("Guardrail headroom now (best vs the segment base): rss: 4.6% of the 20.0% total limit left (best: 15.4% worse than the segment base)");
     // Views: the Overview shows best's cumulative position against the total limit; the candidate its total check.
     const o = overview(engine, store.study("toy-size")!);
@@ -155,13 +155,16 @@ describe("cumulative creep across kept wins (deterministic class, end to end)", 
     expect(g.headroomText).toBe("rss: 4.6% of the 20.0% total limit left (best: 15.4% worse than the segment base)");
     const detail = (await candidateDetail(engine, store.study("toy-size")!, 4))!;
     const row = detail.metricRows.find((r) => r.name === "rss")!;
-    expect(row.guardrail).toMatchObject({ state: "broken", label: "BROKEN (total)" });
+    expect(row.guardrail).toMatchObject({ state: "broken", label: "broken (total)" });
     expect(row.text).toBe("4.9% worse than best (limit 5.0% worse) · 21.1% worse than the segment base (total limit 20.0% worse)");
     const list = candidatesView(engine, store.study("toy-size")!, {});
-    expect(list.find((r) => r.n === 4)!.guardrails.text).toBe("rss BROKEN (total)");
+    expect(list.find((r) => r.n === 4)!.guardrails.text).toBe("rss broken (total)");
     // The strategist's digest and the report carry the cumulative position.
     const report = studyReport(engine.ctx, store.study("toy-size")!, store.spec(store.study("toy-size")!), null);
     expect(report).toContain("## Guardrails (segment 1)");
+    const loss = report.split("\n").find((line) => line.startsWith("- c/4 "))!;
+    expect(loss).toContain("lost on guardrail rss");
+    expect(loss).not.toContain("primary metric improved");
     expect(report).toContain("- Best vs the segment base: 15.4% worse, compounded over 3 promotion(s).");
     expect(report).toMatch(/Wins it rejected: c\/4 \(4\.9% worse than best, within the 5\.0% limit; 21\.1% worse than the segment base, beyond the 20\.0% total limit\)/u);
   });
@@ -404,7 +407,7 @@ describe("views: guardrailStatus with the cumulative position and CI", () => {
     const inconclusive = guardrailStatus({ ...base, regression: 0.03, ci: { lo: -0.02, hi: 0.08 }, cumulative: { regression: 0.03, lo: -0.02, hi: 0.08, limit: 0.1 } });
     expect(inconclusive).toMatchObject({ state: "inconclusive", label: "inconclusive" });
     const total = guardrailStatus({ ...base, regression: 0.03, ci: { lo: 0.02, hi: 0.04 }, cumulative: { regression: 0.12, lo: 0.11, hi: 0.13, limit: 0.1 } });
-    expect(total).toMatchObject({ state: "broken", label: "BROKEN (total)" });
+    expect(total).toMatchObject({ state: "broken", label: "broken (total)" });
     const near = guardrailStatus({ ...base, regression: 0.01, cumulative: { regression: 0.09, limit: 0.1 } });
     expect(near).toMatchObject({ state: "warn", label: "near limit", used: expect.closeTo(0.9, 9) });
   });
@@ -437,7 +440,7 @@ describe("prompts carry headroom", () => {
       gate_output: null,
     } as never;
     const m = verdictMessage(c, { submissionsLeft: 1, spec: s, guardrailPositions: { rss: prior } });
-    expect(m.summary).toBe("[autoresearch] Verdict for c/7: WIN: promoted to best, 10.0% lower size than best (CI +8.0% to +12.0%). Guardrail rss inconclusive (flagged).");
+    expect(m.summary).toBe("[autoresearch] Verdict for c/7: Win: promoted to best. Guardrail rss inconclusive (flagged).\nEstimate: 10.0% lower size vs previous best (CI +8.0% to +12.0%).");
     expect(m.detail).toContain("rss 3.5% worse than best, CI 1.0% better to 8.0% worse (limit 5.0%) INCONCLUSIVE; 9.7% worse than the segment base, CI 4.8% to 14.6% worse (total limit 10.0%) INCONCLUSIVE");
     expect(m.detail).toContain("Guardrail headroom now (best vs the segment base): rss: 4.0% of the 10.0% total limit left (best: 6.0% worse than the segment base, CI 5.0% to 7.0% worse)");
   });
