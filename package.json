@@ -1,6 +1,6 @@
 {
   "name": "bb-autoresearch",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "Long-running, measured code-optimization studies: short-lived agent workers propose changes, the plugin measures every candidate and decides what to keep.",
   "license": "MIT",
